@@ -1,0 +1,34 @@
+# Polymarket Insider Signal Bot — Python 3.12
+# Pin py-clob-client to 0.34.6 per architecture spec.
+# All other pins are conservative minimums; exact versions resolve at install time.
+
+# --- Polymarket CLOB client ---
+py-clob-client==0.34.6
+
+# --- HTTP client (async, used everywhere) ---
+httpx>=0.27.0,<1.0.0
+
+# --- WebSocket client ---
+# websockets 12.x is the stable async-native release for Python 3.12.
+websockets>=12.0,<14.0
+
+# --- Ethereum / Polygon (used for Alchemy JSON-RPC calls) ---
+web3>=6.0.0,<8.0.0
+
+# --- Environment variable loading ---
+python-dotenv>=1.0.0,<2.0.0
+
+# --- Data validation (defensive schema checks on API responses) ---
+# pydantic is not required by the current architecture but is listed
+# as a lightweight option if schema validation is added later.
+# Uncomment if needed:
+# pydantic>=2.0.0,<3.0.0
+
+# --- Standard library only beyond this point ---
+# sqlite3  — built into Python 3.12
+# asyncio  — built into Python 3.12
+# json     — built into Python 3.12
+# logging  — built into Python 3.12
+# dataclasses — built into Python 3.12
+# math     — built into Python 3.12
+# signal   — built into Python 3.12

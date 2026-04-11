@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kill 416 533 559 563)",
+      "Bash(/c/Users/manny/polymarket-signal-bot/venv/Scripts/python.exe main.py)",
+      "Bash(echo \"PID=$!\")",
+      "Bash(/c/Users/manny/polymarket-signal-bot/venv/Scripts/python.exe test_alert.py)",
+      "Bash(pkill -f \"polymarket-signal-bot/venv/Scripts/python.exe\")",
+      "Bash(/c/Users/manny/polymarket-signal-bot/venv/Scripts/python.exe -c ':*)",
+      "Bash(/c/Users/manny/polymarket-signal-bot/venv/Scripts/python.exe -m py_compile resolution_checker.py stats.py alerter.py database.py main.py)",
+      "Bash(/c/Users/manny/polymarket-signal-bot/venv/Scripts/python.exe main.py --dry-run)"
+    ]
+  }
+}
