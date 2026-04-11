@@ -121,8 +121,13 @@ ALCHEMY_RPC_URL: str = os.getenv("ALCHEMY_RPC_URL", "")  # Full URL including AP
 # Scoring thresholds
 # ---------------------------------------------------------------------------
 
-# Minimum Insider Confidence Score (0–100) to fire a Telegram alert.
-SCORE_ALERT_THRESHOLD: int = int(os.getenv("SCORE_ALERT_THRESHOLD", "80"))
+# Two-tier alert thresholds.
+# Scores >= ALERT_INSTANT_THRESHOLD fire an immediate Telegram message.
+# Scores in [ALERT_DIGEST_THRESHOLD, ALERT_INSTANT_THRESHOLD) are buffered
+# and sent as a periodic digest every DIGEST_INTERVAL_SECONDS.
+ALERT_INSTANT_THRESHOLD: int = int(os.getenv("ALERT_INSTANT_THRESHOLD", "80"))
+ALERT_DIGEST_THRESHOLD: int = int(os.getenv("ALERT_DIGEST_THRESHOLD", "60"))
+DIGEST_INTERVAL_SECONDS: int = int(os.getenv("DIGEST_INTERVAL_SECONDS", "7200"))  # 2 hours
 
 # --- Component maximum points (must sum to 100 + 10 bonus) ---
 
@@ -230,8 +235,11 @@ def validate_config() -> None:
 
     log.info("Configuration validated OK")
     log.info(
-        "Score alert threshold: %d | Trade min size: $%.0f | Cache TTL: %dh",
-        SCORE_ALERT_THRESHOLD,
+        "Instant threshold: %d | Digest threshold: %d | Digest interval: %ds | "
+        "Trade min size: $%.0f | Cache TTL: %dh",
+        ALERT_INSTANT_THRESHOLD,
+        ALERT_DIGEST_THRESHOLD,
+        DIGEST_INTERVAL_SECONDS,
         TRADE_MIN_SIZE_USD,
         WALLET_CACHE_TTL_SECONDS // 3600,
     )

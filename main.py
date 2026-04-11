@@ -34,6 +34,7 @@ import resolution_checker
 import scorer
 import alerter as alerter_module
 from alerter import AlertPayload, AlertQueue
+from digest import DigestBuffer, digest_loop
 from market_discovery import get_market_end_date, get_market_title, get_market_slug
 from trade_monitor import Trade, WebSocketManager, RestTradePoller
 from wallet_profiler import get_wallet_profile
@@ -48,6 +49,7 @@ log = logging.getLogger("main")
 async def process_trade(
     trade: Trade,
     alert_queue: AlertQueue,
+    digest_buffer: DigestBuffer,
 ) -> None:
     """
     Full pipeline for one trade event:
@@ -126,22 +128,22 @@ async def process_trade(
         return
 
     log.info(
-        "[Pipeline] Score=%d (threshold=%d) for trade %s wallet=%s",
+        "[Pipeline] Score=%d (instant≥%d, digest≥%d) for trade %s wallet=%s",
         breakdown.total,
-        config.SCORE_ALERT_THRESHOLD,
+        config.ALERT_INSTANT_THRESHOLD,
+        config.ALERT_DIGEST_THRESHOLD,
         trade.trade_id,
         wallet_addr,
     )
 
     # --- Threshold check ---
-    if breakdown.total < config.SCORE_ALERT_THRESHOLD:
+    if breakdown.total < config.ALERT_DIGEST_THRESHOLD:
         log.info(
-            "[Pipeline] Score %d below threshold %d — suppressed",
-            breakdown.total, config.SCORE_ALERT_THRESHOLD,
+            "[Pipeline] Score %d below digest threshold %d — suppressed",
+            breakdown.total, config.ALERT_DIGEST_THRESHOLD,
         )
         return
 
-    # --- Enqueue alert ---
     payload = AlertPayload(
         trade=trade,
         profile=profile,
@@ -151,11 +153,46 @@ async def process_trade(
         hours_to_resolution=hours_to_resolution,
         market_slug=market_slug,
     )
-    await alert_queue.enqueue(payload)
-    log.info(
-        "[Pipeline] Alert enqueued: score=%d trade=%s market='%s'",
-        breakdown.total, trade.trade_id, market_title,
-    )
+
+    # --- Route: instant (≥ ALERT_INSTANT_THRESHOLD) or digest (60–79) ---
+    if breakdown.total >= config.ALERT_INSTANT_THRESHOLD:
+        await alert_queue.enqueue(payload)
+        log.info(
+            "[Pipeline] INSTANT alert enqueued: score=%d trade=%s market='%s'",
+            breakdown.total, trade.trade_id, market_title,
+        )
+    else:
+        # Persist outcome row immediately — same point as instant alerts.
+        # The buffer is in-memory; a crash before the 2-hour flush would
+        # otherwise lose this trade from alert_outcomes permanently.
+        try:
+            import json as _json
+            database.insert_alert_outcome(
+                alert_id=trade.trade_id,
+                market_id=trade.market_id,
+                market_question=market_title or "",
+                wallet_address=wallet_addr,
+                score=breakdown.total,
+                score_breakdown_json=_json.dumps(breakdown.to_dict()),
+                bet_side=trade.outcome or "UNKNOWN",
+                bet_price_at_alert=trade.price,
+                bet_size_usd=trade.size_usd,
+            )
+            log.debug(
+                "[Pipeline] Outcome row inserted for digest trade %s (score=%d)",
+                trade.trade_id, breakdown.total,
+            )
+        except Exception as exc:
+            log.error(
+                "[Pipeline] Failed to insert outcome for digest trade %s: %s",
+                trade.trade_id, exc,
+            )
+
+        await digest_buffer.add(payload)
+        log.info(
+            "[Pipeline] DIGEST signal buffered: score=%d trade=%s market='%s'",
+            breakdown.total, trade.trade_id, market_title,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +202,7 @@ async def process_trade(
 async def trade_processor_loop(
     trade_queue: asyncio.Queue,
     alert_queue: AlertQueue,
+    digest_buffer: DigestBuffer,
 ) -> None:
     """
     Drain the trade queue and run each trade through the full pipeline.
@@ -176,7 +214,7 @@ async def trade_processor_loop(
 
     async def _bounded(trade: Trade) -> None:
         async with semaphore:
-            await process_trade(trade, alert_queue)
+            await process_trade(trade, alert_queue, digest_buffer)
 
     while True:
         trade = await trade_queue.get()
@@ -244,8 +282,14 @@ async def amain(dry_run: bool) -> None:
     """
     log.info("=" * 60)
     log.info("Polymarket Insider Signal Bot starting")
-    log.info("dry_run=%s | score_threshold=%d | min_trade=$%.0f",
-             dry_run, config.SCORE_ALERT_THRESHOLD, config.TRADE_MIN_SIZE_USD)
+    log.info(
+        "dry_run=%s | instant≥%d | digest≥%d | digest_interval=%ds | min_trade=$%.0f",
+        dry_run,
+        config.ALERT_INSTANT_THRESHOLD,
+        config.ALERT_DIGEST_THRESHOLD,
+        config.DIGEST_INTERVAL_SECONDS,
+        config.TRADE_MIN_SIZE_USD,
+    )
     log.info("=" * 60)
 
     # --- Validate configuration ---
@@ -270,6 +314,7 @@ async def amain(dry_run: bool) -> None:
 
     # --- Components ---
     alert_queue = AlertQueue(dry_run=dry_run)
+    digest_buffer = DigestBuffer()
 
     ws_manager = WebSocketManager(
         trade_queue=trade_queue,
@@ -315,7 +360,7 @@ async def amain(dry_run: bool) -> None:
         ),
         asyncio.create_task(
             supervised_task(
-                lambda: trade_processor_loop(trade_queue, alert_queue),
+                lambda: trade_processor_loop(trade_queue, alert_queue, digest_buffer),
                 name="trade-processor",
             ),
             name="trade-processor",
@@ -326,6 +371,13 @@ async def amain(dry_run: bool) -> None:
                 name="resolution-checker",
             ),
             name="resolution-checker",
+        ),
+        asyncio.create_task(
+            supervised_task(
+                lambda: digest_loop(digest_buffer, dry_run=dry_run),
+                name="digest-loop",
+            ),
+            name="digest-loop",
         ),
         asyncio.create_task(
             heartbeat_loop(interval_seconds=300),

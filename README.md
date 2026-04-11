@@ -37,7 +37,7 @@ When a trade above the size threshold is detected:
 | **Underdog Bet** | 10 | Buying a ≤30% outcome scores max. Betting the favorite (≥60%) scores 0. Smart money on underdogs = information signal. |
 | **Cluster Bonus** | +10 | Binary. If Alchemy traces reveal this wallet was funded from the same source as another recently-flagged wallet, add 10 pts. |
 
-**Alert threshold**: Score ≥ 60 (configurable via `SCORE_ALERT_THRESHOLD`).
+**Two-tier alerting**: Score ≥ `ALERT_INSTANT_THRESHOLD` (default 80) fires an immediate Telegram message. Scores in [`ALERT_DIGEST_THRESHOLD`–79] (default 60–79) are buffered and sent as a compact digest every `DIGEST_INTERVAL_SECONDS` (default 2 hours).
 
 ---
 

@@ -15,9 +15,10 @@ Score layout:
   Underdog bet              10    Smart money on underdogs often has information
   Cluster bonus           +10    Coordinated wallets multiply signal strength
   ─────────────────────  ───────
-  TOTAL (max)              110    Alert threshold default: 60
+  TOTAL (max)              110
 
-Score ≥ SCORE_ALERT_THRESHOLD → fire Telegram alert.
+Score ≥ ALERT_INSTANT_THRESHOLD (default 80) → immediate Telegram alert.
+Score ≥ ALERT_DIGEST_THRESHOLD  (default 60) → buffered into periodic digest.
 """
 
 import logging

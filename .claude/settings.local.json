@@ -8,7 +8,13 @@
       "Bash(pkill -f \"polymarket-signal-bot/venv/Scripts/python.exe\")",
       "Bash(/c/Users/manny/polymarket-signal-bot/venv/Scripts/python.exe -c ':*)",
       "Bash(/c/Users/manny/polymarket-signal-bot/venv/Scripts/python.exe -m py_compile resolution_checker.py stats.py alerter.py database.py main.py)",
-      "Bash(/c/Users/manny/polymarket-signal-bot/venv/Scripts/python.exe main.py --dry-run)"
+      "Bash(/c/Users/manny/polymarket-signal-bot/venv/Scripts/python.exe main.py --dry-run)",
+      "Bash(git commit -m ':*)",
+      "Bash(gh repo:*)",
+      "Bash(where gh:*)",
+      "Read(//c/Users/manny/AppData/Local/Programs//**)",
+      "Bash(winget install:*)",
+      "Bash(where.exe gh:*)"
     ]
   }
 }
