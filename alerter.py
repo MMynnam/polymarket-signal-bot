@@ -335,6 +335,67 @@ class TelegramSender:
         log.error("Telegram: all %d send attempts failed", config.HTTP_MAX_RETRIES)
         return False
 
+    async def send_document(
+        self,
+        file_path: str,
+        filename: str,
+        client: httpx.AsyncClient,
+        caption: Optional[str] = None,
+    ) -> bool:
+        """
+        Send a file to Telegram via sendDocument (multipart POST).
+        Returns True on success, False on failure.
+        Uses the same retry/backoff pattern as send_message().
+        """
+        backoff = 2.0
+        for attempt in range(1, config.HTTP_MAX_RETRIES + 1):
+            try:
+                with open(file_path, "rb") as fh:
+                    form_data: dict = {"chat_id": self._chat_id}
+                    if caption:
+                        form_data["caption"] = caption
+                        form_data["parse_mode"] = "HTML"
+                    resp = await client.post(
+                        f"{self._base_url}/sendDocument",
+                        data=form_data,
+                        files={"document": (filename, fh, "text/csv")},
+                        timeout=config.HTTP_TIMEOUT_SECONDS,
+                    )
+
+                if resp.status_code == 429:
+                    retry_after = float(
+                        resp.json().get("parameters", {}).get("retry_after", 5)
+                    )
+                    log.warning(
+                        "Telegram rate-limited (document) — sleeping %.1fs (attempt %d/%d)",
+                        retry_after, attempt, config.HTTP_MAX_RETRIES,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                resp.raise_for_status()
+                return True
+
+            except httpx.HTTPStatusError as exc:
+                log.error(
+                    "Telegram document HTTP error attempt %d/%d: %s — body: %s",
+                    attempt, config.HTTP_MAX_RETRIES,
+                    exc.response.status_code,
+                    exc.response.text[:200],
+                )
+            except Exception as exc:
+                log.error(
+                    "Telegram document send error attempt %d/%d: %s",
+                    attempt, config.HTTP_MAX_RETRIES, exc,
+                )
+
+            if attempt < config.HTTP_MAX_RETRIES:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+
+        log.error("Telegram: all %d document send attempts failed", config.HTTP_MAX_RETRIES)
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Alert queue worker

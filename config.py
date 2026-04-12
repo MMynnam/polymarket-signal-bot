@@ -129,6 +129,10 @@ ALERT_INSTANT_THRESHOLD: int = int(os.getenv("ALERT_INSTANT_THRESHOLD", "80"))
 ALERT_DIGEST_THRESHOLD: int = int(os.getenv("ALERT_DIGEST_THRESHOLD", "60"))
 DIGEST_INTERVAL_SECONDS: int = int(os.getenv("DIGEST_INTERVAL_SECONDS", "7200"))  # 2 hours
 
+# Attach a full-data CSV to each digest message. Set to false if Telegram
+# file sends cause issues — the summary text is still sent either way.
+DIGEST_CSV_ENABLED: bool = os.getenv("DIGEST_CSV_ENABLED", "true").lower() in ("true", "1", "yes")
+
 # --- Component maximum points (must sum to 100 + 10 bonus) ---
 
 # How close to market close is the bet? (0–25 pts)
