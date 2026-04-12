@@ -140,6 +140,29 @@ def _fmt_payout(size_usd: float, price: float, outcome: str) -> str:
     return f"+${profit:,.0f} profit ({multiplier:.1f}x return) if {outcome.upper()} wins"
 
 
+def _fmt_breakdown_table(b: "ScoreBreakdown") -> str:
+    """
+    Compact monospace table of per-component scores for the <code> block.
+    Skipped components (None) show a dash. Cluster bonus appended if non-zero.
+    """
+    rows = [
+        ("Timing",    b.timing,       config.SCORE_MAX_TIMING),
+        ("Win rate",  b.win_rate,     config.SCORE_MAX_WIN_RATE),
+        ("Size",      b.size_anomaly, config.SCORE_MAX_SIZE_ANOMALY),
+        ("Age",       b.wallet_age,   config.SCORE_MAX_WALLET_AGE),
+        ("Conc",      b.concentration, config.SCORE_MAX_CONCENTRATION),
+        ("Underdog",  b.underdog,     config.SCORE_MAX_UNDERDOG),
+    ]
+    lines = []
+    for label, score, max_pts in rows:
+        score_str = f"{score}/{max_pts}" if score is not None else f"—/{max_pts}"
+        lines.append(f"{label:<10} {score_str:>5}")
+    if b.cluster_bonus > 0:
+        lines.append(f"{'Cluster':<10}   +{b.cluster_bonus}")
+    lines.append(f"{'TOTAL':<10} {b.total:>5}")
+    return "\n".join(lines)
+
+
 def _signal_reasons(b: "ScoreBreakdown", p: "WalletProfile", t: "Trade") -> list[str]:
     """
     Translate score components into plain-English bullets.
@@ -239,6 +262,11 @@ def format_alert(payload: AlertPayload) -> str:
         lines.append("<b>Why this fired:</b>")
         lines.extend(f"  {r}" for r in reasons)
         lines.append("")
+
+    # --- Score breakdown (numerical per-component table) ---
+    lines.append("<b>Score breakdown:</b>")
+    lines.append(f"<code>{_fmt_breakdown_table(b)}</code>")
+    lines.append("")
 
     # --- Wallet (full address, copyable) ---
     lines += [
