@@ -58,7 +58,7 @@ def make_profile() -> WalletProfile:
         resolved_trades=22,
         win_count=19,
         loss_count=3,
-        win_rate=19 / 22,                  # ~86% — well above 80% threshold
+        win_rate=19 / 22,                  # ~86% — kept as profile metadata
         median_bet_usd=800.0,
         mean_bet_usd=950.0,
         total_volume_usd=44_650.0,
@@ -73,6 +73,7 @@ def make_profile() -> WalletProfile:
         recent_tx_count=18,
         cluster_id="0xfundingsource000000000000000000000000001",
         in_cluster=True,                   # Cluster bonus fires
+        last_inbound_transfer_ts=time.time() - 1800,  # 30 min ago → near-max funding velocity
         profile_complete=True,
         missing_components=[],
         fetched_at=time.time(),
@@ -89,6 +90,7 @@ def make_breakdown(trade: Trade, profile: WalletProfile) -> ScoreBreakdown:
         market_end_date=end_date,
         profile=profile,
         current_market_id=trade.market_id,
+        trade_timestamp=trade.timestamp,
     )
 
 
@@ -121,11 +123,11 @@ def test_format_alert(payload: AlertPayload) -> bool:
         ("Score:" in text,                   "Missing Score line"),
         ("Will Trump" in text,               "Missing market title"),
         ("Wallet" in text,                   "Missing Wallet section"),
-        ("Why this fired" in text,           "Missing signal reasons section"),
+        ("Score breakdown" in text,          "Missing score breakdown section"),
         ("<b>" in text,                      "No bold tags — HTML formatting broken"),
         ("Polygonscan" in text,              "Missing Polygonscan link"),
-        ("cluster" in text.lower(),          "Missing cluster line"),
-        ("0x1111" in text,                   "Missing full wallet address"),
+        ("Cluster" in text,                  "Missing cluster line in breakdown"),
+        ("0x1111222233334444555566667777888899990000" in text, "Missing full wallet address"),
         ("profit" in text,                   "Missing payout calculation"),
     ]
 
@@ -155,13 +157,13 @@ def test_format_alert(payload: AlertPayload) -> bool:
 def test_score(breakdown: ScoreBreakdown) -> bool:
     log.info("─── TEST 2: compute_score() ───")
     checks = [
-        (breakdown.total > 0,                 f"Score is 0 — expected >0, got {breakdown.total}"),
-        (breakdown.timing is not None,         "timing component is None"),
-        (breakdown.win_rate is not None,       "win_rate component is None"),
-        (breakdown.size_anomaly is not None,   "size_anomaly component is None"),
-        (breakdown.wallet_age is not None,     "wallet_age component is None"),
-        (breakdown.cluster_bonus == 10,        f"cluster_bonus should be 10, got {breakdown.cluster_bonus}"),
-        (breakdown.total >= 60,               f"Score {breakdown.total} below alert threshold 60"),
+        (breakdown.total > 0,                       f"Score is 0 — expected >0, got {breakdown.total}"),
+        (breakdown.timing is not None,               "timing component is None"),
+        (breakdown.funding_velocity is not None,     "funding_velocity component is None"),
+        (breakdown.size_anomaly is not None,         "size_anomaly component is None"),
+        (breakdown.wallet_age is not None,           "wallet_age component is None"),
+        (breakdown.cluster_bonus == 10,              f"cluster_bonus should be 10, got {breakdown.cluster_bonus}"),
+        (breakdown.total >= 60,                      f"Score {breakdown.total} below alert threshold 60"),
     ]
 
     all_ok = True
@@ -172,9 +174,9 @@ def test_score(breakdown: ScoreBreakdown) -> bool:
         log.info("  [%s] %s", status, msg)
 
     log.info(
-        "  Score breakdown: total=%d | timing=%s | win_rate=%s | "
+        "  Score breakdown: total=%d | timing=%s | funding=%s | "
         "size=%s | age=%s | conc=%s | underdog=%s | cluster=+%d",
-        breakdown.total, breakdown.timing, breakdown.win_rate,
+        breakdown.total, breakdown.timing, breakdown.funding_velocity,
         breakdown.size_anomaly, breakdown.wallet_age,
         breakdown.concentration, breakdown.underdog, breakdown.cluster_bonus,
     )

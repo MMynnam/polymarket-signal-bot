@@ -25,16 +25,18 @@ _MIN_RESOLVED_FOR_STATS: int = 10
 # Score buckets and their display labels, matching database.get_outcome_stats().
 _SCORE_BUCKET_LABELS = ["60-69", "70-79", "80-89", "90+"]
 
-# Component definitions: (display_label, json_key_in_breakdown, max_pts)
-# json_key matches the keys produced by ScoreBreakdown.to_dict() / asdict().
+# Component definitions: (display_label, primary_json_key, fallback_json_key_or_None, max_pts)
+# primary_json_key is the current ScoreBreakdown field name.
+# fallback_json_key is checked when primary returns None — used for backward
+# compatibility with rows written before a component was renamed.
 _COMPONENTS = [
-    ("timing",       "timing",       25),
-    ("win_rate",     "win_rate",     20),
-    ("size_anomaly", "size_anomaly", 20),
-    ("wallet_age",   "wallet_age",   15),
-    ("concentration","concentration",10),
-    ("underdog",     "underdog",     10),
-    ("cluster",      "cluster_bonus",10),
+    ("timing",        "timing",            None,       25),
+    ("funding_vel",   "funding_velocity",  "win_rate", 20),
+    ("size_anomaly",  "size_anomaly",      None,       20),
+    ("wallet_age",    "wallet_age",        None,       15),
+    ("concentration", "concentration",     None,       10),
+    ("underdog",      "underdog",          None,       10),
+    ("cluster",       "cluster_bonus",     None,       10),
 ]
 
 
@@ -74,7 +76,7 @@ def _component_stats(resolved_rows: list[dict]) -> list[dict]:
     """
     results = []
 
-    for label, key, max_pts in _COMPONENTS:
+    for label, key, fallback_key, max_pts in _COMPONENTS:
         threshold = max_pts * 0.5
 
         high_wins = high_total = 0
@@ -89,6 +91,9 @@ def _component_stats(resolved_rows: list[dict]) -> list[dict]:
                 continue
 
             component_score = bd.get(key)
+            # Backward compat: try fallback key for rows written before a rename
+            if component_score is None and fallback_key:
+                component_score = bd.get(fallback_key)
             if component_score is None:
                 component_score = 0
 

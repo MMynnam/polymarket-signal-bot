@@ -119,6 +119,7 @@ async def process_trade(
             market_end_date=market_end_date,
             profile=profile,
             current_market_id=trade.market_id,
+            trade_timestamp=trade.timestamp,
         )
     except Exception as exc:
         log.error(

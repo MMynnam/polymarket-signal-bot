@@ -50,19 +50,6 @@ class AlertPayload:
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
-def _fmt_hours(hours: Optional[float]) -> str:
-    """Format hours-to-resolution as human-readable string."""
-    if hours is None:
-        return "Unknown"
-    if hours < 0:
-        return "CLOSED"
-    total_minutes = int(abs(hours) * 60)
-    h, m = divmod(total_minutes, 60)
-    if h >= 48:
-        return f"{h // 24}d {h % 24}h"
-    return f"{h}h {m}m"
-
-
 def _fmt_wallet_age(days: Optional[float]) -> str:
     if days is None:
         return "Unknown"
@@ -75,142 +62,35 @@ def _fmt_wallet_age(days: Optional[float]) -> str:
     return f"{days / 365:.1f} years"
 
 
-def _fmt_address(address: str) -> str:
-    """Truncate 0x address to 0x1234...abcd form."""
-    if len(address) < 10:
-        return address
-    return f"{address[:6]}...{address[-4:]}"
+def _score_bar(score: int, width: int = 20) -> str:
+    """Proportional fill bar scaled to 110 max (100 pts + 10 cluster bonus)."""
+    filled = max(0, min(width, round(score / 110 * width)))
+    return "█" * filled + "░" * (width - filled)
 
 
-def _score_bar(score: int) -> str:
-    """Ascii-art score bar for quick visual scanning."""
-    filled = round(score / 10)
-    empty = 10 - filled
-    return "█" * filled + "░" * empty
-
-
-def _implied_prob_str(price: float) -> str:
-    pct = round(price * 100)
-    if price <= config.UNDERDOG_MAX_PRICE:
-        return f"{pct}% implied underdog"
-    if price >= config.UNDERDOG_MIN_PRICE:
-        return f"{pct}% implied favorite"
-    return f"{pct}% implied"
-
-
-def _win_rate_str(profile: WalletProfile) -> str:
-    if profile.win_rate is None:
-        return "No history"
-    return (
-        f"{profile.resolved_trades} resolved, "
-        f"{profile.win_count} wins "
-        f"({profile.win_rate:.0%})"
-    )
-
-
-def _size_multiple_str(trade_size: float, profile: WalletProfile) -> str:
-    if profile.median_bet_usd and profile.median_bet_usd > 0:
-        multiple = trade_size / profile.median_bet_usd
-        flag = " 🚩" if multiple >= 3 else ""
-        return (
-            f"${profile.median_bet_usd:,.0f} → THIS BET: "
-            f"{multiple:.0f}x median{flag}"
-        )
-    return f"${trade_size:,.0f} (no prior history)"
-
-
-def _score_component_line(label: str, score: Optional[int], max_pts: int, note: str) -> str:
-    """Format one score breakdown line."""
-    if score is None:
-        score_str = "N/A"
-    else:
-        score_str = f"{score}/{max_pts}"
-    return f"• {label}: <b>{score_str}</b> — {html.escape(note)}"
-
-
-def _fmt_payout(size_usd: float, price: float, outcome: str) -> str:
+def _fmt_breakdown(b: "ScoreBreakdown") -> str:
     """
-    Calculate potential profit if the bet wins.
-    At price P, buying $S worth gives S/P shares. Profit = S*(1-P)/P.
-    """
-    if price <= 0 or price >= 1:
-        return ""
-    profit = size_usd * (1 - price) / price
-    multiplier = 1 / price
-    return f"+${profit:,.0f} profit ({multiplier:.1f}x return) if {outcome.upper()} wins"
-
-
-def _fmt_breakdown_table(b: "ScoreBreakdown") -> str:
-    """
-    Compact monospace table of per-component scores for the <code> block.
-    Skipped components (None) show a dash. Cluster bonus appended if non-zero.
+    Monospace breakdown table for insertion in a <code> block.
+    Shows all components. Notes are truncated to keep lines short.
     """
     rows = [
-        ("Timing",    b.timing,       config.SCORE_MAX_TIMING),
-        ("Win rate",  b.win_rate,     config.SCORE_MAX_WIN_RATE),
-        ("Size",      b.size_anomaly, config.SCORE_MAX_SIZE_ANOMALY),
-        ("Age",       b.wallet_age,   config.SCORE_MAX_WALLET_AGE),
-        ("Conc",      b.concentration, config.SCORE_MAX_CONCENTRATION),
-        ("Underdog",  b.underdog,     config.SCORE_MAX_UNDERDOG),
+        ("Timing",   b.timing,            config.SCORE_MAX_TIMING,            b.timing_note),
+        ("Funding",  b.funding_velocity,   config.SCORE_MAX_FUNDING_VELOCITY,  b.funding_velocity_note),
+        ("Size",     b.size_anomaly,       config.SCORE_MAX_SIZE_ANOMALY,      b.size_anomaly_note),
+        ("Age",      b.wallet_age,         config.SCORE_MAX_WALLET_AGE,        b.wallet_age_note),
+        ("Conc",     b.concentration,      config.SCORE_MAX_CONCENTRATION,     b.concentration_note),
+        ("Underdog", b.underdog,           config.SCORE_MAX_UNDERDOG,          b.underdog_note),
     ]
     lines = []
-    for label, score, max_pts in rows:
+    for label, score, max_pts, note in rows:
         score_str = f"{score}/{max_pts}" if score is not None else f"—/{max_pts}"
-        lines.append(f"{label:<10} {score_str:>5}")
+        # Truncate long notes to keep the table readable in Telegram
+        note_short = note[:40] if note else ""
+        lines.append(f"{label:<10} {score_str:>5}  {note_short}")
     if b.cluster_bonus > 0:
-        lines.append(f"{'Cluster':<10}   +{b.cluster_bonus}")
+        lines.append(f"{'Cluster':<10}   +{b.cluster_bonus}  {b.cluster_note[:40]}")
     lines.append(f"{'TOTAL':<10} {b.total:>5}")
     return "\n".join(lines)
-
-
-def _signal_reasons(b: "ScoreBreakdown", p: "WalletProfile", t: "Trade") -> list[str]:
-    """
-    Translate score components into plain-English bullets.
-    Only emit a bullet when the component actually contributed meaningfully.
-    """
-    reasons = []
-
-    # Timing
-    if b.timing is not None and b.timing >= 15:
-        reasons.append(f"⚡ <b>Near resolution</b> — {html.escape(b.timing_note)}")
-    elif b.timing is not None and b.timing >= 8:
-        reasons.append(f"🕐 {html.escape(b.timing_note)}")
-
-    # Win rate
-    if b.win_rate is not None and b.win_rate >= 10:
-        reasons.append(f"🏆 <b>{html.escape(b.win_rate_note)}</b>")
-    elif b.win_rate is not None and b.win_rate > 0:
-        reasons.append(f"📊 {html.escape(b.win_rate_note)}")
-
-    # Size anomaly
-    if b.size_anomaly is not None and b.size_anomaly >= 12:
-        reasons.append(f"📈 <b>{html.escape(b.size_anomaly_note)}</b>")
-    elif b.size_anomaly is not None and b.size_anomaly > 0:
-        reasons.append(f"📈 {html.escape(b.size_anomaly_note)}")
-
-    # Wallet age
-    if b.wallet_age is not None and b.wallet_age >= 10:
-        reasons.append(f"🆕 <b>Wallet age: {html.escape(b.wallet_age_note)}</b>")
-    elif b.wallet_age is not None and b.wallet_age > 0:
-        reasons.append(f"🆕 Wallet age: {html.escape(b.wallet_age_note)}")
-
-    # Concentration
-    if b.concentration is not None and b.concentration >= 7:
-        reasons.append(f"🎯 <b>High conviction: {html.escape(b.concentration_note)}</b>")
-    elif b.concentration is not None and b.concentration > 0:
-        reasons.append(f"🎯 Concentration: {html.escape(b.concentration_note)}")
-
-    # Underdog
-    if b.underdog is not None and b.underdog >= 7:
-        reasons.append(f"🐴 <b>Underdog bet: {html.escape(b.underdog_note)}</b>")
-    elif b.underdog is not None and b.underdog > 0:
-        reasons.append(f"🐴 {html.escape(b.underdog_note)}")
-
-    # Cluster
-    if b.cluster_bonus > 0:
-        reasons.append(f"🔗 <b>Cluster-funded wallet</b> — coordinated activity detected")
-
-    return reasons
 
 
 def format_alert(payload: AlertPayload) -> str:
@@ -218,71 +98,73 @@ def format_alert(payload: AlertPayload) -> str:
     Build the full Telegram HTML message for an alert.
     Uses HTML parse_mode — escape user-controlled strings with html.escape().
 
-    Design philosophy: every line should either help the reader decide
-    whether to act, or help them verify the signal independently.
+    Layout:
+      • Header: score, resolution countdown, proportional bar
+      • Market title + Polymarket link
+      • Bet: side, price, size, payout if wins
+      • Score breakdown: monospace table (all 6 components + cluster bonus)
+      • Wallet: full copyable address, Polygonscan link, age + volume summary
     """
     t = payload.trade
     p = payload.profile
     b = payload.breakdown
 
-    outcome_label = t.outcome.upper() if t.outcome else "UNKNOWN"
+    outcome_label = (t.outcome or "UNKNOWN").upper()
     wallet_addr = t.taker_address or t.maker_address or "unknown"
     polygonscan_url = f"https://polygonscan.com/address/{wallet_addr}"
     market_title = html.escape(payload.market_title or "Unknown Market")
-    resolution_str = _fmt_hours(payload.hours_to_resolution)
-    bar = _score_bar(b.total)
     pct = round(t.price * 100)
 
-    # --- Header ---
-    lines = [
-        f"🚨 <b>INSIDER SIGNAL</b>  |  Score: <b>{b.total}/100</b>  |  ⏰ {resolution_str}",
+    # Resolution countdown
+    h = payload.hours_to_resolution
+    if h is None:
+        res_str = "close unknown"
+    elif h < 0:
+        res_str = "CLOSED"
+    elif h < 1:
+        res_str = f"{int(h * 60)}m to close"
+    elif h < 24:
+        res_str = f"{h:.1f}h to close"
+    elif h < 168:
+        res_str = f"{h / 24:.1f}d to close"
+    else:
+        res_str = f"{h / 24:.0f}d to close"
+
+    bar = _score_bar(b.total)
+
+    lines: list[str] = [
+        f"🚨 <b>INSIDER SIGNAL</b>  •  Score: <b>{b.total}</b>  •  ⏰ {res_str}",
         f"<code>{bar}</code>",
         "",
+        f"<b>{market_title}</b>",
     ]
 
-    # --- Market ---
-    lines.append(f"<b>{market_title}</b>")
     if payload.market_slug:
         polymarket_url = f"https://polymarket.com/event/{payload.market_slug}"
         lines.append(f'<a href="{polymarket_url}">🔮 View on Polymarket</a>')
     lines.append("")
 
-    # --- The bet ---
-    payout_str = _fmt_payout(t.size_usd, t.price, outcome_label)
-    lines += [
-        f"<b>Bet:</b> {outcome_label} @ {pct}¢  |  <b>${t.size_usd:,.0f}</b>",
-    ]
-    if payout_str:
-        lines.append(f"<i>{payout_str}</i>")
+    # Bet details with potential payout
+    if 0 < t.price < 1:
+        profit = t.size_usd * (1 - t.price) / t.price
+        payout_str = f"  •  profit ${profit:,.0f} if {outcome_label} wins"
+    else:
+        payout_str = ""
+    lines.append(f"<b>Bet:</b> {outcome_label} @ {pct}¢  •  <b>${t.size_usd:,.0f}</b>{payout_str}")
     lines.append("")
 
-    # --- Why this fired ---
-    reasons = _signal_reasons(b, p, t)
-    if reasons:
-        lines.append("<b>Why this fired:</b>")
-        lines.extend(f"  {r}" for r in reasons)
-        lines.append("")
-
-    # --- Score breakdown (numerical per-component table) ---
+    # Score breakdown — monospace table
     lines.append("<b>Score breakdown:</b>")
-    lines.append(f"<code>{_fmt_breakdown_table(b)}</code>")
+    lines.append(f"<code>{_fmt_breakdown(b)}</code>")
     lines.append("")
 
-    # --- Wallet (full address, copyable) ---
+    # Wallet — full address so users can verify on-chain independently
     lines += [
         "<b>Wallet</b>",
         f"<code>{html.escape(wallet_addr)}</code>",
-        f'<a href="{polygonscan_url}">🔍 Verify on Polygonscan</a>',
+        f'<a href="{polygonscan_url}">🔍 View on Polygonscan</a>',
+        f"<i>{_fmt_wallet_age(p.wallet_age_days)} · {p.total_trades} trades · ${p.total_volume_usd:,.0f} total volume</i>",
     ]
-
-    # Track record summary inline
-    if p.win_rate is not None and p.resolved_trades > 0:
-        lines.append(
-            f"<i>{p.resolved_trades} resolved bets · {p.win_count} wins · "
-            f"{p.win_rate:.0%} win rate · wallet age {_fmt_wallet_age(p.wallet_age_days)}</i>"
-        )
-    else:
-        lines.append(f"<i>Wallet age: {_fmt_wallet_age(p.wallet_age_days)}</i>")
 
     if not p.profile_complete:
         missing_str = ", ".join(p.missing_components)

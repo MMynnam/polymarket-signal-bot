@@ -8,7 +8,7 @@ Score layout:
   Component              Max pts  Rationale
   ─────────────────────  ───────  ──────────────────────────────────────────
   Timing                    25    Close-to-resolution bets are highest risk/conviction
-  Win rate                  20    Track record is the strongest predictor of edge
+  Funding velocity          20    Short gap between inbound transfer and bet = rapid deploy
   Size anomaly              20    Statistically unusual bets signal conviction
   Wallet age                15    Fresh wallets are often purpose-built for one tip
   Concentration             10    Single-market concentration = high conviction
@@ -17,7 +17,7 @@ Score layout:
   ─────────────────────  ───────
   TOTAL (max)              110
 
-Score ≥ ALERT_INSTANT_THRESHOLD (default 80) → immediate Telegram alert.
+Score ≥ ALERT_INSTANT_THRESHOLD (default 70) → immediate Telegram alert.
 Score ≥ ALERT_DIGEST_THRESHOLD  (default 60) → buffered into periodic digest.
 """
 
@@ -43,7 +43,7 @@ class ScoreBreakdown:
 
     # Individual component scores (None = component skipped / data unavailable)
     timing: Optional[int] = None
-    win_rate: Optional[int] = None
+    funding_velocity: Optional[int] = None
     size_anomaly: Optional[int] = None
     wallet_age: Optional[int] = None
     concentration: Optional[int] = None
@@ -52,7 +52,7 @@ class ScoreBreakdown:
 
     # Human-readable notes for each component (shown in alert)
     timing_note: str = ""
-    win_rate_note: str = ""
+    funding_velocity_note: str = ""
     size_anomaly_note: str = ""
     wallet_age_note: str = ""
     concentration_note: str = ""
@@ -118,63 +118,61 @@ def _score_timing(
 
 
 # ---------------------------------------------------------------------------
-# Component 2 — Win Rate (0–20 pts)
+# Component 2 — Funding Velocity (0–20 pts)
 # ---------------------------------------------------------------------------
 
-def _score_win_rate(
+def _score_funding_velocity(
+    trade_timestamp: Optional[float],
     profile: WalletProfile,
-    max_pts: int = config.SCORE_MAX_WIN_RATE,
+    max_pts: int = config.SCORE_MAX_FUNDING_VELOCITY,
 ) -> tuple[int, str]:
     """
-    Linear interpolation between WINRATE_LOW_THRESHOLD (0 pts) and
-    WINRATE_HIGH_THRESHOLD (max_pts), with a statistical significance
-    multiplier that down-weights wallets with fewer than
-    WINRATE_SIGNIFICANCE_BETS resolved bets.
+    Measures the gap between the wallet's most recent inbound transfer and
+    the trade timestamp. A short gap means the wallet was funded and deployed
+    rapidly — a hallmark of purpose-built insider accounts.
 
-    Rationale:
-      • A wallet with 80%+ win rate over 20+ resolved bets is almost
-        certainly not random — it has edge.
-      • A wallet with 80% over 3 bets could be luck; apply a 50% confidence
-        multiplier to avoid false positives from new wallets.
-      • Below 50% win rate → 0 pts (no edge demonstrated).
+    Gap = trade_timestamp − last_inbound_transfer_ts
 
-    Significance multiplier:
-      sig = min(1.0, resolved_trades / WINRATE_SIGNIFICANCE_BETS)
-      Full weight at 20+ bets. Half weight at 10 bets. Zero at 0 bets.
-      We apply a floor of 0.5 so even 1-bet wallets get half credit if
-      win rate is high (combined with wallet_age component this still produces
-      a meaningful signal for fresh wallets).
+      • Gap ≤ FUNDING_VELOCITY_FAST_HOURS (1h) → max_pts
+      • Gap > FUNDING_VELOCITY_SLOW_HOURS (7 days) → 0 pts
+      • Between: linear decay
+
+    Rationale: Insiders often fund a fresh wallet, place the bet immediately,
+    and withdraw. The funding-to-bet velocity is a direct proxy for
+    premeditation. Wallets where funds sat for weeks before the bet are less
+    suspicious (could be long-term traders). Wallets funded within an hour
+    of the bet are highly anomalous.
+
+    Graceful degradation: if Alchemy is not configured or the fetch failed,
+    profile.last_inbound_transfer_ts will be None and this component returns 0.
     """
-    if "closed_positions" in profile.missing_components:
-        return 0, "N/A (data unavailable)"
+    if trade_timestamp is None or profile.last_inbound_transfer_ts is None:
+        return 0, "N/A (no Alchemy data)"
 
-    if profile.win_rate is None or profile.resolved_trades == 0:
-        return 0, "No resolved bets"
+    gap_seconds = trade_timestamp - profile.last_inbound_transfer_ts
+    if gap_seconds < 0:
+        # Transfer timestamped after the trade — data anomaly, skip.
+        return 0, "N/A (transfer after trade)"
 
-    low = config.WINRATE_LOW_THRESHOLD    # 0.50
-    high = config.WINRATE_HIGH_THRESHOLD  # 0.80
+    gap_hours = gap_seconds / 3600
+    fast = config.FUNDING_VELOCITY_FAST_HOURS   # 1.0h
+    slow = config.FUNDING_VELOCITY_SLOW_HOURS   # 168.0h (7 days)
 
-    if profile.win_rate <= low:
-        return 0, f"{profile.win_rate:.0%} win rate ({profile.resolved_trades} bets)"
-
-    if profile.win_rate >= high:
-        raw_score = max_pts
+    if gap_hours <= fast:
+        score = max_pts
+        note = f"Funded {gap_hours * 60:.0f}m before bet (RAPID)"
+    elif gap_hours >= slow:
+        score = 0
+        note = f"Funded {gap_hours / 24:.0f}d before bet"
     else:
-        # Linear interpolation between low and high.
-        raw_score = max_pts * (profile.win_rate - low) / (high - low)
+        score = round(max_pts * (1 - (gap_hours - fast) / (slow - fast)))
+        score = max(0, min(max_pts, score))
+        if gap_hours < 24:
+            note = f"Funded {gap_hours:.1f}h before bet"
+        else:
+            note = f"Funded {gap_hours / 24:.1f}d before bet"
 
-    # Statistical significance multiplier — floor at 0.5 (generous floor).
-    sig = min(1.0, profile.resolved_trades / config.WINRATE_SIGNIFICANCE_BETS)
-    sig = max(0.5, sig)   # Never penalize below 50%
-
-    final = max(0, min(max_pts, round(raw_score * sig)))
-
-    sig_str = "HIGH" if sig >= 1.0 else f"{sig:.0%} sig"
-    note = (
-        f"{profile.win_rate:.0%} win rate "
-        f"({profile.resolved_trades} bets, {sig_str})"
-    )
-    return final, note
+    return score, note
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +417,7 @@ def compute_score(
     market_end_date: Optional[str],
     profile: WalletProfile,
     current_market_id: Optional[str] = None,
+    trade_timestamp: Optional[float] = None,
 ) -> ScoreBreakdown:
     """
     Compute the full Insider Confidence Score for a single trade + wallet.
@@ -437,6 +436,9 @@ def compute_score(
     current_market_id : str | None
         The conditionId of the market being bet on. Used for concentration
         component to subtract current position if already held.
+    trade_timestamp : float | None
+        Unix timestamp of the trade. Used with profile.last_inbound_transfer_ts
+        to compute funding velocity. Degrades gracefully if None.
 
     Returns
     -------
@@ -465,8 +467,10 @@ def compute_score(
     breakdown.timing, breakdown.timing_note = _score_timing(hours_to_resolution)
     log.debug("Timing score: %d — %s", breakdown.timing, breakdown.timing_note)
 
-    breakdown.win_rate, breakdown.win_rate_note = _score_win_rate(profile)
-    log.debug("Win rate score: %d — %s", breakdown.win_rate, breakdown.win_rate_note)
+    breakdown.funding_velocity, breakdown.funding_velocity_note = _score_funding_velocity(
+        trade_timestamp, profile
+    )
+    log.debug("Funding velocity score: %d — %s", breakdown.funding_velocity, breakdown.funding_velocity_note)
 
     breakdown.size_anomaly, breakdown.size_anomaly_note = _score_size_anomaly(
         trade_size_usd, profile
@@ -490,7 +494,7 @@ def compute_score(
     # --- Sum components (treat None as 0 for degraded components) ---
     component_sum = (
         (breakdown.timing or 0)
-        + (breakdown.win_rate or 0)
+        + (breakdown.funding_velocity or 0)
         + (breakdown.size_anomaly or 0)
         + (breakdown.wallet_age or 0)
         + (breakdown.concentration or 0)
@@ -502,12 +506,12 @@ def compute_score(
     breakdown.total = max(0, min(110, component_sum))
 
     log.info(
-        "Score computed: %d/100 (cluster: +%d) | "
-        "timing=%s win_rate=%s size=%s age=%s conc=%s dog=%s",
+        "Score computed: %d/110 (cluster: +%d) | "
+        "timing=%s funding=%s size=%s age=%s conc=%s dog=%s",
         breakdown.total,
         breakdown.cluster_bonus,
         breakdown.timing,
-        breakdown.win_rate,
+        breakdown.funding_velocity,
         breakdown.size_anomaly,
         breakdown.wallet_age,
         breakdown.concentration,

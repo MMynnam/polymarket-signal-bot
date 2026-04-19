@@ -89,6 +89,9 @@ class WalletProfile:
     cluster_id: Optional[str] = None  # Funding source address if flagged
     in_cluster: bool = False
 
+    # --- Funding velocity ---
+    last_inbound_transfer_ts: Optional[float] = None  # Unix ts of most recent inbound transfer
+
     # --- Metadata ---
     profile_complete: bool = True     # False if any sub-fetch failed
     missing_components: list[str] = field(default_factory=list)
@@ -358,6 +361,58 @@ async def _trace_funding_source(address: str) -> Optional[str]:
     return None
 
 
+async def _fetch_last_inbound_ts(address: str) -> Optional[float]:
+    """
+    Fetch the Unix timestamp of the most recent inbound MATIC or USDC transfer
+    to `address` via Alchemy's alchemy_getAssetTransfers (order=desc, maxCount=1,
+    withMetadata=True).
+
+    Used by scorer.py to compute funding velocity — how quickly this wallet
+    received external funds before placing the bet. A short gap is a strong
+    insider signal (funded and deployed immediately).
+
+    Returns None if Alchemy is unconfigured or the call fails.
+    """
+    if not config.ALCHEMY_RPC_URL:
+        return None
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "alchemy_getAssetTransfers",
+        "params": [{
+            "toAddress": address,
+            "category": ["external", "erc20"],
+            "order": "desc",
+            "maxCount": "0x1",       # Only the most recent transfer
+            "withMetadata": True,    # Required to get blockTimestamp
+        }],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=config.HTTP_TIMEOUT_SECONDS) as client:
+            resp = await client.post(config.ALCHEMY_RPC_URL, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        transfers = data.get("result", {}).get("transfers") or []
+        if not transfers:
+            return None
+
+        # metadata.blockTimestamp is ISO-8601 string when withMetadata=True
+        ts_str = (transfers[0].get("metadata") or {}).get("blockTimestamp")
+        if not ts_str:
+            return None
+
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return dt.timestamp()
+
+    except Exception as exc:
+        log.warning("[Alchemy] Last inbound ts fetch failed for %s: %s", address, exc)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Profile assembly
 # ---------------------------------------------------------------------------
@@ -567,6 +622,15 @@ async def get_wallet_profile(address: str) -> WalletProfile:
                 "[WalletProfiler] New cluster: %s funded by %s (cluster_id=%s)",
                 address, funding_source, cluster_key,
             )
+
+    # --- Last inbound transfer timestamp (for funding velocity scoring) ---
+    last_inbound_ts = await _fetch_last_inbound_ts(address)
+    if last_inbound_ts is not None:
+        profile.last_inbound_transfer_ts = last_inbound_ts
+        log.debug(
+            "[WalletProfiler] %s: last inbound transfer ts=%.0f (%.1f days ago)",
+            address, last_inbound_ts, (time.time() - last_inbound_ts) / 86400,
+        )
 
     # --- Finalize ---
     if missing:

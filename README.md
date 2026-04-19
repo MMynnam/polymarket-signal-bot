@@ -30,14 +30,14 @@ When a trade above the size threshold is detected:
 | Component | Max Pts | What It Measures |
 |---|---|---|
 | **Timing** | 25 | Distance to market resolution. Bets in the final 2 hours score highest. Uses exponential decay curve — score halves roughly every 24 hours. |
-| **Win Rate** | 20 | Historical win rate on resolved positions. 80%+ over 20+ bets = max score. Statistical significance multiplier prevents 1-bet wallets from scoring max. |
+| **Funding Velocity** | 20 | Gap between the wallet's most recent inbound transfer and this bet. Funded and deployed within 1 hour = max score (rapid-deploy insider pattern). Gap > 7 days = 0 pts. Requires Alchemy RPC. |
 | **Size Anomaly** | 20 | How large is this bet vs. the wallet's median? 5× median = max score. First-ever large bet scores 12/20 (no baseline). |
 | **Wallet Age** | 15 | Inverted: newer wallets score higher. Under 30 days = max. Over 1 year = 0. Burner/purpose-built insider wallets are often fresh. |
 | **Concentration** | 10 | What % of the wallet's observable capital is in this single bet? 70%+ = max score. |
 | **Underdog Bet** | 10 | Buying a ≤30% outcome scores max. Betting the favorite (≥60%) scores 0. Smart money on underdogs = information signal. |
 | **Cluster Bonus** | +10 | Binary. If Alchemy traces reveal this wallet was funded from the same source as another recently-flagged wallet, add 10 pts. |
 
-**Two-tier alerting**: Score ≥ `ALERT_INSTANT_THRESHOLD` (default 80) fires an immediate Telegram message. Scores in [`ALERT_DIGEST_THRESHOLD`–79] (default 60–79) are buffered and sent as a compact digest every `DIGEST_INTERVAL_SECONDS` (default 2 hours).
+**Two-tier alerting**: Score ≥ `ALERT_INSTANT_THRESHOLD` (default 70) fires an immediate Telegram message. Scores in [`ALERT_DIGEST_THRESHOLD`–69] (default 60–69) are buffered and sent as a compact digest every `DIGEST_INTERVAL_SECONDS` (default 2 hours).
 
 ---
 

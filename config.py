@@ -138,8 +138,8 @@ DIGEST_CSV_ENABLED: bool = os.getenv("DIGEST_CSV_ENABLED", "true").lower() in ("
 # How close to market close is the bet? (0–25 pts)
 SCORE_MAX_TIMING: int = 25
 
-# Wallet historical win rate on resolved positions (0–20 pts)
-SCORE_MAX_WIN_RATE: int = 20
+# Funding-to-bet velocity: gap between last inbound transfer and the bet (0–20 pts)
+SCORE_MAX_FUNDING_VELOCITY: int = 20
 
 # Bet size vs wallet median (0–20 pts)
 SCORE_MAX_SIZE_ANOMALY: int = 20
@@ -166,6 +166,13 @@ TIMING_ZERO_SCORE_HOURS: float = float(os.getenv("TIMING_ZERO_SCORE_HOURS", str(
 WINRATE_HIGH_THRESHOLD: float = 0.80  # 80%+ → near-max score
 WINRATE_LOW_THRESHOLD: float = 0.50   # 50% or below → 0 pts
 WINRATE_SIGNIFICANCE_BETS: int = 20   # >= 20 resolved bets → full statistical weight
+
+# --- Funding velocity thresholds ---
+# Gap between most recent inbound transfer and the bet.
+# ≤ FAST_HOURS → near-max score (funded and deployed immediately = insider pattern)
+FUNDING_VELOCITY_FAST_HOURS: float = float(os.getenv("FUNDING_VELOCITY_FAST_HOURS", "1.0"))
+# > SLOW_HOURS → 0 pts (funds sat idle long enough to be unremarkable)
+FUNDING_VELOCITY_SLOW_HOURS: float = float(os.getenv("FUNDING_VELOCITY_SLOW_HOURS", str(7 * 24)))  # 7 days
 
 # --- Size anomaly thresholds ---
 SIZE_ANOMALY_HIGH_MULTIPLE: float = 5.0   # 5× median → near-max score
