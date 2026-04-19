@@ -14,7 +14,10 @@
       "Bash(where gh:*)",
       "Read(//c/Users/manny/AppData/Local/Programs//**)",
       "Bash(winget install:*)",
-      "Bash(where.exe gh:*)"
+      "Bash(where.exe gh:*)",
+      "Bash(railway --version)",
+      "Bash(npm install *)",
+      "Bash(railway whoami *)"
     ]
   }
 }
