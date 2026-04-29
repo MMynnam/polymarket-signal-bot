@@ -31,11 +31,11 @@ _SCORE_BUCKET_LABELS = ["60-69", "70-79", "80-89", "90+"]
 # compatibility with rows written before a component was renamed.
 _COMPONENTS = [
     ("timing",        "timing",            None,       25),
-    ("funding_vel",   "funding_velocity",  "win_rate", 20),
+    ("funding_vel",   "funding_velocity",  None,       10),
+    ("win_rate",      "win_rate",          None,       10),
     ("size_anomaly",  "size_anomaly",      None,       20),
-    ("wallet_age",    "wallet_age",        None,       15),
+    ("wallet_age",    "wallet_age",        None,       25),
     ("concentration", "concentration",     None,       10),
-    ("underdog",      "underdog",          None,       10),
     ("cluster",       "cluster_bonus",     None,       10),
 ]
 
@@ -131,8 +131,8 @@ def _component_stats(resolved_rows: list[dict]) -> list[dict]:
 # Main output
 # ---------------------------------------------------------------------------
 
-def print_stats(since_days: Optional[int]) -> None:
-    database.init_db()
+def print_stats(since_days: Optional[int], db_path: Optional[str] = None) -> None:
+    database.init_db(db_path=db_path)
 
     since_ts: Optional[int] = None
     if since_days is not None:
@@ -246,8 +246,14 @@ Examples:
         metavar="N",
         help="Restrict stats to the last N days (default: all time)",
     )
+    parser.add_argument(
+        "--db",
+        default=None,
+        metavar="PATH",
+        help="Path to SQLite database (default: config.SQLITE_DB_PATH)",
+    )
     args = parser.parse_args()
-    print_stats(since_days=args.since_days)
+    print_stats(since_days=args.since_days, db_path=args.db)
 
 
 if __name__ == "__main__":

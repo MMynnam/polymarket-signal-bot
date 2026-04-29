@@ -139,19 +139,23 @@ DIGEST_CSV_ENABLED: bool = os.getenv("DIGEST_CSV_ENABLED", "true").lower() in ("
 SCORE_MAX_TIMING: int = 25
 
 # Funding-to-bet velocity: gap between last inbound transfer and the bet (0–20 pts)
-SCORE_MAX_FUNDING_VELOCITY: int = 20
+SCORE_MAX_FUNDING_VELOCITY: int = 10
+
+# Historical win rate on resolved bets (0–10 pts)
+SCORE_MAX_WIN_RATE: int = 10
 
 # Bet size vs wallet median (0–20 pts)
 SCORE_MAX_SIZE_ANOMALY: int = 20
 
-# Wallet age — newer wallets score higher on this axis (0–15 pts)
-SCORE_MAX_WALLET_AGE: int = 15
+# Wallet age — newer wallets score higher on this axis (0–25 pts)
+SCORE_MAX_WALLET_AGE: int = 25
 
 # Capital concentration in a single market (0–10 pts)
 SCORE_MAX_CONCENTRATION: int = 10
 
-# Betting on the underdog vs. betting the favorite (0–10 pts)
-SCORE_MAX_UNDERDOG: int = 10
+# Betting on the underdog vs. betting the favorite — DISABLED (0 pts)
+# 128-alert backtest: 14% win rate, -0.60 ROI (actively harmful signal).
+SCORE_MAX_UNDERDOG: int = 0
 
 # Cluster bonus: funded from same source as another flagged wallet (0 or +10)
 SCORE_CLUSTER_BONUS: int = 10

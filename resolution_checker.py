@@ -5,13 +5,25 @@ Design:
   • Runs as a supervised asyncio.Task alongside the other bot loops.
   • Each cycle (default: every 1 hour) fetches all pending outcome rows,
     groups them by market_id to minimise Gamma API calls, and checks each
-    unique market for resolution via GET /markets?conditionIds={id}.
-  • When a market is resolved, every pending alert on that market is graded
-    won/lost/invalid and its ROI is computed.
-  • All Gamma API calls reuse the _build_http_client / _get_with_retry helpers
-    from market_discovery so error-handling behaviour is identical.
-  • Failures on individual markets are logged and skipped; the loop never
-    crashes — it retries the same pending rows next cycle.
+    unique market for resolution.
+  • Resolution data comes from the LOCAL markets table, which is refreshed
+    continuously by market_discovery_loop(). This avoids direct Gamma API
+    calls for each market and sidesteps the Gamma conditionIds lookup bug
+    (see NOTE below).
+  • For markets that are past their end_date but whose local raw_json doesn't
+    yet have closed=True (stale snapshot), we also try prices-based resolution
+    directly from outcomePrices, and fall back to a targeted Gamma refresh
+    to fetch the current closed state.
+  • All failures are logged and skipped — the loop retries the same pending
+    rows next cycle.
+
+NOTE: The Gamma GET /markets?conditionIds={id} endpoint returns incorrect
+markets for some conditionIds (returns a completely different market with a
+different conditionId). We therefore do NOT use it as the primary resolution
+source. The local markets table (populated by market_discovery via the events
+endpoint) is reliable and preferred. Targeted Gamma refreshes are attempted
+as a fallback for stale markets, with a conditionId verification step to
+catch and discard wrong responses.
 
 Resolution schema (Gamma /markets endpoint):
   closed          : bool   — market is closed for trading
@@ -25,11 +37,12 @@ import json
 import logging
 import time
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import config
 import database
-from market_discovery import _build_http_client, _get_with_retry
+from market_discovery import _build_http_client, _get_with_retry, _parse_market
 
 log = logging.getLogger("resolution_checker")
 
@@ -78,30 +91,58 @@ def _parse_outcome_list(raw: object) -> list[str]:
     return [str(o) for o in raw]
 
 
+def _is_market_past_end_date(end_date_str: Optional[str], days: float = 0) -> bool:
+    """Return True if the market's end_date is more than `days` days in the past."""
+    if not end_date_str:
+        return False
+    try:
+        end_str = end_date_str.replace("Z", "+00:00")
+        end_dt = datetime.fromisoformat(end_str)
+        return datetime.now(timezone.utc) > end_dt + timedelta(days=days)
+    except Exception:
+        return False
+
+
 def _determine_resolution(
     market_data: dict,
 ) -> tuple[Optional[str], Optional[str], Optional[float]]:
     """
     Inspect a Gamma market dict and return (status, winning_outcome, roi_multiplier).
+    Requires closed=True to proceed — use _determine_resolution_by_prices() for
+    markets that are past their end_date but whose snapshot predates the close.
 
     Returns:
-        (None, None, None)                          — market not yet resolved; skip
-        ("resolved_won",  winning_outcome, roi)     — bet_side won
-        ("resolved_lost", winning_outcome, -1.0)    — bet_side lost
-        ("resolved_invalid", None, 0.0)             — voided / refunded
-
-    Note: ROI is computed by the caller once we know the bet_side.
-    This function only determines the winning outcome; ROI calculation
-    happens in _grade_alert() so the price is taken into account.
+        (None, None, None)                       — not yet resolved; skip
+        ("resolved", winning_outcome, None)      — bet_side won (ROI computed per-alert)
+        ("resolved_invalid", None, 0.0)          — voided / refunded
     """
     if not market_data.get("closed", False):
         return None, None, None
 
+    return _resolve_from_prices(market_data)
+
+
+def _determine_resolution_by_prices(
+    market_data: dict,
+) -> tuple[Optional[str], Optional[str], Optional[float]]:
+    """
+    Like _determine_resolution() but does NOT require closed=True.
+
+    Used for markets that are past their end_date — at that point, outcomePrices
+    reflect the final settled state even if the closed flag wasn't captured in
+    our local snapshot (which was stored while the market was still open).
+    """
+    return _resolve_from_prices(market_data)
+
+
+def _resolve_from_prices(
+    market_data: dict,
+) -> tuple[Optional[str], Optional[str], Optional[float]]:
+    """Shared price-inspection logic for both _determine_resolution variants."""
     prices   = _parse_price_list(market_data.get("outcomePrices", []))
     outcomes = _parse_outcome_list(market_data.get("outcomes", []))
 
     if not prices or not outcomes or len(prices) != len(outcomes):
-        # Insufficient data — treat as unresolved for now.
         return None, None, None
 
     max_price = max(prices)
@@ -150,6 +191,81 @@ def _grade_alert(
 
 
 # ---------------------------------------------------------------------------
+# Targeted Gamma refresh (fallback for stale local data)
+# ---------------------------------------------------------------------------
+
+async def _refresh_market_from_gamma(
+    client,
+    market_id: str,
+) -> Optional[dict]:
+    """
+    Fetch one specific market from Gamma by conditionId and update the local DB.
+    Returns the updated local market dict, or None if:
+      - The Gamma API call failed
+      - Gamma returned a market with a different conditionId (known lookup bug)
+
+    NOTE: Gamma conditionIds lookup returns incorrect markets for some IDs.
+    We verify the returned conditionId matches before trusting the response.
+    """
+    url = f"{config.GAMMA_API_BASE}/markets"
+    try:
+        data = await _get_with_retry(client, url, params={"conditionIds": market_id})
+    except RuntimeError as exc:
+        log.warning(
+            "[ResolutionChecker] Gamma refresh failed for %s: %s", market_id, exc
+        )
+        return None
+
+    if isinstance(data, list):
+        if not data:
+            return None
+        market_data = data[0]
+    elif isinstance(data, dict):
+        market_data = data
+    else:
+        return None
+
+    # Verify Gamma returned the market we asked for.
+    returned_id = (
+        market_data.get("conditionId")
+        or market_data.get("condition_id")
+        or ""
+    )
+    if returned_id and returned_id.lower() != market_id.lower():
+        log.warning(
+            "[ResolutionChecker] Gamma returned wrong conditionId for %s (got %s) "
+            "— ignoring response, using local data only",
+            market_id, returned_id,
+        )
+        return None
+
+    parsed = _parse_market(market_data)
+    if not parsed:
+        return None
+
+    try:
+        database.upsert_market(
+            condition_id=parsed["condition_id"],
+            title=parsed["title"],
+            clob_token_ids=parsed["clob_token_ids"],
+            end_date=parsed["end_date"],
+            raw_json=parsed["raw"],
+            active=parsed["active"],
+        )
+        log.debug(
+            "[ResolutionChecker] Refreshed market %s from Gamma (closed=%s)",
+            market_id, market_data.get("closed"),
+        )
+        return database.get_market(market_id)
+    except Exception as exc:
+        log.error(
+            "[ResolutionChecker] Failed to store refreshed market %s: %s",
+            market_id, exc,
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Per-market resolution check
 # ---------------------------------------------------------------------------
 
@@ -159,35 +275,69 @@ async def _check_market(
     pending_alerts: list[dict],
 ) -> int:
     """
-    Fetch resolution data for one market and grade all pending alerts on it.
+    Check one market for resolution using local DB data, falling back to a
+    targeted Gamma refresh for stale snapshots.
     Returns the number of alerts graded (0 if market not yet resolved).
+
+    Resolution cascade:
+      1. Try standard resolution from local raw_json (requires closed=True).
+      2. If past end_date: try prices-based resolution (closed flag not required).
+      3. If still unresolved and past end_date by >1 day: targeted Gamma refresh,
+         then re-apply steps 1+2 on the refreshed data.
+      4. If >30 days past end_date with no resolution: mark resolved_invalid.
     """
-    url = f"{config.GAMMA_API_BASE}/markets"
-    try:
-        data = await _get_with_retry(client, url, params={"conditionIds": market_id})
-    except RuntimeError as exc:
-        log.error(
-            "[ResolutionChecker] Gamma API failed for market %s: %s — will retry next cycle",
-            market_id, exc,
-        )
-        return 0
+    # Gamma conditionIds lookup returns incorrect markets for some IDs.
+    # Using local markets table (refreshed by market_discovery) instead.
+    market = database.get_market(market_id)
 
-    # /markets returns a list; take the first matching entry.
-    if isinstance(data, list):
-        if not data:
-            log.debug("[ResolutionChecker] Empty response for market %s", market_id)
-            return 0
-        market_data = data[0]
-    elif isinstance(data, dict):
-        market_data = data
-    else:
+    if market is None:
         log.warning(
-            "[ResolutionChecker] Unexpected response shape for market %s: %s",
-            market_id, type(data),
+            "[ResolutionChecker] Market %s not found in local DB — skipping",
+            market_id,
         )
         return 0
 
-    base_status, winning_outcome, _ = _determine_resolution(market_data)
+    raw_json      = market.get("raw_json", {})
+    end_date_str  = market.get("end_date")
+
+    # Step 1: standard resolution (requires closed=True in raw_json).
+    base_status, winning_outcome, _ = _determine_resolution(raw_json)
+
+    # Step 2: past end_date → try prices directly (closed flag not required).
+    if base_status is None and _is_market_past_end_date(end_date_str, days=0):
+        base_status, winning_outcome, _ = _determine_resolution_by_prices(raw_json)
+        if base_status is not None:
+            log.info(
+                "[ResolutionChecker] Market %s resolved from prices (past end_date, "
+                "closed flag not set in local snapshot)",
+                market_id,
+            )
+
+    # Step 3: still unresolved and >1 day past end_date → try Gamma refresh.
+    if base_status is None and _is_market_past_end_date(end_date_str, days=1):
+        log.info(
+            "[ResolutionChecker] Market %s unresolved >1 day past end_date — "
+            "attempting targeted Gamma refresh",
+            market_id,
+        )
+        refreshed = await _refresh_market_from_gamma(client, market_id)
+        if refreshed:
+            refreshed_raw = refreshed.get("raw_json", {})
+            base_status, winning_outcome, _ = _determine_resolution(refreshed_raw)
+            if base_status is None:
+                base_status, winning_outcome, _ = _determine_resolution_by_prices(
+                    refreshed_raw
+                )
+
+    # Step 4: very stale market (>30 days past end_date) with no resolution data.
+    if base_status is None and _is_market_past_end_date(end_date_str, days=30):
+        log.warning(
+            "[ResolutionChecker] Market %s is >30 days past end_date with no "
+            "resolution data — marking resolved_invalid",
+            market_id,
+        )
+        base_status    = "resolved_invalid"
+        winning_outcome = None
 
     if base_status is None:
         log.debug("[ResolutionChecker] Market %s not yet resolved", market_id)
@@ -198,8 +348,11 @@ async def _check_market(
 
     for alert in pending_alerts:
         alert_id  = alert["alert_id"]
-        bet_side  = alert["bet_side"]
-        bet_price = float(alert["bet_price_at_alert"])
+        bet_side  = alert.get("bet_side") or "UNKNOWN"
+        try:
+            bet_price = float(alert["bet_price_at_alert"])
+        except (TypeError, ValueError):
+            bet_price = 0.0
 
         status, roi = _grade_alert(bet_side, bet_price, winning_outcome, base_status)
 
@@ -212,7 +365,8 @@ async def _check_market(
                 resolved_at=resolved_at,
             )
             log.info(
-                "[ResolutionChecker] Graded alert %s — market=%s bet=%s status=%s roi=%s",
+                "[ResolutionChecker] Graded alert %s — market=%s bet=%s "
+                "status=%s roi=%s",
                 alert_id, market_id, bet_side, status,
                 f"{roi:+.2f}" if roi is not None else "N/A",
             )
@@ -233,7 +387,7 @@ async def _check_market(
 async def resolution_checker_loop() -> None:
     """
     Long-running coroutine. Each cycle fetches pending outcome rows, groups
-    them by market, and grades resolved markets via the Gamma API.
+    them by market, and grades resolved markets using local DB data.
     Designed to run as an asyncio.Task under the supervised_task wrapper.
     """
     log.info(
@@ -273,7 +427,7 @@ async def _run_cycle(client) -> None:
         len(pending),
     )
 
-    # Group alerts by market_id to batch API calls.
+    # Group alerts by market_id so we do one DB lookup per unique market.
     by_market: dict[str, list[dict]] = defaultdict(list)
     for alert in pending:
         by_market[alert["market_id"]].append(alert)
@@ -282,8 +436,8 @@ async def _run_cycle(client) -> None:
     for market_id, alerts in by_market.items():
         graded = await _check_market(client, market_id, alerts)
         total_graded += graded
-        # Brief pause between markets to be polite to the Gamma API.
-        await asyncio.sleep(0.25)
+        # Small pause between markets; only matters when Gamma refresh is triggered.
+        await asyncio.sleep(0.1)
 
     log.info(
         "[ResolutionChecker] Cycle complete: %d/%d alert(s) graded",

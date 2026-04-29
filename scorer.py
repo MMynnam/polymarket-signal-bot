@@ -8,11 +8,12 @@ Score layout:
   Component              Max pts  Rationale
   ─────────────────────  ───────  ──────────────────────────────────────────
   Timing                    25    Close-to-resolution bets are highest risk/conviction
-  Funding velocity          20    Short gap between inbound transfer and bet = rapid deploy
+  Funding velocity          10    Short gap between inbound transfer and bet = rapid deploy
+  Win rate                  10    Historical accuracy on resolved bets
   Size anomaly              20    Statistically unusual bets signal conviction
-  Wallet age                15    Fresh wallets are often purpose-built for one tip
+  Wallet age                25    Fresh wallets are often purpose-built for one tip
   Concentration             10    Single-market concentration = high conviction
-  Underdog bet              10    Smart money on underdogs often has information
+  Underdog bet               0    DISABLED — 128-alert backtest: 14% win rate, -0.60 ROI
   Cluster bonus           +10    Coordinated wallets multiply signal strength
   ─────────────────────  ───────
   TOTAL (max)              110
@@ -44,6 +45,7 @@ class ScoreBreakdown:
     # Individual component scores (None = component skipped / data unavailable)
     timing: Optional[int] = None
     funding_velocity: Optional[int] = None
+    win_rate: Optional[int] = None
     size_anomaly: Optional[int] = None
     wallet_age: Optional[int] = None
     concentration: Optional[int] = None
@@ -53,6 +55,7 @@ class ScoreBreakdown:
     # Human-readable notes for each component (shown in alert)
     timing_note: str = ""
     funding_velocity_note: str = ""
+    win_rate_note: str = ""
     size_anomaly_note: str = ""
     wallet_age_note: str = ""
     concentration_note: str = ""
@@ -176,7 +179,54 @@ def _score_funding_velocity(
 
 
 # ---------------------------------------------------------------------------
-# Component 3 — Size Anomaly (0–20 pts)
+# Component 3 — Win Rate (0–10 pts)
+# ---------------------------------------------------------------------------
+
+def _score_win_rate(
+    profile: WalletProfile,
+    max_pts: int = config.SCORE_MAX_WIN_RATE,
+) -> tuple[int, str]:
+    """
+    Historical win rate on resolved bets, weighted by sample size.
+
+      • win_rate ≥ WINRATE_HIGH_THRESHOLD (80%) → max_pts (full weight)
+      • win_rate ≤ WINRATE_LOW_THRESHOLD  (50%) → 0 pts
+      • Between: linear interpolation
+      • Sample size < WINRATE_SIGNIFICANCE_BETS (20): score scaled by
+        (resolved_trades / significance_bets) so thin histories don't
+        dominate the signal.
+
+    Rationale: A wallet with 86% win rate across 30 resolved trades has
+    demonstrated systematic edge. One lucky win from 2 trades does not.
+    """
+    if profile.win_rate is None or profile.resolved_trades == 0:
+        return 0, "N/A (no resolved trades)"
+
+    high = config.WINRATE_HIGH_THRESHOLD  # 0.80
+    low  = config.WINRATE_LOW_THRESHOLD   # 0.50
+    sig  = config.WINRATE_SIGNIFICANCE_BETS  # 20
+
+    wr = profile.win_rate
+    if wr <= low:
+        raw_score = 0
+    elif wr >= high:
+        raw_score = max_pts
+    else:
+        raw_score = round(max_pts * (wr - low) / (high - low))
+
+    # Downweight thin samples.
+    weight = min(1.0, profile.resolved_trades / sig)
+    score = max(0, min(max_pts, round(raw_score * weight)))
+
+    note = (
+        f"{wr:.0%} on {profile.resolved_trades} resolved "
+        f"({'full weight' if weight >= 1.0 else f'{weight:.0%} weight'})"
+    )
+    return score, note
+
+
+# ---------------------------------------------------------------------------
+# Component 5 — Size Anomaly (0–20 pts)
 # ---------------------------------------------------------------------------
 
 def _score_size_anomaly(
@@ -230,7 +280,7 @@ def _score_size_anomaly(
 
 
 # ---------------------------------------------------------------------------
-# Component 4 — Wallet Age (0–15 pts)
+# Component 6 — Wallet Age (0–25 pts)
 # ---------------------------------------------------------------------------
 
 def _score_wallet_age(
@@ -275,7 +325,7 @@ def _score_wallet_age(
 
 
 # ---------------------------------------------------------------------------
-# Component 5 — Concentration (0–10 pts)
+# Component 7 — Concentration (0–10 pts)
 # ---------------------------------------------------------------------------
 
 def _score_concentration(
@@ -332,51 +382,34 @@ def _score_concentration(
 
 
 # ---------------------------------------------------------------------------
-# Component 6 — Underdog Bet (0–10 pts)
+# Component 8 — Underdog Bet — DISABLED (always 0 pts)
 # ---------------------------------------------------------------------------
 
 def _score_underdog(
     price: float,
     max_pts: int = config.SCORE_MAX_UNDERDOG,
 ) -> tuple[int, str]:
-    """
-    Betting on a low-probability outcome (underdog) suggests the bettor
-    has information the market lacks.
+    # Disabled: 128-alert backtest showed 14% win rate, -0.60 ROI.
+    # Underdog price correlated with losses, not insider edge.
+    # Original scoring logic preserved below for reference.
+    implied_prob = round(max(0.0, min(1.0, price)) * 100)
+    return 0, f"{implied_prob}% implied (disabled)"
 
-    price is the CLOB price for the outcome bet (0.0–1.0):
-      • price ≤ UNDERDOG_MAX_PRICE (0.30) → max_pts
-      • price ≥ UNDERDOG_MIN_PRICE (0.60) → 0 pts (clear favorite)
-      • Between: linear interpolation (inverted — lower price = higher score)
-
-    Rationale: Markets are often efficient on favorites. Betting heavily
-    on a 15% outcome with confidence is unusual and may indicate private
-    information. Piling onto a 70% favorite is unremarkable.
-
-    Note: This component interacts interestingly with win rate. A wallet
-    with high win rate AND a history of underdog bets is the strongest
-    possible signal.
-    """
-    price = max(0.0, min(1.0, price))
-
-    low_price = config.UNDERDOG_MAX_PRICE   # 0.30 — max score below this
-    high_price = config.UNDERDOG_MIN_PRICE  # 0.60 — zero score above this
-
-    if price <= low_price:
-        score = max_pts
-        implied_prob = round(price * 100)
-        note = f"${price:.2f} ({implied_prob}% implied — UNDERDOG)"
-    elif price >= high_price:
-        score = 0
-        implied_prob = round(price * 100)
-        note = f"${price:.2f} ({implied_prob}% implied — favorite)"
-    else:
-        # Inverted linear: as price rises from low to high, score falls.
-        score = round(max_pts * (1 - (price - low_price) / (high_price - low_price)))
-        score = max(0, min(max_pts, score))
-        implied_prob = round(price * 100)
-        note = f"${price:.2f} ({implied_prob}% implied)"
-
-    return score, note
+    # --- Original logic (disabled) ---
+    # price = max(0.0, min(1.0, price))
+    # low_price = config.UNDERDOG_MAX_PRICE   # 0.30
+    # high_price = config.UNDERDOG_MIN_PRICE  # 0.60
+    # if price <= low_price:
+    #     score = max_pts
+    #     note = f"${price:.2f} ({round(price*100)}% implied — UNDERDOG)"
+    # elif price >= high_price:
+    #     score = 0
+    #     note = f"${price:.2f} ({round(price*100)}% implied — favorite)"
+    # else:
+    #     score = round(max_pts * (1 - (price - low_price) / (high_price - low_price)))
+    #     score = max(0, min(max_pts, score))
+    #     note = f"${price:.2f} ({round(price*100)}% implied)"
+    # return score, note
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +505,9 @@ def compute_score(
     )
     log.debug("Funding velocity score: %d — %s", breakdown.funding_velocity, breakdown.funding_velocity_note)
 
+    breakdown.win_rate, breakdown.win_rate_note = _score_win_rate(profile)
+    log.debug("Win rate score: %d — %s", breakdown.win_rate, breakdown.win_rate_note)
+
     breakdown.size_anomaly, breakdown.size_anomaly_note = _score_size_anomaly(
         trade_size_usd, profile
     )
@@ -495,6 +531,7 @@ def compute_score(
     component_sum = (
         (breakdown.timing or 0)
         + (breakdown.funding_velocity or 0)
+        + (breakdown.win_rate or 0)
         + (breakdown.size_anomaly or 0)
         + (breakdown.wallet_age or 0)
         + (breakdown.concentration or 0)
@@ -507,15 +544,15 @@ def compute_score(
 
     log.info(
         "Score computed: %d/110 (cluster: +%d) | "
-        "timing=%s funding=%s size=%s age=%s conc=%s dog=%s",
+        "timing=%s funding=%s winrate=%s size=%s age=%s conc=%s",
         breakdown.total,
         breakdown.cluster_bonus,
         breakdown.timing,
         breakdown.funding_velocity,
+        breakdown.win_rate,
         breakdown.size_anomaly,
         breakdown.wallet_age,
         breakdown.concentration,
-        breakdown.underdog,
     )
 
     return breakdown

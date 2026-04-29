@@ -142,16 +142,18 @@ _CURRENT_SCHEMA_VERSION = 2
 _connection: Optional[sqlite3.Connection] = None
 
 
-def init_db() -> None:
+def init_db(db_path: Optional[str] = None) -> None:
     """
     Open the SQLite database, apply the schema, and run any pending
     migrations. Call once at startup before any other database function.
+    db_path overrides config.SQLITE_DB_PATH when provided.
     """
     global _connection
 
-    log.info("Opening SQLite database at: %s", config.SQLITE_DB_PATH)
+    path = db_path or config.SQLITE_DB_PATH
+    log.info("Opening SQLite database at: %s", path)
     _connection = sqlite3.connect(
-        config.SQLITE_DB_PATH,
+        path,
         check_same_thread=False,  # We use a mutex pattern; asyncio tasks share thread
         timeout=30,
     )

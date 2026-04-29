@@ -76,11 +76,13 @@ def _fmt_breakdown(b: "ScoreBreakdown") -> str:
     rows = [
         ("Timing",   b.timing,            config.SCORE_MAX_TIMING,            b.timing_note),
         ("Funding",  b.funding_velocity,   config.SCORE_MAX_FUNDING_VELOCITY,  b.funding_velocity_note),
+        ("Win Rate", b.win_rate,           config.SCORE_MAX_WIN_RATE,          b.win_rate_note),
         ("Size",     b.size_anomaly,       config.SCORE_MAX_SIZE_ANOMALY,      b.size_anomaly_note),
         ("Age",      b.wallet_age,         config.SCORE_MAX_WALLET_AGE,        b.wallet_age_note),
         ("Conc",     b.concentration,      config.SCORE_MAX_CONCENTRATION,     b.concentration_note),
-        ("Underdog", b.underdog,           config.SCORE_MAX_UNDERDOG,          b.underdog_note),
     ]
+    if config.SCORE_MAX_UNDERDOG > 0:
+        rows.append(("Underdog", b.underdog, config.SCORE_MAX_UNDERDOG, b.underdog_note))
     lines = []
     for label, score, max_pts, note in rows:
         score_str = f"{score}/{max_pts}" if score is not None else f"—/{max_pts}"

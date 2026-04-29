@@ -302,6 +302,14 @@ async def amain(dry_run: bool) -> None:
 
     # --- Initialise database ---
     database.init_db()
+
+    # Backfill any alert_history rows that predate the alert_outcomes table.
+    try:
+        from backfill_outcomes import backfill as _backfill_outcomes
+        _backfill_outcomes(db_path=config.SQLITE_DB_PATH)
+    except Exception as exc:
+        log.warning("Startup backfill failed (non-fatal): %s", exc)
+
     stats = database.get_stats()
     log.info(
         "Database loaded: %d active markets, %d cached wallets, %d prior alerts",

@@ -160,6 +160,7 @@ def test_score(breakdown: ScoreBreakdown) -> bool:
         (breakdown.total > 0,                       f"Score is 0 — expected >0, got {breakdown.total}"),
         (breakdown.timing is not None,               "timing component is None"),
         (breakdown.funding_velocity is not None,     "funding_velocity component is None"),
+        (breakdown.win_rate is not None,             "win_rate component is None"),
         (breakdown.size_anomaly is not None,         "size_anomaly component is None"),
         (breakdown.wallet_age is not None,           "wallet_age component is None"),
         (breakdown.cluster_bonus == 10,              f"cluster_bonus should be 10, got {breakdown.cluster_bonus}"),
@@ -175,10 +176,10 @@ def test_score(breakdown: ScoreBreakdown) -> bool:
 
     log.info(
         "  Score breakdown: total=%d | timing=%s | funding=%s | "
-        "size=%s | age=%s | conc=%s | underdog=%s | cluster=+%d",
+        "winrate=%s | size=%s | age=%s | conc=%s | cluster=+%d",
         breakdown.total, breakdown.timing, breakdown.funding_velocity,
-        breakdown.size_anomaly, breakdown.wallet_age,
-        breakdown.concentration, breakdown.underdog, breakdown.cluster_bonus,
+        breakdown.win_rate, breakdown.size_anomaly, breakdown.wallet_age,
+        breakdown.concentration, breakdown.cluster_bonus,
     )
     return all_ok
 
