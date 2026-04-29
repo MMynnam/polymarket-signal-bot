@@ -150,6 +150,7 @@ def print_stats(since_days: Optional[int], db_path: Optional[str] = None) -> Non
     total_roi = stats["total_roi"]
     buckets  = stats["score_buckets"]
     resolved_rows = stats["resolved_rows"]
+    latency_rows  = stats["latency_rows"]
 
     window_str = f"last {since_days} days" if since_days else "all time"
 
@@ -198,6 +199,34 @@ def print_stats(since_days: Optional[int], db_path: Optional[str] = None) -> Non
             f"Score {b['label']:7s}  {b_total:4d} alerts,  "
             f"win rate {b_win_pct:4s},  avg ROI {b_roi}"
         )
+
+    # --- Resolution speed ---
+    _LATENCY_BUCKETS = [
+        ("< 24h",    0,    24),
+        ("1-3 days", 24,   72),
+        ("3-7 days", 72,   168),
+        ("7+ days",  168,  float("inf")),
+    ]
+    _MIN_LATENCY_FOR_SECTION = 10
+
+    if len(latency_rows) >= _MIN_LATENCY_FOR_SECTION:
+        print()
+        print("--- ROI by resolution speed ---")
+        for label, lo, hi in _LATENCY_BUCKETS:
+            bucket_rows = [
+                r for r in latency_rows
+                if lo <= r["resolution_latency_hours"] < hi
+            ]
+            if not bucket_rows:
+                continue
+            b_wins = sum(1 for r in bucket_rows if r["resolution_status"] == "resolved_won")
+            b_roi_vals = [r["roi"] for r in bucket_rows if r["roi"] is not None]
+            b_avg_roi = sum(b_roi_vals) / len(b_roi_vals) if b_roi_vals else None
+            print(
+                f"{label:<10}  {len(bucket_rows):4d} alerts,  "
+                f"win rate {_pct(b_wins, len(bucket_rows)):4s},  "
+                f"avg ROI {_roi_str(b_avg_roi)}"
+            )
 
     # --- Component correlation ---
     if not resolved_rows:

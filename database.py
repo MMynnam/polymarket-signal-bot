@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS alert_outcomes (
                                                 -- | resolved_invalid
     resolved_at             INTEGER,            -- unix timestamp; NULL until resolved
     winning_outcome         TEXT,               -- NULL until resolved
-    roi                     REAL                -- NULL until resolved
+    roi                     REAL,               -- NULL until resolved
+    resolution_latency_hours REAL               -- (resolved_at - created_at) / 3600; NULL until resolved
 );
 CREATE INDEX IF NOT EXISTS idx_alert_outcomes_status
     ON alert_outcomes(resolution_status);
@@ -133,7 +134,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_SCHEMA_VERSION = 2
+_CURRENT_SCHEMA_VERSION = 3
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -223,6 +224,28 @@ def _apply_migrations() -> None:
         db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(2)")
         db.commit()
         log.info("Applied schema migration → version 2")
+
+    if current < 3:
+        # Version 3 — resolution_latency_hours column on alert_outcomes.
+        try:
+            db.execute(
+                "ALTER TABLE alert_outcomes ADD COLUMN resolution_latency_hours REAL"
+            )
+            log.info("Migration 3: added resolution_latency_hours column")
+        except Exception:
+            pass  # Column already exists (idempotent re-run)
+        # Backfill rows that are already resolved.
+        db.execute(
+            """
+            UPDATE alert_outcomes
+            SET resolution_latency_hours = (resolved_at - created_at) / 3600.0
+            WHERE resolved_at IS NOT NULL
+              AND resolution_latency_hours IS NULL
+            """
+        )
+        db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(3)")
+        db.commit()
+        log.info("Applied schema migration → version 3")
 
 
 # ---------------------------------------------------------------------------
@@ -556,6 +579,7 @@ def update_outcome_resolution(
     winning_outcome: Optional[str],
     roi: Optional[float],
     resolved_at: int,
+    resolution_latency_hours: Optional[float] = None,
 ) -> None:
     """
     Update a pending outcome row once the market has resolved.
@@ -565,13 +589,15 @@ def update_outcome_resolution(
         db.execute(
             """
             UPDATE alert_outcomes
-            SET resolution_status = ?,
-                winning_outcome   = ?,
-                roi               = ?,
-                resolved_at       = ?
+            SET resolution_status        = ?,
+                winning_outcome          = ?,
+                roi                      = ?,
+                resolved_at              = ?,
+                resolution_latency_hours = ?
             WHERE alert_id = ?
             """,
-            (status, winning_outcome, roi, resolved_at, alert_id),
+            (status, winning_outcome, roi, resolved_at,
+             resolution_latency_hours, alert_id),
         )
 
 
@@ -675,6 +701,25 @@ def get_outcome_stats(since_timestamp: Optional[int] = None) -> dict[str, Any]:
         params,
     ).fetchall()
 
+    # Resolution latency rows — for speed-bucket breakdown in stats.py.
+    if where_clause:
+        latency_clause = (
+            f"{where_clause} AND resolution_latency_hours IS NOT NULL"
+            f" AND resolution_status IN ('resolved_won','resolved_lost','resolved_invalid')"
+        )
+    else:
+        latency_clause = (
+            "WHERE resolution_latency_hours IS NOT NULL"
+            " AND resolution_status IN ('resolved_won','resolved_lost','resolved_invalid')"
+        )
+    latency_rows = db.execute(
+        f"""
+        SELECT resolution_latency_hours, resolution_status, roi
+        FROM alert_outcomes {latency_clause}
+        """,
+        params,
+    ).fetchall()
+
     return {
         "total":        total,
         "resolved":     resolved,
@@ -686,6 +731,7 @@ def get_outcome_stats(since_timestamp: Optional[int] = None) -> dict[str, Any]:
         "total_roi":    total_roi,
         "score_buckets": buckets,
         "resolved_rows": [dict(r) for r in resolved_rows],
+        "latency_rows":  [dict(r) for r in latency_rows],
     }
 
 

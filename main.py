@@ -25,6 +25,7 @@ import logging
 import signal
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import config
@@ -40,6 +41,42 @@ from trade_monitor import Trade, WebSocketManager, RestTradePoller
 from wallet_profiler import get_wallet_profile
 
 log = logging.getLogger("main")
+
+
+# ---------------------------------------------------------------------------
+# Pre-scorer trade filter
+# ---------------------------------------------------------------------------
+
+def _pre_scorer_filter(trade: Trade, market_end_date: Optional[str]) -> Optional[str]:
+    """
+    Return a human-readable rejection reason if the trade should be dropped
+    before scoring, or None if it passes.
+
+    Checked in order of cheapness (no I/O):
+      1. Price too extreme — market has effectively settled.
+      2. Bet too small — noise, not signal.
+      3. Market already closed — stale REST data arriving post-resolution.
+      4. Market closing too soon — alert cannot be acted on before close.
+    """
+    if trade.price < config.FILTER_MIN_PRICE or trade.price > config.FILTER_MAX_PRICE:
+        return f"price too extreme ({trade.price:.3f})"
+
+    if trade.size_usd < config.FILTER_MIN_BET_SIZE_USD:
+        return f"bet too small (${trade.size_usd:.2f})"
+
+    if market_end_date:
+        try:
+            end_str = market_end_date.replace("Z", "+00:00")
+            end_dt = datetime.fromisoformat(end_str)
+            minutes_remaining = (end_dt - datetime.now(timezone.utc)).total_seconds() / 60
+            if minutes_remaining < 0:
+                return f"market already closed ({-minutes_remaining:.0f}m ago)"
+            if minutes_remaining < config.FILTER_MIN_ACTIONABLE_MINUTES:
+                return f"market closing too soon ({minutes_remaining:.1f}m left)"
+        except Exception:
+            pass  # Unparseable end_date — let the trade through
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +121,13 @@ async def process_trade(
         log.warning("[Pipeline] Trade %s has no wallet address — skipping", trade.trade_id)
         return
 
+    # --- Pre-scorer filter (local DB lookup — cheap; runs before wallet API calls) ---
+    market_end_date = get_market_end_date(trade.market_id)
+    filter_reason = _pre_scorer_filter(trade, market_end_date)
+    if filter_reason:
+        log.debug("[Filter] Rejected trade %s: %s", trade.trade_id, filter_reason)
+        return
+
     # --- Wallet profiling (cache-aware, degrades gracefully) ---
     try:
         profile = await get_wallet_profile(wallet_addr)
@@ -94,9 +138,8 @@ async def process_trade(
         )
         return
 
-    # --- Market metadata ---
+    # --- Market metadata (end_date already fetched above for the filter) ---
     market_title = get_market_title(trade.market_id)
-    market_end_date = get_market_end_date(trade.market_id)
     market_slug = get_market_slug(trade.market_id)
 
     # Compute hours to resolution for the alert formatter too.

@@ -356,6 +356,9 @@ async def _check_market(
 
         status, roi = _grade_alert(bet_side, bet_price, winning_outcome, base_status)
 
+        alert_created_at = alert.get("created_at") or resolved_at
+        latency_hours = (resolved_at - alert_created_at) / 3600.0
+
         try:
             database.update_outcome_resolution(
                 alert_id=alert_id,
@@ -363,6 +366,7 @@ async def _check_market(
                 winning_outcome=winning_outcome,
                 roi=roi,
                 resolved_at=resolved_at,
+                resolution_latency_hours=latency_hours,
             )
             log.info(
                 "[ResolutionChecker] Graded alert %s — market=%s bet=%s "

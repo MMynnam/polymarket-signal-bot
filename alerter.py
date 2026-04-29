@@ -62,6 +62,32 @@ def _fmt_wallet_age(days: Optional[float]) -> str:
     return f"{days / 365:.1f} years"
 
 
+def _fmt_actionability_label(hours_to_resolution: Optional[float]) -> str:
+    """
+    Return an HTML line conveying how much time remains to act on the alert.
+    Tiers match the pre-scorer filter thresholds so the label is always
+    consistent with what gets through the filter.
+    """
+    if hours_to_resolution is None:
+        return "🟢 <b>ACTIONABLE</b> — window unknown"
+    minutes = hours_to_resolution * 60
+    if minutes < 0:
+        return "⚫ <b>EXPIRED</b>"
+    if minutes < 10:
+        return "⚫ <b>EXPIRED</b>"
+    if minutes < 30:
+        return f"🔴 <b>CLOSING</b> — {minutes:.0f}m left"
+    if minutes < 120:
+        h = int(minutes // 60)
+        m = int(minutes % 60)
+        if h > 0:
+            return f"🟡 <b>ACT FAST</b> — {h}h {m}m window"
+        return f"🟡 <b>ACT FAST</b> — {minutes:.0f}m window"
+    h = int(minutes // 60)
+    m = int(minutes % 60)
+    return f"🟢 <b>ACTIONABLE</b> — {h}h {m}m window"
+
+
 def _score_bar(score: int, width: int = 20) -> str:
     """Proportional fill bar scaled to 110 max (100 pts + 10 cluster bonus)."""
     filled = max(0, min(width, round(score / 110 * width)))
@@ -137,6 +163,7 @@ def format_alert(payload: AlertPayload) -> str:
     lines: list[str] = [
         f"🚨 <b>INSIDER SIGNAL</b>  •  Score: <b>{b.total}</b>  •  ⏰ {res_str}",
         f"<code>{bar}</code>",
+        _fmt_actionability_label(payload.hours_to_resolution),
         "",
         f"<b>{market_title}</b>",
     ]

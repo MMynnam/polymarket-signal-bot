@@ -127,6 +127,22 @@ ALCHEMY_RPC_URL: str = os.getenv("ALCHEMY_RPC_URL", "")  # Full URL including AP
 # and sent as a periodic digest every DIGEST_INTERVAL_SECONDS.
 ALERT_INSTANT_THRESHOLD: int = int(os.getenv("ALERT_INSTANT_THRESHOLD", "75"))
 ALERT_DIGEST_THRESHOLD: int = int(os.getenv("ALERT_DIGEST_THRESHOLD", "60"))
+
+# ---------------------------------------------------------------------------
+# Pre-scorer trade filter
+# ---------------------------------------------------------------------------
+
+# Prices outside this band imply the market has effectively settled —
+# no insider edge exists at 1¢ or 99¢.
+FILTER_MIN_PRICE: float = float(os.getenv("FILTER_MIN_PRICE", "0.02"))
+FILTER_MAX_PRICE: float = float(os.getenv("FILTER_MAX_PRICE", "0.98"))
+
+# Bets below this USD notional are treated as noise regardless of score.
+FILTER_MIN_BET_SIZE_USD: float = float(os.getenv("FILTER_MIN_BET_SIZE_USD", "50"))
+
+# If fewer than this many minutes remain before market close, the alert
+# cannot be acted on — filter it before scoring.
+FILTER_MIN_ACTIONABLE_MINUTES: int = int(os.getenv("FILTER_MIN_ACTIONABLE_MINUTES", "10"))
 DIGEST_INTERVAL_SECONDS: int = int(os.getenv("DIGEST_INTERVAL_SECONDS", "7200"))  # 2 hours
 
 # Attach a full-data CSV to each digest message. Set to false if Telegram

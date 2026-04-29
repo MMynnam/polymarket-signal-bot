@@ -48,6 +48,20 @@ log = logging.getLogger("digest")
 
 _BUFFER_MAX = 200
 
+
+def _actionability_emoji(hours_to_resolution: Optional[float]) -> str:
+    """Compact single-emoji actionability indicator for digest entries."""
+    if hours_to_resolution is None:
+        return "🟢"
+    minutes = hours_to_resolution * 60
+    if minutes >= 120:
+        return "🟢"
+    if minutes >= 30:
+        return "🟡"
+    if minutes >= 10:
+        return "🔴"
+    return "⚫"
+
 # CSV columns in output order.
 _CSV_FIELDNAMES = [
     "score",
@@ -266,7 +280,8 @@ def format_digest(
         url = _market_url(p)
         m_link = _market_link(p.market_title or "Unknown Market", url, max_len=80)
         side = (t.outcome or "?").upper()
-        lines.append(f"- <b>{b.total}</b> — <code>{html.escape(wallet_short)}</code>")
+        action_emoji = _actionability_emoji(p.hours_to_resolution)
+        lines.append(f"- {action_emoji} <b>{b.total}</b> — <code>{html.escape(wallet_short)}</code>")
         lines.append(f"   {m_link}")
         lines.append(f"   ${t.size_usd:,.0f} {side} @ {t.price:.2f}")
     lines.append("")
