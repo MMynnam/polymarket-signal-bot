@@ -25,6 +25,7 @@ import httpx
 
 import config
 import database
+from convergence import ConvergenceResult
 from scorer import ScoreBreakdown
 from trade_monitor import Trade
 from wallet_profiler import WalletProfile
@@ -43,7 +44,8 @@ class AlertPayload:
     market_title: str
     market_end_date: Optional[str]   # ISO-8601 string or None
     hours_to_resolution: Optional[float]
-    market_slug: Optional[str] = None   # Polymarket URL slug for direct link
+    market_slug: Optional[str] = None          # Polymarket URL slug for direct link
+    convergence_result: Optional[ConvergenceResult] = None
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +91,8 @@ def _fmt_actionability_label(hours_to_resolution: Optional[float]) -> str:
 
 
 def _score_bar(score: int, width: int = 20) -> str:
-    """Proportional fill bar scaled to 110 max (100 pts + 10 cluster bonus)."""
-    filled = max(0, min(width, round(score / 110 * width)))
+    """Proportional fill bar scaled to 130 max (110 base + 20 convergence bonus)."""
+    filled = max(0, min(width, round(score / 130 * width)))
     return "█" * filled + "░" * (width - filled)
 
 
@@ -117,6 +119,8 @@ def _fmt_breakdown(b: "ScoreBreakdown") -> str:
         lines.append(f"{label:<10} {score_str:>5}  {note_short}")
     if b.cluster_bonus > 0:
         lines.append(f"{'Cluster':<10}   +{b.cluster_bonus}  {b.cluster_note[:40]}")
+    if b.convergence_bonus > 0:
+        lines.append(f"{'Converg':<10}   +{b.convergence_bonus}  {(b.convergence_note or '')[:40]}")
     lines.append(f"{'TOTAL':<10} {b.total:>5}")
     return "\n".join(lines)
 
@@ -186,6 +190,20 @@ def format_alert(payload: AlertPayload) -> str:
     lines.append("<b>Score breakdown:</b>")
     lines.append(f"<code>{_fmt_breakdown(b)}</code>")
     lines.append("")
+
+    # Convergence section — only shown when multiple wallets hit same side
+    cr = payload.convergence_result
+    if cr and cr.is_convergence_alert:
+        wallet_shorts = []
+        for w in cr.wallet_addresses[:5]:
+            wallet_shorts.append(f"{w[:6]}...{w[-4:]}" if len(w) >= 10 else w)
+        wallet_list_str = ", ".join(wallet_shorts)
+        lines.append(
+            f"🔗 <b>CONVERGENCE</b> — {cr.distinct_wallets} wallets,  "
+            f"${cr.total_volume:,.0f} combined vol"
+        )
+        lines.append(f"<i>Wallets: {html.escape(wallet_list_str)}</i>")
+        lines.append("")
 
     # Wallet — full address so users can verify on-chain independently
     lines += [

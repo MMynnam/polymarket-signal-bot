@@ -652,8 +652,8 @@ def get_outcome_stats(since_timestamp: Optional[int] = None) -> dict[str, Any]:
 
     # Score-bucket aggregates.
     buckets = []
-    for lo, hi in [(60, 69), (70, 79), (80, 89), (90, 110)]:
-        label = f"{lo}-{hi}" if hi < 110 else f"{lo}+"
+    for lo, hi in [(75, 79), (80, 89), (90, 99), (100, 130)]:
+        label = f"{lo}-{hi}" if hi < 130 else f"{lo}+"
         if where_clause:
             bucket_clause = f"{where_clause} AND score BETWEEN ? AND ?"
         else:
@@ -661,6 +661,11 @@ def get_outcome_stats(since_timestamp: Optional[int] = None) -> dict[str, Any]:
         bucket_params = params + (lo, hi)
         b_total = db.execute(
             f"SELECT COUNT(*) FROM alert_outcomes {bucket_clause}",
+            bucket_params,
+        ).fetchone()[0]
+        b_resolved = db.execute(
+            f"SELECT COUNT(*) FROM alert_outcomes {bucket_clause}"
+            f" AND resolution_status IN ('resolved_won','resolved_lost','resolved_invalid')",
             bucket_params,
         ).fetchone()[0]
         b_wins = db.execute(
@@ -676,10 +681,11 @@ def get_outcome_stats(since_timestamp: Optional[int] = None) -> dict[str, Any]:
         ).fetchall()
         b_roi = [r[0] for r in b_roi_rows if r[0] is not None]
         buckets.append({
-            "label":   label,
-            "count":   b_total,
-            "wins":    b_wins,
-            "avg_roi": sum(b_roi) / len(b_roi) if b_roi else None,
+            "label":    label,
+            "count":    b_total,
+            "resolved": b_resolved,
+            "wins":     b_wins,
+            "avg_roi":  sum(b_roi) / len(b_roi) if b_roi else None,
         })
 
     # Resolved rows for component-level correlation analysis.

@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import config
+import convergence as convergence_module
 import database
 import market_discovery
 import resolution_checker
@@ -180,6 +181,31 @@ async def process_trade(
         wallet_addr,
     )
 
+    # --- Convergence detection (applied post-scoring, pre-routing) ---
+    convergence_result = None
+    if breakdown.total >= config.ALERT_DIGEST_THRESHOLD:
+        try:
+            convergence_result = await convergence_module.check_convergence(
+                market_id=trade.market_id,
+                bet_side=trade.outcome or "",
+                wallet_address=wallet_addr,
+                score=breakdown.total,
+                trade_id=trade.trade_id,
+                bet_size_usd=trade.size_usd,
+                timestamp=trade.timestamp or time.time(),
+            )
+            if convergence_result.convergence_bonus > 0:
+                n = convergence_result.distinct_wallets
+                breakdown.convergence_bonus = convergence_result.convergence_bonus
+                breakdown.convergence_note = f"{n} wallets, ${convergence_result.total_volume:,.0f} vol"
+                breakdown.total = min(130, breakdown.total + convergence_result.convergence_bonus)
+                log.info(
+                    "[Pipeline] Convergence bonus +%d (distinct_wallets=%d) → total=%d",
+                    convergence_result.convergence_bonus, n, breakdown.total,
+                )
+        except Exception as exc:
+            log.error("[Pipeline] Convergence check failed for trade %s: %s", trade.trade_id, exc)
+
     # --- Threshold check ---
     if breakdown.total < config.ALERT_DIGEST_THRESHOLD:
         log.info(
@@ -196,9 +222,10 @@ async def process_trade(
         market_end_date=market_end_date,
         hours_to_resolution=hours_to_resolution,
         market_slug=market_slug,
+        convergence_result=convergence_result,
     )
 
-    # --- Route: instant (≥ ALERT_INSTANT_THRESHOLD) or digest (60–79) ---
+    # --- Route: instant (≥ ALERT_INSTANT_THRESHOLD) or digest (75–89) ---
     if breakdown.total >= config.ALERT_INSTANT_THRESHOLD:
         await alert_queue.enqueue(payload)
         log.info(

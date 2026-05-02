@@ -79,6 +79,7 @@ _CSV_FIELDNAMES = [
     "concentration",
     "underdog",
     "cluster",
+    "convergence",
     "trade_id",
     "timestamp",
 ]
@@ -166,16 +167,22 @@ def _market_link(title: str, url: str, max_len: int = 80) -> str:
 
 def _score_distribution_lines(entries: list[AlertPayload]) -> list[str]:
     """
-    Build proportional bar lines for 5-point score buckets (60-64 … 75-79).
-    Only non-empty buckets are included. Bars scale so the largest bucket
-    fills 20 characters.
+    Build proportional bar lines for 5-point score buckets derived from config
+    thresholds. Generates 5-point intervals from ALERT_DIGEST_THRESHOLD up to
+    ALERT_INSTANT_THRESHOLD, plus a combined instant+ bucket.
+    Only non-empty buckets are included.
     """
-    buckets = [
-        (75, 79, "75-79"),
-        (70, 74, "70-74"),
-        (65, 69, "65-69"),
-        (60, 64, "60-64"),
-    ]
+    digest = config.ALERT_DIGEST_THRESHOLD
+    instant = config.ALERT_INSTANT_THRESHOLD
+
+    buckets: list[tuple[int, int, str]] = []
+    lo = digest
+    while lo < instant:
+        hi = min(lo + 4, instant - 1)
+        buckets.append((lo, hi, f"{lo}-{hi}"))
+        lo = hi + 1
+    buckets.append((instant, 130, f"{instant}+"))
+
     counts = {
         label: sum(1 for p in entries if lo <= p.breakdown.total <= hi)
         for lo, hi, label in buckets
@@ -281,7 +288,8 @@ def format_digest(
         m_link = _market_link(p.market_title or "Unknown Market", url, max_len=80)
         side = (t.outcome or "?").upper()
         action_emoji = _actionability_emoji(p.hours_to_resolution)
-        lines.append(f"- {action_emoji} <b>{b.total}</b> — <code>{html.escape(wallet_short)}</code>")
+        conv_emoji = "🔗" if b.convergence_bonus > 0 else ""
+        lines.append(f"- {action_emoji}{conv_emoji} <b>{b.total}</b> — <code>{html.escape(wallet_short)}</code>")
         lines.append(f"   {m_link}")
         lines.append(f"   ${t.size_usd:,.0f} {side} @ {t.price:.2f}")
     lines.append("")
@@ -381,6 +389,7 @@ def _write_digest_csv(entries: list[AlertPayload], digest_id: str) -> str:
                 "concentration": b.concentration if b.concentration is not None else "",
                 "underdog":     b.underdog if b.underdog is not None else "",
                 "cluster":      b.cluster_bonus,
+                "convergence":  b.convergence_bonus,
                 "trade_id":     t.trade_id,
                 "timestamp":    ts_str,
             })

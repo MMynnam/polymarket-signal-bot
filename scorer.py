@@ -15,11 +15,12 @@ Score layout:
   Concentration             10    Single-market concentration = high conviction
   Underdog bet               0    DISABLED — 128-alert backtest: 14% win rate, -0.60 ROI
   Cluster bonus           +10    Coordinated wallets multiply signal strength
+  Convergence bonus       +20    Multiple independent wallets, same side, same market
   ─────────────────────  ───────
-  TOTAL (max)              110
+  TOTAL (max)              130
 
-Score ≥ ALERT_INSTANT_THRESHOLD (default 70) → immediate Telegram alert.
-Score ≥ ALERT_DIGEST_THRESHOLD  (default 60) → buffered into periodic digest.
+Score ≥ ALERT_INSTANT_THRESHOLD (default 90) → immediate Telegram alert.
+Score ≥ ALERT_DIGEST_THRESHOLD  (default 75) → buffered into periodic digest.
 """
 
 import logging
@@ -51,6 +52,7 @@ class ScoreBreakdown:
     concentration: Optional[int] = None
     underdog: Optional[int] = None
     cluster_bonus: int = 0
+    convergence_bonus: int = 0
 
     # Human-readable notes for each component (shown in alert)
     timing_note: str = ""
@@ -61,6 +63,7 @@ class ScoreBreakdown:
     concentration_note: str = ""
     underdog_note: str = ""
     cluster_note: str = "No"
+    convergence_note: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -540,6 +543,7 @@ def compute_score(
     )
 
     # Clamp to 0–110 (100 max from components + 10 cluster bonus).
+    # Convergence bonus (+0–20) is applied in main.py after this, clamping to 130.
     breakdown.total = max(0, min(110, component_sum))
 
     log.info(

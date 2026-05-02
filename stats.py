@@ -23,7 +23,7 @@ import database
 _MIN_RESOLVED_FOR_STATS: int = 10
 
 # Score buckets and their display labels, matching database.get_outcome_stats().
-_SCORE_BUCKET_LABELS = ["60-69", "70-79", "80-89", "90+"]
+_SCORE_BUCKET_LABELS = ["75-79", "80-89", "90-99", "100+"]
 
 # Component definitions: (display_label, primary_json_key, fallback_json_key_or_None, max_pts)
 # primary_json_key is the current ScoreBreakdown field name.
@@ -37,6 +37,7 @@ _COMPONENTS = [
     ("wallet_age",    "wallet_age",        None,       25),
     ("concentration", "concentration",     None,       10),
     ("cluster",       "cluster_bonus",     None,       10),
+    ("convergence",   "convergence_bonus", None,       20),
 ]
 
 
@@ -181,24 +182,28 @@ def print_stats(since_days: Optional[int], db_path: Optional[str] = None) -> Non
     print(f"Total simulated ROI:       {_roi_str(total_roi)}")
 
     # --- Score buckets ---
+    _MIN_RESOLVED_FOR_BUCKET = 5
+
     print()
     print("--- ROI by score bucket ---")
     for b in buckets:
         if b["count"] == 0:
             continue
-        b_resolved = sum(
-            1 for r in resolved_rows
-            if r["resolution_status"] != "pending"
-        )
-        # Compute bucket-specific win rate from pre-aggregated counts.
-        b_wins = b["wins"]
+        b_resolved = b["resolved"]
         b_total = b["count"]
-        b_win_pct = _pct(b_wins, b_total)
+        b_wins = b["wins"]
         b_roi = _roi_str(b["avg_roi"])
-        print(
-            f"Score {b['label']:7s}  {b_total:4d} alerts,  "
-            f"win rate {b_win_pct:4s},  avg ROI {b_roi}"
-        )
+        if b_resolved < _MIN_RESOLVED_FOR_BUCKET:
+            print(
+                f"Score {b['label']:7s}  {b_total:4d} alerts  "
+                f"(insufficient data — {b_resolved} resolved)"
+            )
+        else:
+            b_win_pct = _pct(b_wins, b_resolved)
+            print(
+                f"Score {b['label']:7s}  {b_resolved}/{b_total} resolved,  "
+                f"win rate {b_win_pct:4s},  avg ROI {b_roi}"
+            )
 
     # --- Resolution speed ---
     _LATENCY_BUCKETS = [
@@ -252,6 +257,38 @@ def print_stats(since_days: Optional[int], db_path: Optional[str] = None) -> Non
         )
 
     print()
+
+    # --- Convergence summary ---
+    convergence_resolved: list[dict] = []
+    no_convergence_resolved: list[dict] = []
+    for row in resolved_rows:
+        try:
+            bd = json.loads(row["score_breakdown_json"])
+            if bd.get("convergence_bonus", 0) > 0:
+                convergence_resolved.append(row)
+            else:
+                no_convergence_resolved.append(row)
+        except (ValueError, TypeError, KeyError):
+            no_convergence_resolved.append(row)
+
+    if convergence_resolved:
+        print("--- Convergence detection summary ---")
+        c_wins = sum(1 for r in convergence_resolved if r["resolution_status"] == "resolved_won")
+        c_roi_vals = [r["roi"] for r in convergence_resolved if r.get("roi") is not None]
+        c_avg_roi = sum(c_roi_vals) / len(c_roi_vals) if c_roi_vals else None
+        nc_wins = sum(1 for r in no_convergence_resolved if r["resolution_status"] == "resolved_won")
+        nc_roi_vals = [r["roi"] for r in no_convergence_resolved if r.get("roi") is not None]
+        nc_avg_roi = sum(nc_roi_vals) / len(nc_roi_vals) if nc_roi_vals else None
+        print(
+            f"Convergence alerts:     {len(convergence_resolved):4d} resolved  "
+            f"win rate {_pct(c_wins, len(convergence_resolved)):4s}  avg ROI {_roi_str(c_avg_roi)}"
+        )
+        if no_convergence_resolved:
+            print(
+                f"Non-convergence alerts: {len(no_convergence_resolved):4d} resolved  "
+                f"win rate {_pct(nc_wins, len(no_convergence_resolved)):4s}  avg ROI {_roi_str(nc_avg_roi)}"
+            )
+        print()
 
 
 # ---------------------------------------------------------------------------

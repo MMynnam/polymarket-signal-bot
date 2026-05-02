@@ -125,8 +125,8 @@ ALCHEMY_RPC_URL: str = os.getenv("ALCHEMY_RPC_URL", "")  # Full URL including AP
 # Scores >= ALERT_INSTANT_THRESHOLD fire an immediate Telegram message.
 # Scores in [ALERT_DIGEST_THRESHOLD, ALERT_INSTANT_THRESHOLD) are buffered
 # and sent as a periodic digest every DIGEST_INTERVAL_SECONDS.
-ALERT_INSTANT_THRESHOLD: int = int(os.getenv("ALERT_INSTANT_THRESHOLD", "75"))
-ALERT_DIGEST_THRESHOLD: int = int(os.getenv("ALERT_DIGEST_THRESHOLD", "60"))
+ALERT_INSTANT_THRESHOLD: int = int(os.getenv("ALERT_INSTANT_THRESHOLD", "90"))
+ALERT_DIGEST_THRESHOLD: int = int(os.getenv("ALERT_DIGEST_THRESHOLD", "75"))
 
 # ---------------------------------------------------------------------------
 # Pre-scorer trade filter
@@ -175,6 +175,22 @@ SCORE_MAX_UNDERDOG: int = 0
 
 # Cluster bonus: funded from same source as another flagged wallet (0 or +10)
 SCORE_CLUSTER_BONUS: int = 10
+
+# ---------------------------------------------------------------------------
+# Convergence detection — in-memory sliding window
+# ---------------------------------------------------------------------------
+
+# How many hours back to look for same-market, same-side trades.
+CONVERGENCE_WINDOW_HOURS: int = int(os.getenv("CONVERGENCE_WINDOW_HOURS", "4"))
+
+# Minimum distinct wallets required to flag an alert as a convergence event.
+CONVERGENCE_MIN_WALLETS: int = int(os.getenv("CONVERGENCE_MIN_WALLETS", "3"))
+
+# Score bonus added per additional wallet beyond the first (1 wallet = +0, 2 = +5, …).
+CONVERGENCE_BONUS_PER_WALLET: int = int(os.getenv("CONVERGENCE_BONUS_PER_WALLET", "5"))
+
+# Maximum convergence bonus regardless of wallet count (caps at 5+ wallets = +20).
+CONVERGENCE_MAX_BONUS: int = int(os.getenv("CONVERGENCE_MAX_BONUS", "20"))
 
 # --- Timing curve parameters ---
 # Bets placed within this many hours of close score near maximum timing pts.
