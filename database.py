@@ -134,7 +134,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_SCHEMA_VERSION = 3
+_CURRENT_SCHEMA_VERSION = 4
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -246,6 +246,29 @@ def _apply_migrations() -> None:
         db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(3)")
         db.commit()
         log.info("Applied schema migration → version 3")
+
+    if current < 4:
+        # Version 4 — analytical dimensions: category, price band, time-of-day,
+        # contrarian flag, duration, and size anomaly multiple.
+        new_cols = [
+            ("market_category",        "TEXT"),
+            ("bet_price_band",         "TEXT"),
+            ("hours_to_close_at_alert","REAL"),
+            ("trade_hour_utc",         "INTEGER"),
+            ("is_contrarian",          "INTEGER DEFAULT 0"),
+            ("size_anomaly_multiple",  "REAL"),
+        ]
+        for col_name, col_type in new_cols:
+            try:
+                db.execute(
+                    f"ALTER TABLE alert_outcomes ADD COLUMN {col_name} {col_type}"
+                )
+                log.info("Migration 4: added column %s", col_name)
+            except Exception:
+                pass  # Column already exists (idempotent re-run)
+        db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(4)")
+        db.commit()
+        log.info("Applied schema migration → version 4")
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +549,12 @@ def insert_alert_outcome(
     bet_side: str,
     bet_price_at_alert: float,
     bet_size_usd: float,
+    market_category: Optional[str] = None,
+    bet_price_band: Optional[str] = None,
+    hours_to_close_at_alert: Optional[float] = None,
+    trade_hour_utc: Optional[int] = None,
+    is_contrarian: int = 0,
+    size_anomaly_multiple: Optional[float] = None,
 ) -> None:
     """
     Insert a new pending outcome row when an alert fires.
@@ -538,8 +567,10 @@ def insert_alert_outcome(
             INSERT OR IGNORE INTO alert_outcomes
                 (alert_id, created_at, market_id, market_question, wallet_address,
                  score, score_breakdown_json, bet_side, bet_price_at_alert,
-                 bet_size_usd, resolution_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                 bet_size_usd, resolution_status,
+                 market_category, bet_price_band, hours_to_close_at_alert,
+                 trade_hour_utc, is_contrarian, size_anomaly_multiple)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
             """,
             (
                 alert_id,
@@ -552,6 +583,12 @@ def insert_alert_outcome(
                 bet_side,
                 bet_price_at_alert,
                 bet_size_usd,
+                market_category,
+                bet_price_band,
+                hours_to_close_at_alert,
+                trade_hour_utc,
+                is_contrarian,
+                size_anomaly_multiple,
             ),
         )
 
@@ -701,7 +738,8 @@ def get_outcome_stats(since_timestamp: Optional[int] = None) -> dict[str, Any]:
         )
     resolved_rows = db.execute(
         f"""
-        SELECT score, score_breakdown_json, bet_side, roi, resolution_status
+        SELECT score, score_breakdown_json, bet_side, roi, resolution_status,
+               market_category, bet_price_band, trade_hour_utc, is_contrarian
         FROM alert_outcomes {resolved_clause}
         """,
         params,

@@ -53,6 +53,7 @@ class ScoreBreakdown:
     underdog: Optional[int] = None
     cluster_bonus: int = 0
     convergence_bonus: int = 0
+    size_anomaly_multiple: Optional[float] = None
 
     # Human-readable notes for each component (shown in alert)
     timing_note: str = ""
@@ -236,7 +237,7 @@ def _score_size_anomaly(
     trade_size_usd: float,
     profile: WalletProfile,
     max_pts: int = config.SCORE_MAX_SIZE_ANOMALY,
-) -> tuple[int, str]:
+) -> tuple[int, str, Optional[float]]:
     """
     Measures how abnormal this bet is relative to the wallet's historical
     median bet size.
@@ -256,12 +257,12 @@ def _score_size_anomaly(
     are less remarkable (though still scored on other components).
     """
     if "trade_history" in profile.missing_components:
-        return 0, "N/A (data unavailable)"
+        return 0, "N/A (data unavailable)", None
 
     if profile.median_bet_usd is None or profile.median_bet_usd == 0:
         # First large bet — suspicious but we have no baseline.
         note = f"${trade_size_usd:,.0f} (no prior history)"
-        return 12, note
+        return 12, note, None
 
     multiple = trade_size_usd / profile.median_bet_usd
     low = config.SIZE_ANOMALY_LOW_MULTIPLE    # 1.5×
@@ -279,7 +280,7 @@ def _score_size_anomaly(
         f"${trade_size_usd:,.0f} vs median ${profile.median_bet_usd:,.0f} "
         f"({multiple:.1f}x)"
     )
-    return score, note
+    return score, note, multiple
 
 
 # ---------------------------------------------------------------------------
@@ -511,8 +512,8 @@ def compute_score(
     breakdown.win_rate, breakdown.win_rate_note = _score_win_rate(profile)
     log.debug("Win rate score: %d — %s", breakdown.win_rate, breakdown.win_rate_note)
 
-    breakdown.size_anomaly, breakdown.size_anomaly_note = _score_size_anomaly(
-        trade_size_usd, profile
+    breakdown.size_anomaly, breakdown.size_anomaly_note, breakdown.size_anomaly_multiple = (
+        _score_size_anomaly(trade_size_usd, profile)
     )
     log.debug("Size anomaly score: %d — %s", breakdown.size_anomaly, breakdown.size_anomaly_note)
 

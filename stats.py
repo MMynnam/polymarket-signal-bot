@@ -290,6 +290,92 @@ def print_stats(since_days: Optional[int], db_path: Optional[str] = None) -> Non
             )
         print()
 
+    # --- ROI by market category ---
+    _CATEGORIES_ORDER = ["crypto", "sports", "politics", "entertainment", "other"]
+    category_rows = [r for r in resolved_rows if r.get("market_category") is not None]
+    if category_rows:
+        print("--- ROI by market category ---")
+        for cat in _CATEGORIES_ORDER:
+            cat_rows = [r for r in category_rows if r.get("market_category") == cat]
+            if len(cat_rows) < 5:
+                continue
+            cat_wins = sum(1 for r in cat_rows if r["resolution_status"] == "resolved_won")
+            cat_roi_vals = [r["roi"] for r in cat_rows if r.get("roi") is not None]
+            cat_avg_roi = sum(cat_roi_vals) / len(cat_roi_vals) if cat_roi_vals else None
+            print(
+                f"{cat:<14}  {len(cat_rows):4d} resolved,  "
+                f"win rate {_pct(cat_wins, len(cat_rows)):4s},  avg ROI {_roi_str(cat_avg_roi)}"
+            )
+        print()
+
+    # --- ROI by price band ---
+    _BAND_ORDER = [
+        ("longshot",  "longshot  (2-30%)"),
+        ("uncertain", "uncertain (30-50%)"),
+        ("lean",      "lean      (50-70%)"),
+        ("favorite",  "favorite  (70-98%)"),
+    ]
+    band_rows = [r for r in resolved_rows if r.get("bet_price_band") is not None]
+    if band_rows:
+        print("--- ROI by price band ---")
+        for band_key, band_label in _BAND_ORDER:
+            b_rows = [r for r in band_rows if r.get("bet_price_band") == band_key]
+            if len(b_rows) < 5:
+                continue
+            b_wins = sum(1 for r in b_rows if r["resolution_status"] == "resolved_won")
+            b_roi_vals = [r["roi"] for r in b_rows if r.get("roi") is not None]
+            b_avg_roi = sum(b_roi_vals) / len(b_roi_vals) if b_roi_vals else None
+            print(
+                f"{band_label:<22}  {len(b_rows):4d} resolved,  "
+                f"win rate {_pct(b_wins, len(b_rows)):4s},  avg ROI {_roi_str(b_avg_roi)}"
+            )
+        print()
+
+    # --- ROI by time of day (UTC, 6-hour blocks) ---
+    _TOD_BUCKETS = [
+        ("00-05", 0,  6),
+        ("06-11", 6,  12),
+        ("12-17", 12, 18),
+        ("18-23", 18, 24),
+    ]
+    tod_rows = [r for r in resolved_rows if r.get("trade_hour_utc") is not None]
+    if tod_rows:
+        print("--- ROI by time of day (UTC) ---")
+        for label, lo, hi in _TOD_BUCKETS:
+            t_rows = [r for r in tod_rows if lo <= r["trade_hour_utc"] < hi]
+            if len(t_rows) < 5:
+                continue
+            t_wins = sum(1 for r in t_rows if r["resolution_status"] == "resolved_won")
+            t_roi_vals = [r["roi"] for r in t_rows if r.get("roi") is not None]
+            t_avg_roi = sum(t_roi_vals) / len(t_roi_vals) if t_roi_vals else None
+            print(
+                f"{label}  {len(t_rows):4d} resolved,  "
+                f"win rate {_pct(t_wins, len(t_rows)):4s},  avg ROI {_roi_str(t_avg_roi)}"
+            )
+        print()
+
+    # --- Contrarian signals ---
+    contrarian_rows = [r for r in resolved_rows if r.get("is_contrarian") == 1]
+    non_contrarian_rows = [r for r in resolved_rows if r.get("is_contrarian") == 0]
+    if contrarian_rows:
+        print("--- Contrarian signals ---")
+        ct_wins = sum(1 for r in contrarian_rows if r["resolution_status"] == "resolved_won")
+        ct_roi_vals = [r["roi"] for r in contrarian_rows if r.get("roi") is not None]
+        ct_avg_roi = sum(ct_roi_vals) / len(ct_roi_vals) if ct_roi_vals else None
+        print(
+            f"Contrarian alerts:     {len(contrarian_rows):4d} resolved  "
+            f"win rate {_pct(ct_wins, len(contrarian_rows)):4s}  avg ROI {_roi_str(ct_avg_roi)}"
+        )
+        if non_contrarian_rows:
+            nc_wins = sum(1 for r in non_contrarian_rows if r["resolution_status"] == "resolved_won")
+            nc_roi_vals = [r["roi"] for r in non_contrarian_rows if r.get("roi") is not None]
+            nc_avg_roi = sum(nc_roi_vals) / len(nc_roi_vals) if nc_roi_vals else None
+            print(
+                f"Non-contrarian alerts: {len(non_contrarian_rows):4d} resolved  "
+                f"win rate {_pct(nc_wins, len(non_contrarian_rows)):4s}  avg ROI {_roi_str(nc_avg_roi)}"
+            )
+        print()
+
 
 # ---------------------------------------------------------------------------
 # Entry point

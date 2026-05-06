@@ -125,8 +125,8 @@ ALCHEMY_RPC_URL: str = os.getenv("ALCHEMY_RPC_URL", "")  # Full URL including AP
 # Scores >= ALERT_INSTANT_THRESHOLD fire an immediate Telegram message.
 # Scores in [ALERT_DIGEST_THRESHOLD, ALERT_INSTANT_THRESHOLD) are buffered
 # and sent as a periodic digest every DIGEST_INTERVAL_SECONDS.
-ALERT_INSTANT_THRESHOLD: int = int(os.getenv("ALERT_INSTANT_THRESHOLD", "90"))
-ALERT_DIGEST_THRESHOLD: int = int(os.getenv("ALERT_DIGEST_THRESHOLD", "75"))
+ALERT_INSTANT_THRESHOLD: int = int(os.getenv("ALERT_INSTANT_THRESHOLD", "80"))
+ALERT_DIGEST_THRESHOLD: int = int(os.getenv("ALERT_DIGEST_THRESHOLD", "65"))
 
 # ---------------------------------------------------------------------------
 # Pre-scorer trade filter
@@ -143,6 +143,11 @@ FILTER_MIN_BET_SIZE_USD: float = float(os.getenv("FILTER_MIN_BET_SIZE_USD", "50"
 # If fewer than this many minutes remain before market close, the alert
 # cannot be acted on — filter it before scoring.
 FILTER_MIN_ACTIONABLE_MINUTES: int = int(os.getenv("FILTER_MIN_ACTIONABLE_MINUTES", "10"))
+# Market duration window: skip markets closing too soon (sub-24h bucket was unprofitable)
+# or too far from close (> 7 days — insufficient urgency signal, likely noise).
+# When end_date is unavailable, the trade passes through unchanged.
+FILTER_MIN_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MIN_HOURS_TO_CLOSE", "18"))
+FILTER_MAX_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MAX_HOURS_TO_CLOSE", "168"))
 DIGEST_INTERVAL_SECONDS: int = int(os.getenv("DIGEST_INTERVAL_SECONDS", "7200"))  # 2 hours
 
 # Attach a full-data CSV to each digest message. Set to false if Telegram
@@ -174,7 +179,8 @@ SCORE_MAX_CONCENTRATION: int = 10
 SCORE_MAX_UNDERDOG: int = 0
 
 # Cluster bonus: funded from same source as another flagged wallet (0 or +10)
-SCORE_CLUSTER_BONUS: int = 10
+# Zeroed out — fires on every alert, adds no information. Still tracked for analysis.
+SCORE_CLUSTER_BONUS: int = 0
 
 # ---------------------------------------------------------------------------
 # Convergence detection — in-memory sliding window
@@ -190,7 +196,8 @@ CONVERGENCE_MIN_WALLETS: int = int(os.getenv("CONVERGENCE_MIN_WALLETS", "3"))
 CONVERGENCE_BONUS_PER_WALLET: int = int(os.getenv("CONVERGENCE_BONUS_PER_WALLET", "5"))
 
 # Maximum convergence bonus regardless of wallet count (caps at 5+ wallets = +20).
-CONVERGENCE_MAX_BONUS: int = int(os.getenv("CONVERGENCE_MAX_BONUS", "20"))
+# Zeroed out — convergence was anti-predictive in production data. Still tracked for analysis.
+CONVERGENCE_MAX_BONUS: int = int(os.getenv("CONVERGENCE_MAX_BONUS", "0"))
 
 # --- Timing curve parameters ---
 # Bets placed within this many hours of close score near maximum timing pts.

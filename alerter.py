@@ -26,6 +26,7 @@ import httpx
 import config
 import database
 from convergence import ConvergenceResult
+from market_classifier import classify_market, bet_price_band as _bet_price_band
 from scorer import ScoreBreakdown
 from trade_monitor import Trade
 from wallet_profiler import WalletProfile
@@ -203,6 +204,15 @@ def format_alert(payload: AlertPayload) -> str:
             f"${cr.total_volume:,.0f} combined vol"
         )
         lines.append(f"<i>Wallets: {html.escape(wallet_list_str)}</i>")
+        lines.append("")
+
+    # Contrarian section — shown when this trade bets against an established herd
+    if cr and cr.is_contrarian:
+        n = cr.opposite_side_wallets
+        lines.append(
+            f"⚡ <b>CONTRARIAN</b> — betting against "
+            f"{n} wallet{'s' if n != 1 else ''} on the other side"
+        )
         lines.append("")
 
     # Wallet — full address so users can verify on-chain independently
@@ -468,6 +478,8 @@ class AlertQueue:
         # Failures here must never affect alert delivery — log and move on.
         try:
             import json as _json
+            from datetime import datetime as _dt, timezone as _tz
+            _cr = payload.convergence_result
             database.insert_alert_outcome(
                 alert_id=t.trade_id,
                 market_id=t.market_id,
@@ -478,6 +490,12 @@ class AlertQueue:
                 bet_side=t.outcome or "UNKNOWN",
                 bet_price_at_alert=t.price,
                 bet_size_usd=t.size_usd,
+                market_category=classify_market(payload.market_title or ""),
+                bet_price_band=_bet_price_band(t.price),
+                hours_to_close_at_alert=payload.hours_to_resolution,
+                trade_hour_utc=_dt.now(_tz.utc).hour,
+                is_contrarian=1 if (_cr and _cr.is_contrarian) else 0,
+                size_anomaly_multiple=b.size_anomaly_multiple,
             )
             log.debug(
                 "Outcome row inserted for trade %s (market=%s bet=%s @ %.3f)",

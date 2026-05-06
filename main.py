@@ -31,6 +31,7 @@ from typing import Optional
 import config
 import convergence as convergence_module
 import database
+from market_classifier import classify_market, bet_price_band as _bet_price_band
 import market_discovery
 import resolution_checker
 import scorer
@@ -74,6 +75,17 @@ def _pre_scorer_filter(trade: Trade, market_end_date: Optional[str]) -> Optional
                 return f"market already closed ({-minutes_remaining:.0f}m ago)"
             if minutes_remaining < config.FILTER_MIN_ACTIONABLE_MINUTES:
                 return f"market closing too soon ({minutes_remaining:.1f}m left)"
+            hours_to_close = minutes_remaining / 60
+            if hours_to_close < config.FILTER_MIN_HOURS_TO_CLOSE:
+                return (
+                    f"market duration too short "
+                    f"({hours_to_close:.1f}h to close, min {config.FILTER_MIN_HOURS_TO_CLOSE}h)"
+                )
+            if hours_to_close > config.FILTER_MAX_HOURS_TO_CLOSE:
+                return (
+                    f"market duration too long "
+                    f"({hours_to_close:.1f}h to close, max {config.FILTER_MAX_HOURS_TO_CLOSE}h)"
+                )
         except Exception:
             pass  # Unparseable end_date — let the trade through
 
@@ -225,7 +237,7 @@ async def process_trade(
         convergence_result=convergence_result,
     )
 
-    # --- Route: instant (≥ ALERT_INSTANT_THRESHOLD) or digest (75–89) ---
+    # --- Route: instant (≥ ALERT_INSTANT_THRESHOLD) or digest (65–79) ---
     if breakdown.total >= config.ALERT_INSTANT_THRESHOLD:
         await alert_queue.enqueue(payload)
         log.info(
@@ -238,6 +250,7 @@ async def process_trade(
         # otherwise lose this trade from alert_outcomes permanently.
         try:
             import json as _json
+            _now_utc = datetime.now(timezone.utc)
             database.insert_alert_outcome(
                 alert_id=trade.trade_id,
                 market_id=trade.market_id,
@@ -248,6 +261,12 @@ async def process_trade(
                 bet_side=trade.outcome or "UNKNOWN",
                 bet_price_at_alert=trade.price,
                 bet_size_usd=trade.size_usd,
+                market_category=classify_market(market_title or ""),
+                bet_price_band=_bet_price_band(trade.price),
+                hours_to_close_at_alert=hours_to_resolution,
+                trade_hour_utc=_now_utc.hour,
+                is_contrarian=1 if (convergence_result and convergence_result.is_contrarian) else 0,
+                size_anomaly_multiple=breakdown.size_anomaly_multiple,
             )
             log.debug(
                 "[Pipeline] Outcome row inserted for digest trade %s (score=%d)",

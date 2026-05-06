@@ -39,6 +39,8 @@ class ConvergenceResult:
     convergence_bonus: int = 0
     is_convergence_alert: bool = False
     wallet_addresses: list = field(default_factory=list)  # str list
+    is_contrarian: bool = False
+    opposite_side_wallets: int = 0  # distinct wallets on the opposing side
 
 
 # Key: (market_id, bet_side_normalised)
@@ -78,6 +80,8 @@ async def check_convergence(
     key = (market_id, bet_side.strip().lower())
     cutoff = timestamp - config.CONVERGENCE_WINDOW_HOURS * 3600
 
+    opp_distinct = 0
+
     async with _lock:
         # Prune expired entries for this key.
         if key in _window:
@@ -115,6 +119,24 @@ async def check_convergence(
         total_volume = sum(e["bet_size_usd"] for e in seen.values())
         wallet_list = list(seen.keys())
 
+        # Contrarian detection: check if the opposite side has >= CONVERGENCE_MIN_WALLETS.
+        own_side = bet_side.strip().lower()
+        if own_side in ("yes", "no"):
+            opp_side = "no" if own_side == "yes" else "yes"
+            opp_key = (market_id, opp_side)
+            opp_entries = [
+                e for e in _window.get(opp_key, [])
+                if e["timestamp"] >= cutoff
+            ]
+            opp_seen: dict[str, dict] = {}
+            for e in opp_entries:
+                addr = e["wallet_address"]
+                if addr not in opp_seen or e["timestamp"] > opp_seen[addr]["timestamp"]:
+                    opp_seen[addr] = e
+            opp_distinct = len(opp_seen)
+        else:
+            opp_distinct = 0
+
     # Compute bonus outside the lock.
     bonus = min(
         config.CONVERGENCE_MAX_BONUS,
@@ -127,6 +149,8 @@ async def check_convergence(
         convergence_bonus=bonus,
         is_convergence_alert=(distinct_wallets >= config.CONVERGENCE_MIN_WALLETS),
         wallet_addresses=wallet_list,
+        is_contrarian=(opp_distinct >= config.CONVERGENCE_MIN_WALLETS),
+        opposite_side_wallets=opp_distinct,
     )
 
 
