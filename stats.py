@@ -376,6 +376,73 @@ def print_stats(since_days: Optional[int], db_path: Optional[str] = None) -> Non
             )
         print()
 
+    print_trade_stats(since_days=since_days, db_path=db_path)
+
+
+# ---------------------------------------------------------------------------
+# Trading bot performance
+# ---------------------------------------------------------------------------
+
+_TRADING_STARTING_BANKROLL: float = 100.0  # USDC
+
+
+def print_trade_stats(since_days: Optional[int] = None, db_path: Optional[str] = None) -> None:
+    since_ts: Optional[int] = None
+    if since_days is not None:
+        since_ts = int(time.time()) - since_days * 86400
+
+    stats = database.get_trade_stats(since_timestamp=since_ts)
+
+    if stats.get("total", 0) == 0:
+        print()
+        print("=== Trading Bot Performance ===")
+        print("No trades executed yet.")
+        print()
+        return
+
+    total        = stats["total"]
+    resolved     = stats["resolved"]
+    won          = stats["won"]
+    lost         = stats["lost"]
+    total_pnl    = stats["total_pnl"]
+    avg_pnl      = stats["avg_pnl"]
+    avg_slippage = stats["avg_slippage"]
+    max_slippage = stats["max_slippage"]
+
+    def _pnl(v: Optional[float]) -> str:
+        if v is None:
+            return "—"
+        sign = "+" if v >= 0 else ""
+        return f"${sign}{v:.2f}"
+
+    def _slip(v: Optional[float]) -> str:
+        return "—" if v is None else f"{v:.4f}"
+
+    win_rate_str = _pct(won, resolved) if resolved else "—"
+    bankroll = _TRADING_STARTING_BANKROLL + (total_pnl or 0.0)
+    avg_slip_usd = (avg_slippage or 0.0) * (stats.get("size_usdc") or 2.0)
+
+    window_str = f"last {since_days} days" if since_days else "all time"
+
+    print()
+    print("=== Trading Bot Performance ===")
+    print(f"Window: {window_str}")
+    print()
+    print(f"Total trades executed:     {total}")
+    print(f"Resolved:                  {resolved}")
+    print(f"Won:                       {won}  ({win_rate_str})")
+    print(f"Lost:                      {lost}  ({_pct(lost, resolved)})")
+    print()
+    print(f"Actual P&L:                {_pnl(total_pnl)}")
+    print(f"Average P&L per trade:     {_pnl(avg_pnl)}")
+    print(f"Win rate:                  {win_rate_str}")
+    print()
+    print(f"Average slippage:          {_slip(avg_slippage)}")
+    print(f"Max slippage:              {_slip(max_slippage)}")
+    print()
+    print(f"Bankroll:                  ${bankroll:,.2f}  (started at ${_TRADING_STARTING_BANKROLL:.0f})")
+    print()
+
 
 # ---------------------------------------------------------------------------
 # Entry point

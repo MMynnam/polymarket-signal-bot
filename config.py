@@ -271,6 +271,39 @@ HTTP_RETRY_BACKOFF_SECONDS: float = float(os.getenv("HTTP_RETRY_BACKOFF_SECONDS"
 
 DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
 
+# ---------------------------------------------------------------------------
+# Trading bot
+# ---------------------------------------------------------------------------
+
+# Master kill switch. Must be explicitly set to "true" to enable live trades.
+TRADING_ENABLED: bool = os.getenv("TRADING_ENABLED", "false").lower() in ("true", "1", "yes")
+
+# Private key of the wallet that will execute trades (hex, no 0x prefix required).
+# NEVER logged anywhere — only the derived wallet address is logged.
+TRADING_PRIVATE_KEY: str = os.getenv("TRADING_PRIVATE_KEY", "")
+
+# Fixed USDC size per trade. Keep small during initial testing.
+TRADING_BET_SIZE_USDC: float = float(os.getenv("TRADING_BET_SIZE_USDC", "2.0"))
+
+# Risk limits — trading pauses when these are breached.
+TRADING_MAX_DAILY_LOSS_USDC: float = float(os.getenv("TRADING_MAX_DAILY_LOSS_USDC", "10.0"))
+TRADING_MAX_CONCURRENT_POSITIONS: int = int(os.getenv("TRADING_MAX_CONCURRENT_POSITIONS", "10"))
+TRADING_MAX_SINGLE_POSITION_USDC: float = float(os.getenv("TRADING_MAX_SINGLE_POSITION_USDC", "5.0"))
+
+# After N consecutive losses, pause trading for TRADING_PAUSE_DURATION_SECONDS.
+TRADING_CONSECUTIVE_LOSS_PAUSE: int = int(os.getenv("TRADING_CONSECUTIVE_LOSS_PAUSE", "3"))
+TRADING_PAUSE_DURATION_SECONDS: int = int(os.getenv("TRADING_PAUSE_DURATION_SECONDS", "7200"))
+
+# Only execute alerts with score >= this value.
+TRADING_MIN_SCORE: int = int(os.getenv("TRADING_MIN_SCORE", "75"))
+
+# How often to poll alert_outcomes for new tradeable alerts.
+TRADING_POLL_INTERVAL_SECONDS: int = int(os.getenv("TRADING_POLL_INTERVAL_SECONDS", "30"))
+
+# Polymarket CLOB endpoint (constant — not user-configurable).
+TRADING_CLOB_HOST: str = "https://clob.polymarket.com"
+TRADING_CHAIN_ID: int = 137
+
 
 # ---------------------------------------------------------------------------
 # Validation — fail loudly at startup if critical env vars are missing

@@ -127,6 +127,37 @@ CREATE INDEX IF NOT EXISTS idx_flagged_clusters_cluster
     ON flagged_clusters(cluster_id);
 
 -- ------------------------------------------------------------------
+-- ------------------------------------------------------------------
+-- trade_executions: every trade attempt made by the automated trader.
+-- alert_id is a UNIQUE foreign key to alert_outcomes.alert_id.
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS trade_executions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id            TEXT NOT NULL,
+    market_id           TEXT NOT NULL,
+    market_question     TEXT,
+    clob_token_id       TEXT NOT NULL,
+    bet_side            TEXT NOT NULL,
+    bet_price_intended  REAL,
+    bet_price_filled    REAL,
+    slippage            REAL,
+    size_usdc           REAL NOT NULL,
+    order_type          TEXT DEFAULT 'FOK',
+    order_id            TEXT,
+    status              TEXT NOT NULL,   -- filled | partial | rejected | failed | error
+    error_message       TEXT,
+    gas_cost_matic      REAL,
+    created_at          INTEGER NOT NULL,
+    resolved_at         INTEGER,
+    resolution_status   TEXT DEFAULT 'pending',  -- pending | won | lost | invalid
+    pnl                 REAL,
+    UNIQUE(alert_id)
+);
+CREATE INDEX IF NOT EXISTS idx_te_status     ON trade_executions(status);
+CREATE INDEX IF NOT EXISTS idx_te_created    ON trade_executions(created_at);
+CREATE INDEX IF NOT EXISTS idx_te_resolution ON trade_executions(resolution_status);
+
+-- ------------------------------------------------------------------
 -- schema_version: simple migration tracking
 -- ------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -134,7 +165,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_SCHEMA_VERSION = 4
+_CURRENT_SCHEMA_VERSION = 5
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -269,6 +300,13 @@ def _apply_migrations() -> None:
         db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(4)")
         db.commit()
         log.info("Applied schema migration → version 4")
+
+    if current < 5:
+        # Version 5 — trade_executions table (created via _SCHEMA_SQL above;
+        # indexes already applied). Just bump the version record.
+        db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(5)")
+        db.commit()
+        log.info("Applied schema migration → version 5")
 
 
 # ---------------------------------------------------------------------------
@@ -776,6 +814,200 @@ def get_outcome_stats(since_timestamp: Optional[int] = None) -> dict[str, Any]:
         "score_buckets": buckets,
         "resolved_rows": [dict(r) for r in resolved_rows],
         "latency_rows":  [dict(r) for r in latency_rows],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Trade execution helpers
+# ---------------------------------------------------------------------------
+
+def insert_trade_execution(
+    alert_id: str,
+    market_id: str,
+    market_question: str,
+    clob_token_id: str,
+    bet_side: str,
+    size_usdc: float,
+    status: str,
+    bet_price_intended: Optional[float] = None,
+    bet_price_filled: Optional[float] = None,
+    slippage: Optional[float] = None,
+    order_id: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> int:
+    """Log a trade attempt. Returns the new row id. Uses INSERT OR IGNORE so retries are safe."""
+    now = int(time.time())
+    with transaction() as db:
+        cursor = db.execute(
+            """
+            INSERT OR IGNORE INTO trade_executions
+                (alert_id, market_id, market_question, clob_token_id, bet_side,
+                 bet_price_intended, bet_price_filled, slippage, size_usdc,
+                 order_type, order_id, status, error_message, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'FOK', ?, ?, ?, ?)
+            """,
+            (
+                alert_id, market_id, market_question, clob_token_id, bet_side,
+                bet_price_intended, bet_price_filled, slippage, size_usdc,
+                order_id, status, error_message, now,
+            ),
+        )
+        return cursor.lastrowid
+
+
+def get_pending_trade_executions() -> list[dict]:
+    """Return all trade_executions awaiting resolution (status=filled, resolution_status=pending)."""
+    rows = get_db().execute(
+        """
+        SELECT * FROM trade_executions
+        WHERE status = 'filled' AND resolution_status = 'pending'
+        ORDER BY created_at ASC
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_trade_resolution(
+    row_id: int,
+    resolution_status: str,
+    pnl: Optional[float],
+    resolved_at: int,
+) -> None:
+    """Update a filled trade execution with its win/loss outcome and P&L."""
+    with transaction() as db:
+        db.execute(
+            """
+            UPDATE trade_executions
+            SET resolution_status = ?, pnl = ?, resolved_at = ?
+            WHERE id = ?
+            """,
+            (resolution_status, pnl, resolved_at, row_id),
+        )
+
+
+def get_daily_loss() -> float:
+    """Sum of losses (as positive USDC amount) for trades resolved since UTC midnight today."""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    today_start = int(
+        now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    )
+    row = get_db().execute(
+        """
+        SELECT COALESCE(SUM(ABS(pnl)), 0.0) FROM trade_executions
+        WHERE resolution_status = 'lost' AND resolved_at >= ?
+        """,
+        (today_start,),
+    ).fetchone()
+    return float(row[0]) if row else 0.0
+
+
+def get_open_position_count() -> int:
+    """Count of filled trades still pending resolution."""
+    row = get_db().execute(
+        "SELECT COUNT(*) FROM trade_executions WHERE status = 'filled' AND resolution_status = 'pending'"
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def get_consecutive_losses() -> int:
+    """Count the number of consecutive 'lost' resolutions at the head of the resolved history."""
+    rows = get_db().execute(
+        """
+        SELECT resolution_status FROM trade_executions
+        WHERE resolution_status IN ('won', 'lost')
+        ORDER BY resolved_at DESC
+        """
+    ).fetchall()
+    count = 0
+    for row in rows:
+        if row[0] == "lost":
+            count += 1
+        else:
+            break
+    return count
+
+
+def is_market_already_traded(market_id: str) -> bool:
+    """Return True if any trade_execution exists for this market_id (regardless of status)."""
+    row = get_db().execute(
+        "SELECT 1 FROM trade_executions WHERE market_id = ? LIMIT 1",
+        (market_id,),
+    ).fetchone()
+    return row is not None
+
+
+def get_tradeable_alerts(since_timestamp: int, min_score: int) -> list[dict]:
+    """
+    Return alert_outcomes that:
+      - were created after since_timestamp
+      - meet or exceed min_score
+      - are still pending resolution (market is live)
+      - have no corresponding trade_execution yet
+    """
+    rows = get_db().execute(
+        """
+        SELECT ao.alert_id, ao.market_id, ao.market_question, ao.bet_side,
+               ao.bet_price_at_alert, ao.bet_size_usd, ao.score, ao.created_at
+        FROM alert_outcomes ao
+        LEFT JOIN trade_executions te ON ao.alert_id = te.alert_id
+        WHERE ao.created_at > ?
+          AND ao.score >= ?
+          AND ao.resolution_status = 'pending'
+          AND te.alert_id IS NULL
+        ORDER BY ao.created_at ASC
+        """,
+        (since_timestamp, min_score),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_trade_stats(since_timestamp: Optional[int] = None) -> dict[str, Any]:
+    """Aggregate stats for the trading bot performance section in stats.py."""
+    db = get_db()
+
+    w = "WHERE created_at >= ?" if since_timestamp else ""
+    p: tuple = (since_timestamp,) if since_timestamp else ()
+
+    def _and(clause: str) -> tuple[str, tuple]:
+        if w:
+            return f"{w} AND {clause}", p
+        return f"WHERE {clause}", p
+
+    total = db.execute(f"SELECT COUNT(*) FROM trade_executions {w}", p).fetchone()[0]
+    if total == 0:
+        return {"total": 0}
+
+    res_clause, res_p = _and("resolution_status IN ('won','lost','invalid')")
+    resolved = db.execute(f"SELECT COUNT(*) FROM trade_executions {res_clause}", res_p).fetchone()[0]
+    won_clause, won_p = _and("resolution_status = 'won'")
+    won = db.execute(f"SELECT COUNT(*) FROM trade_executions {won_clause}", won_p).fetchone()[0]
+    lost_clause, lost_p = _and("resolution_status = 'lost'")
+    lost = db.execute(f"SELECT COUNT(*) FROM trade_executions {lost_clause}", lost_p).fetchone()[0]
+
+    pnl_clause, pnl_p = _and("pnl IS NOT NULL")
+    pnl_row = db.execute(
+        f"SELECT SUM(pnl), AVG(pnl) FROM trade_executions {pnl_clause}", pnl_p
+    ).fetchone()
+    total_pnl = pnl_row[0]
+    avg_pnl = pnl_row[1]
+
+    slip_clause, slip_p = _and("slippage IS NOT NULL")
+    slip_row = db.execute(
+        f"SELECT AVG(slippage), MAX(slippage) FROM trade_executions {slip_clause}", slip_p
+    ).fetchone()
+    avg_slippage = slip_row[0]
+    max_slippage = slip_row[1]
+
+    return {
+        "total":        total,
+        "resolved":     resolved,
+        "won":          won,
+        "lost":         lost,
+        "total_pnl":    total_pnl,
+        "avg_pnl":      avg_pnl,
+        "avg_slippage": avg_slippage,
+        "max_slippage": max_slippage,
     }
 
 

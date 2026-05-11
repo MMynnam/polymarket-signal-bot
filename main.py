@@ -31,6 +31,7 @@ from typing import Optional
 import config
 import convergence as convergence_module
 import database
+import trader
 from market_classifier import classify_market, bet_price_band as _bet_price_band
 import market_discovery
 import resolution_checker
@@ -496,9 +497,20 @@ async def amain(dry_run: bool) -> None:
             heartbeat_loop(interval_seconds=300),
             name="heartbeat",
         ),
+        asyncio.create_task(
+            supervised_task(
+                trader.trading_loop,
+                name="trader",
+            ),
+            name="trader",
+        ),
     ]
 
-    log.info("All %d tasks started", len(tasks))
+    log.info(
+        "All %d tasks started | trading=%s",
+        len(tasks),
+        "ENABLED" if config.TRADING_ENABLED else "disabled",
+    )
 
     # --- Graceful shutdown on SIGINT / SIGTERM ---
     loop = asyncio.get_event_loop()
