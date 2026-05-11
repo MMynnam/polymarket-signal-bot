@@ -79,6 +79,9 @@ async def check_convergence(
     """
     key = (market_id, bet_side.strip().lower())
     cutoff = timestamp - config.CONVERGENCE_WINDOW_HOURS * 3600
+    # Wider lookback for opposite-side detection: 1-3 day markets trade slowly,
+    # so meaningful opposite-side activity may predate the own-side window.
+    contrarian_cutoff = timestamp - config.CONVERGENCE_CONTRARIAN_WINDOW_HOURS * 3600
 
     opp_distinct = 0
 
@@ -126,7 +129,7 @@ async def check_convergence(
             opp_key = (market_id, opp_side)
             opp_entries = [
                 e for e in _window.get(opp_key, [])
-                if e["timestamp"] >= cutoff
+                if e["timestamp"] >= contrarian_cutoff
             ]
             opp_seen: dict[str, dict] = {}
             for e in opp_entries:

@@ -49,22 +49,38 @@ log = logging.getLogger("main")
 # Pre-scorer trade filter
 # ---------------------------------------------------------------------------
 
-def _pre_scorer_filter(trade: Trade, market_end_date: Optional[str]) -> Optional[str]:
+def _pre_scorer_filter(
+    trade: Trade,
+    market_end_date: Optional[str],
+    market_category: str = "",
+) -> Optional[str]:
     """
     Return a human-readable rejection reason if the trade should be dropped
     before scoring, or None if it passes.
 
     Checked in order of cheapness (no I/O):
       1. Price too extreme — market has effectively settled.
-      2. Bet too small — noise, not signal.
-      3. Market already closed — stale REST data arriving post-resolution.
-      4. Market closing too soon — alert cannot be acted on before close.
+      2. Price outside profitable band — longshots and favorites lose money.
+      3. Bet too small — noise, not signal.
+      4. Excluded market category — e.g. sports (51% win, -0.17 ROI).
+      5. Market already closed — stale REST data arriving post-resolution.
+      6. Market closing too soon — alert cannot be acted on before close.
+      7. Market duration outside profitable window (26–96h).
     """
     if trade.price < config.FILTER_MIN_PRICE or trade.price > config.FILTER_MAX_PRICE:
         return f"price too extreme ({trade.price:.3f})"
 
+    if trade.price < config.FILTER_MIN_BET_PRICE or trade.price > config.FILTER_MAX_BET_PRICE:
+        return (
+            f"price outside profitable band ({trade.price:.3f}, "
+            f"range {config.FILTER_MIN_BET_PRICE}–{config.FILTER_MAX_BET_PRICE})"
+        )
+
     if trade.size_usd < config.FILTER_MIN_BET_SIZE_USD:
         return f"bet too small (${trade.size_usd:.2f})"
+
+    if market_category and market_category in config.FILTER_EXCLUDED_CATEGORIES:
+        return f"excluded category ({market_category})"
 
     if market_end_date:
         try:
@@ -134,9 +150,12 @@ async def process_trade(
         log.warning("[Pipeline] Trade %s has no wallet address — skipping", trade.trade_id)
         return
 
-    # --- Pre-scorer filter (local DB lookup — cheap; runs before wallet API calls) ---
+    # --- Pre-scorer filter (all local DB lookups — cheap; runs before wallet API calls) ---
     market_end_date = get_market_end_date(trade.market_id)
-    filter_reason = _pre_scorer_filter(trade, market_end_date)
+    market_title = get_market_title(trade.market_id)
+    market_slug = get_market_slug(trade.market_id)
+    market_category = classify_market(market_title or "")
+    filter_reason = _pre_scorer_filter(trade, market_end_date, market_category)
     if filter_reason:
         log.debug("[Filter] Rejected trade %s: %s", trade.trade_id, filter_reason)
         return
@@ -150,10 +169,6 @@ async def process_trade(
             wallet_addr, exc, trade.trade_id,
         )
         return
-
-    # --- Market metadata (end_date already fetched above for the filter) ---
-    market_title = get_market_title(trade.market_id)
-    market_slug = get_market_slug(trade.market_id)
 
     # Compute hours to resolution for the alert formatter too.
     hours_to_resolution: Optional[float] = None

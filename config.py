@@ -146,8 +146,22 @@ FILTER_MIN_ACTIONABLE_MINUTES: int = int(os.getenv("FILTER_MIN_ACTIONABLE_MINUTE
 # Market duration window: skip markets closing too soon (sub-24h bucket was unprofitable)
 # or too far from close (> 7 days — insufficient urgency signal, likely noise).
 # When end_date is unavailable, the trade passes through unchanged.
-FILTER_MIN_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MIN_HOURS_TO_CLOSE", "18"))
-FILTER_MAX_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MAX_HOURS_TO_CLOSE", "168"))
+FILTER_MIN_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MIN_HOURS_TO_CLOSE", "26"))
+FILTER_MAX_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MAX_HOURS_TO_CLOSE", "96"))
+
+# Profitable price band: only alert on bets within this range.
+# Distinct from FILTER_MIN/MAX_PRICE (which reject glitch prices at 1-2¢).
+# Data: lean (35-72%) is the only band with positive ROI; longshots and favorites lose.
+FILTER_MIN_BET_PRICE: float = float(os.getenv("FILTER_MIN_BET_PRICE", "0.35"))
+FILTER_MAX_BET_PRICE: float = float(os.getenv("FILTER_MAX_BET_PRICE", "0.72"))
+
+# Market categories to exclude entirely. Parsed as comma-separated string from env.
+# Data: sports showed 51% win rate, -0.17 ROI across 79 resolved alerts.
+FILTER_EXCLUDED_CATEGORIES: list[str] = [
+    c.strip().lower()
+    for c in os.getenv("FILTER_EXCLUDED_CATEGORIES", "sports").split(",")
+    if c.strip()
+]
 DIGEST_INTERVAL_SECONDS: int = int(os.getenv("DIGEST_INTERVAL_SECONDS", "7200"))  # 2 hours
 
 # Attach a full-data CSV to each digest message. Set to false if Telegram
@@ -190,10 +204,14 @@ SCORE_CLUSTER_BONUS: int = 0
 CONVERGENCE_WINDOW_HOURS: int = int(os.getenv("CONVERGENCE_WINDOW_HOURS", "4"))
 
 # Minimum distinct wallets required to flag an alert as a convergence event.
-CONVERGENCE_MIN_WALLETS: int = int(os.getenv("CONVERGENCE_MIN_WALLETS", "3"))
+CONVERGENCE_MIN_WALLETS: int = int(os.getenv("CONVERGENCE_MIN_WALLETS", "2"))
 
 # Score bonus added per additional wallet beyond the first (1 wallet = +0, 2 = +5, …).
 CONVERGENCE_BONUS_PER_WALLET: int = int(os.getenv("CONVERGENCE_BONUS_PER_WALLET", "5"))
+
+# Wider lookback window used only for contrarian detection (opposite side).
+# Longer than CONVERGENCE_WINDOW_HOURS because 1-3 day markets trade slowly.
+CONVERGENCE_CONTRARIAN_WINDOW_HOURS: int = int(os.getenv("CONVERGENCE_CONTRARIAN_WINDOW_HOURS", "8"))
 
 # Maximum convergence bonus regardless of wallet count (caps at 5+ wallets = +20).
 # Zeroed out — convergence was anti-predictive in production data. Still tracked for analysis.
