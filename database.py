@@ -442,6 +442,8 @@ def get_cached_wallet_profile(address: str) -> Optional[dict]:
     return json.loads(row["profile_json"])
 
 
+_WALLET_PROFILE_MAX_ROWS = 2_000
+
 def save_wallet_profile(address: str, profile: dict) -> None:
     """Persist (or overwrite) a wallet profile in the cache."""
     address = address.lower()
@@ -456,6 +458,18 @@ def save_wallet_profile(address: str, profile: dict) -> None:
             """,
             (address, json.dumps(profile), time.time()),
         )
+        count = db.execute("SELECT COUNT(*) FROM wallet_profiles").fetchone()[0]
+        if count > _WALLET_PROFILE_MAX_ROWS:
+            db.execute(
+                """
+                DELETE FROM wallet_profiles WHERE address IN (
+                    SELECT address FROM wallet_profiles
+                    ORDER BY fetched_at ASC
+                    LIMIT ?
+                )
+                """,
+                (count - _WALLET_PROFILE_MAX_ROWS,),
+            )
     log.debug("Wallet profile cached for %s", address)
 
 

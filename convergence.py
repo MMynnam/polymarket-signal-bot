@@ -49,8 +49,8 @@ _window: dict[tuple, list] = {}
 _lock = asyncio.Lock()
 
 # Safety valve: if total entries across all keys exceeds this, prune oldest.
-_MAX_TOTAL_ENTRIES: int = 10_000
-_PRUNE_TARGET: int = 8_000
+_MAX_TOTAL_ENTRIES: int = 2_000
+_PRUNE_TARGET: int = 1_500
 
 
 # ---------------------------------------------------------------------------

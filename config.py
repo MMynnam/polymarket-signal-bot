@@ -93,7 +93,7 @@ GAMMA_MARKETS_LIMIT: int = int(os.getenv("GAMMA_MARKETS_LIMIT", "200"))
 # ---------------------------------------------------------------------------
 
 # SQLite cache TTL for wallet profiles — don't re-fetch within this window.
-WALLET_CACHE_TTL_SECONDS: int = int(os.getenv("WALLET_CACHE_TTL_SECONDS", str(6 * 3600)))  # 6 hours
+WALLET_CACHE_TTL_SECONDS: int = int(os.getenv("WALLET_CACHE_TTL_SECONDS", str(2 * 3600)))  # 2 hours
 
 # Max trades to pull per wallet for history analysis.
 WALLET_TRADE_HISTORY_LIMIT: int = int(os.getenv("WALLET_TRADE_HISTORY_LIMIT", "10000"))
