@@ -400,14 +400,15 @@ def print_trade_stats(since_days: Optional[int] = None, db_path: Optional[str] =
         print()
         return
 
-    total        = stats["total"]
-    resolved     = stats["resolved"]
-    won          = stats["won"]
-    lost         = stats["lost"]
-    total_pnl    = stats["total_pnl"]
-    avg_pnl      = stats["avg_pnl"]
-    avg_slippage = stats["avg_slippage"]
-    max_slippage = stats["max_slippage"]
+    total         = stats["total"]
+    resolved      = stats["resolved"]
+    won           = stats["won"]
+    lost          = stats["lost"]
+    total_pnl     = stats["total_pnl"]
+    avg_pnl       = stats["avg_pnl"]
+    avg_slippage  = stats["avg_slippage"]
+    max_slippage  = stats["max_slippage"]
+    avg_size_usdc = stats.get("avg_size_usdc")
 
     def _pnl(v: Optional[float]) -> str:
         if v is None:
@@ -420,9 +421,26 @@ def print_trade_stats(since_days: Optional[int] = None, db_path: Optional[str] =
 
     win_rate_str = _pct(won, resolved) if resolved else "—"
     bankroll = _TRADING_STARTING_BANKROLL + (total_pnl or 0.0)
-    avg_slip_usd = (avg_slippage or 0.0) * (stats.get("size_usdc") or 2.0)
 
     window_str = f"last {since_days} days" if since_days else "all time"
+
+    # Sizing mode description
+    if config.TRADING_USE_DYNAMIC_SIZING:
+        sizing_mode = (
+            f"Dynamic ({config.TRADING_BET_PERCENTAGE * 100:.0f}% of bankroll, "
+            f"${config.TRADING_MIN_BET_USDC:.2f}–${config.TRADING_MAX_BET_USDC:.2f})"
+        )
+    else:
+        sizing_mode = f"Fixed (${config.TRADING_BET_SIZE_USDC:.2f})"
+
+    # Vault sweep stats
+    sweep_stats = database.get_vault_sweep_stats()
+    sweep_count = sweep_stats["sweep_count"]
+    total_swept = sweep_stats["total_swept"]
+    if sweep_count > 0:
+        sweep_str = f"{sweep_count} sweep{'s' if sweep_count != 1 else ''}, ${total_swept:.2f} total"
+    else:
+        sweep_str = "none"
 
     print()
     print("=== Trading Bot Performance ===")
@@ -440,7 +458,10 @@ def print_trade_stats(since_days: Optional[int] = None, db_path: Optional[str] =
     print(f"Average slippage:          {_slip(avg_slippage)}")
     print(f"Max slippage:              {_slip(max_slippage)}")
     print()
-    print(f"Bankroll:                  ${bankroll:,.2f}  (started at ${_TRADING_STARTING_BANKROLL:.0f})")
+    print(f"Sizing mode:               {sizing_mode}")
+    print(f"Average bet size:          {'$'+f'{avg_size_usdc:.2f}' if avg_size_usdc else '—'}")
+    print(f"Bankroll (est.):           ${bankroll:,.2f}  (started at ${_TRADING_STARTING_BANKROLL:.0f})")
+    print(f"Vault sweeps:              {sweep_str}")
     print()
 
 

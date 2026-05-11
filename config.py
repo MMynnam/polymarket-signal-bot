@@ -304,6 +304,27 @@ TRADING_POLL_INTERVAL_SECONDS: int = int(os.getenv("TRADING_POLL_INTERVAL_SECOND
 TRADING_CLOB_HOST: str = "https://clob.polymarket.com"
 TRADING_CHAIN_ID: int = 137
 
+# Dynamic position sizing (disabled by default).
+# When enabled, bet size = balance × TRADING_BET_PERCENTAGE, clamped to [MIN, MAX].
+# Requires TRADING_DYNAMIC_MIN_RESOLVED resolved trades before activating — uses
+# fixed TRADING_BET_SIZE_USDC until then.
+TRADING_USE_DYNAMIC_SIZING: bool = os.getenv("TRADING_USE_DYNAMIC_SIZING", "false").lower() in ("true", "1", "yes")
+TRADING_BET_PERCENTAGE: float = float(os.getenv("TRADING_BET_PERCENTAGE", "0.02"))       # 2% of bankroll
+TRADING_MIN_BET_USDC: float = float(os.getenv("TRADING_MIN_BET_USDC", "1.0"))            # floor
+TRADING_MAX_BET_USDC: float = float(os.getenv("TRADING_MAX_BET_USDC", "10.0"))           # ceiling
+TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20")) # warmup guard
+
+# Profit sweeping — transfers excess USDC to a vault wallet (disabled by default).
+# Requires both VAULT_WALLET_ADDRESS and VAULT_SWEEP_ENABLED=true.
+VAULT_WALLET_ADDRESS: str = os.getenv("VAULT_WALLET_ADDRESS", "")
+VAULT_SWEEP_THRESHOLD_USDC: float = float(os.getenv("VAULT_SWEEP_THRESHOLD_USDC", "150.0"))
+VAULT_SWEEP_FLOOR_USDC: float = float(os.getenv("VAULT_SWEEP_FLOOR_USDC", "110.0"))
+VAULT_SWEEP_INTERVAL_SECONDS: int = int(os.getenv("VAULT_SWEEP_INTERVAL_SECONDS", "3600"))
+VAULT_SWEEP_ENABLED: bool = bool(
+    VAULT_WALLET_ADDRESS
+    and os.getenv("VAULT_SWEEP_ENABLED", "false").lower() in ("true", "1", "yes")
+)
+
 
 # ---------------------------------------------------------------------------
 # Validation — fail loudly at startup if critical env vars are missing

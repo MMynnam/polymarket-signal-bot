@@ -44,6 +44,37 @@ _RESOLUTION_CHECK_INTERVAL_SECONDS: int = 600  # 10 minutes
 # Wallet address derived at startup (never contains the private key).
 _wallet_address: str = ""
 
+# ---------------------------------------------------------------------------
+# USDC contract constants (Polygon — bridged USDC.e)
+# ---------------------------------------------------------------------------
+
+_USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+_USDC_DECIMALS = 6
+_USDC_BALANCE_ABI = [
+    {
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+_USDC_TRANSFER_ABI = [
+    {
+        "inputs": [
+            {"name": "to", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+        ],
+        "name": "transfer",
+        "outputs": [{"name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    }
+]
+
+# Minimum MATIC balance required to send a Polygon transaction.
+_SWEEP_MIN_MATIC: float = 0.01
+
 
 # ---------------------------------------------------------------------------
 # CLOB client initialisation
@@ -79,6 +110,222 @@ def _get_wallet_address() -> str:
     except Exception as exc:
         log.warning("[Trader] Could not derive wallet address: %s", exc)
         return "<unknown>"
+
+
+# ---------------------------------------------------------------------------
+# On-chain balance helpers (synchronous cores wrapped in asyncio.to_thread)
+# ---------------------------------------------------------------------------
+
+def _get_usdc_balance_sync() -> float:
+    """Read USDC.e balanceOf(_wallet_address) on Polygon (free view call)."""
+    from web3 import Web3
+    rpc = config.ALCHEMY_RPC_URL or "https://polygon-rpc.com"
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(_USDC_CONTRACT),
+        abi=_USDC_BALANCE_ABI,
+    )
+    raw = contract.functions.balanceOf(
+        Web3.to_checksum_address(_wallet_address)
+    ).call()
+    return raw / (10 ** _USDC_DECIMALS)
+
+
+async def _get_usdc_balance() -> float:
+    return await asyncio.to_thread(_get_usdc_balance_sync)
+
+
+def _get_matic_balance_sync() -> float:
+    """Read native MATIC balance of _wallet_address (free view call)."""
+    from web3 import Web3
+    rpc = config.ALCHEMY_RPC_URL or "https://polygon-rpc.com"
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
+    raw = w3.eth.get_balance(Web3.to_checksum_address(_wallet_address))
+    return float(w3.from_wei(raw, "ether"))
+
+
+# ---------------------------------------------------------------------------
+# Dynamic position sizing
+# ---------------------------------------------------------------------------
+
+async def _calculate_bet_size() -> float:
+    """
+    Return the USDC amount to bet on the next trade.
+
+    Fixed mode (default): always returns config.TRADING_BET_SIZE_USDC.
+    Dynamic mode: balance × TRADING_BET_PERCENTAGE, clamped to [MIN, MAX].
+    Dynamic mode requires TRADING_DYNAMIC_MIN_RESOLVED resolved trades first;
+    falls back to fixed until the warmup guard is satisfied.
+    """
+    if not config.TRADING_USE_DYNAMIC_SIZING:
+        return config.TRADING_BET_SIZE_USDC
+
+    stats = database.get_trade_stats()
+    resolved = stats.get("resolved", 0)
+    if resolved < config.TRADING_DYNAMIC_MIN_RESOLVED:
+        log.info(
+            "[Trader] Dynamic sizing requires %d resolved trades, have %d. Using fixed $%.2f",
+            config.TRADING_DYNAMIC_MIN_RESOLVED, resolved, config.TRADING_BET_SIZE_USDC,
+        )
+        return config.TRADING_BET_SIZE_USDC
+
+    try:
+        balance = await _get_usdc_balance()
+    except Exception as exc:
+        log.warning(
+            "[Trader] USDC balance fetch failed for dynamic sizing: %s — using fixed $%.2f",
+            exc, config.TRADING_BET_SIZE_USDC,
+        )
+        return config.TRADING_BET_SIZE_USDC
+
+    raw_size = balance * config.TRADING_BET_PERCENTAGE
+    clamped = max(config.TRADING_MIN_BET_USDC, min(config.TRADING_MAX_BET_USDC, raw_size))
+
+    log.info(
+        "[Trader] Dynamic sizing: balance=$%.2f × %.1f%% = $%.2f → clamped to $%.2f",
+        balance, config.TRADING_BET_PERCENTAGE * 100, raw_size, clamped,
+    )
+    return clamped
+
+
+# ---------------------------------------------------------------------------
+# Vault sweep
+# ---------------------------------------------------------------------------
+
+def _send_usdc_sync(to_address: str, amount_usdc: float) -> str:
+    """Transfer USDC.e on Polygon. Returns tx hash hex string."""
+    from web3 import Web3
+    from eth_account import Account
+
+    rpc = config.ALCHEMY_RPC_URL or "https://polygon-rpc.com"
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+
+    usdc = w3.eth.contract(
+        address=Web3.to_checksum_address(_USDC_CONTRACT),
+        abi=_USDC_TRANSFER_ABI,
+    )
+    amount_raw = int(amount_usdc * (10 ** _USDC_DECIMALS))
+    from_addr = Web3.to_checksum_address(_wallet_address)
+
+    tx = usdc.functions.transfer(
+        Web3.to_checksum_address(to_address),
+        amount_raw,
+    ).build_transaction({
+        "from":     from_addr,
+        "nonce":    w3.eth.get_transaction_count(from_addr),
+        "gas":      100_000,
+        "gasPrice": w3.eth.gas_price,
+        "chainId":  config.TRADING_CHAIN_ID,
+    })
+
+    account = Account.from_key(config.TRADING_PRIVATE_KEY)
+    signed = account.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    return tx_hash.hex()
+
+
+async def _check_and_sweep() -> None:
+    """
+    If USDC balance exceeds VAULT_SWEEP_THRESHOLD_USDC, transfer the excess
+    (balance − VAULT_SWEEP_FLOOR_USDC) to VAULT_WALLET_ADDRESS.
+
+    Safety checks before any transfer:
+      1. VAULT_SWEEP_ENABLED must be true (env-var guard).
+      2. Sweep amount is always balance − floor, never the full balance.
+      3. Open-position check: floor must cover worst-case committed capital.
+      4. MATIC gas check: skip if wallet cannot pay gas.
+    """
+    if not config.VAULT_SWEEP_ENABLED:
+        return
+
+    try:
+        balance = await _get_usdc_balance()
+    except Exception as exc:
+        log.warning("[Vault] Could not fetch USDC balance: %s — skipping sweep", exc)
+        return
+
+    if balance <= config.VAULT_SWEEP_THRESHOLD_USDC:
+        log.debug("[Vault] Balance $%.2f ≤ threshold $%.2f — no sweep", balance, config.VAULT_SWEEP_THRESHOLD_USDC)
+        return
+
+    sweep_amount = balance - config.VAULT_SWEEP_FLOOR_USDC
+    if sweep_amount <= 0:
+        return
+
+    # Open-position safety: ensure floor still covers worst-case committed capital.
+    open_positions = database.get_open_position_count()
+    committed = open_positions * config.TRADING_MAX_BET_USDC
+    remaining_after = balance - sweep_amount
+    if remaining_after < committed:
+        reduced = max(0.0, balance - max(config.VAULT_SWEEP_FLOOR_USDC, committed))
+        if reduced <= 0:
+            log.info(
+                "[Vault] Skipping sweep — $%.2f committed across %d open positions, floor insufficient",
+                committed, open_positions,
+            )
+            return
+        log.info("[Vault] Reducing sweep from $%.2f to $%.2f due to open positions", sweep_amount, reduced)
+        sweep_amount = reduced
+
+    # Gas check.
+    try:
+        matic = await asyncio.to_thread(_get_matic_balance_sync)
+        if matic < _SWEEP_MIN_MATIC:
+            log.warning("[Vault] Insufficient MATIC for gas (%.4f MATIC < %.4f) — skipping sweep", matic, _SWEEP_MIN_MATIC)
+            return
+    except Exception as exc:
+        log.warning("[Vault] MATIC balance check failed: %s — skipping sweep", exc)
+        return
+
+    log.info(
+        "[Vault] Balance $%.2f exceeds threshold $%.2f. Sweeping $%.2f to vault.",
+        balance, config.VAULT_SWEEP_THRESHOLD_USDC, sweep_amount,
+    )
+
+    try:
+        tx_hash = await asyncio.to_thread(_send_usdc_sync, config.VAULT_WALLET_ADDRESS, sweep_amount)
+        remaining = balance - sweep_amount
+        log.info("[Vault] Sweep complete: $%.2f → %s... (tx: %s)", sweep_amount, config.VAULT_WALLET_ADDRESS[:10], tx_hash)
+
+        database.log_vault_sweep(
+            amount_usdc=sweep_amount,
+            balance_before=balance,
+            balance_after=remaining,
+            vault_address=config.VAULT_WALLET_ADDRESS,
+            tx_hash=tx_hash,
+        )
+        await _notify_sweep(sweep_amount, remaining, tx_hash)
+    except Exception as exc:
+        log.error("[Vault] Sweep failed: %s", exc, exc_info=True)
+
+
+async def _notify_sweep(sweep_amount: float, remaining: float, tx_hash: str) -> None:
+    """Send a Telegram notification about a completed vault sweep."""
+    if config.DRY_RUN:
+        return
+
+    from alerter import TelegramSender
+
+    try:
+        def _short(addr: str) -> str:
+            return f"{addr[:10]}...{addr[-6:]}" if len(addr) > 16 else addr
+
+        vault_addr = config.VAULT_WALLET_ADDRESS
+        text = (
+            "🏦 <b>PROFIT SWEEP</b>\n\n"
+            f"💸 <b>${sweep_amount:.2f}</b> USDC transferred to vault\n"
+            f"📤 From: <code>{_short(_wallet_address)}</code>\n"
+            f"📥 To: <code>{_short(vault_addr)}</code>\n\n"
+            f"💰 Trading wallet balance: ${remaining:.2f}\n"
+            f'🔗 <a href="https://polygonscan.com/tx/{tx_hash}">Verify transaction →</a>\n\n'
+            f"<i>Profits secured. Trading continues with ${remaining:.2f}.</i>"
+        )
+        sender = TelegramSender(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
+        async with httpx.AsyncClient() as client:
+            await sender.send_message(text, client)
+    except Exception as exc:
+        log.warning("[Vault] Failed to send sweep notification: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -204,13 +451,16 @@ async def _execute_trade(client, alert: dict) -> None:
     score       = alert["score"]
     market_slug = get_market_slug(market_id) or ""
 
+    # --- Calculate bet size (dynamic or fixed) ---
+    bet_size = await _calculate_bet_size()
+
     # --- Resolve token ID ---
     token_id = _resolve_token_id(market_id, bet_side)
     if token_id is None:
         database.insert_trade_execution(
             alert_id=alert_id, market_id=market_id,
             market_question=market_q, clob_token_id="UNKNOWN",
-            bet_side=bet_side, size_usdc=config.TRADING_BET_SIZE_USDC,
+            bet_side=bet_side, size_usdc=bet_size,
             status="failed", error_message="token ID resolution failed",
         )
         return
@@ -219,7 +469,7 @@ async def _execute_trade(client, alert: dict) -> None:
     database.insert_trade_execution(
         alert_id=alert_id, market_id=market_id,
         market_question=market_q, clob_token_id=token_id,
-        bet_side=bet_side, size_usdc=config.TRADING_BET_SIZE_USDC,
+        bet_side=bet_side, size_usdc=bet_size,
         status="pending",
         bet_price_intended=price_alert,
     )
@@ -252,7 +502,7 @@ async def _execute_trade(client, alert: dict) -> None:
     try:
         order = MarketOrderArgs(
             token_id=token_id,
-            amount=config.TRADING_BET_SIZE_USDC,
+            amount=bet_size,
             side=BUY,
         )
         signed = client.create_market_order(order)
@@ -323,7 +573,7 @@ async def _execute_trade(client, alert: dict) -> None:
         "[Trader] Trade %s | market='%.40s' | side=%s | score=%d | "
         "size=$%.2f | status=%s | fill_price=%s | slippage=%s",
         alert_id[:12], market_q, bet_side, score,
-        config.TRADING_BET_SIZE_USDC, status,
+        bet_size, status,
         f"{fill_price:.4f}" if fill_price else "N/A",
         f"{slippage:.4f}" if slippage else "N/A",
     )
@@ -336,7 +586,7 @@ async def _execute_trade(client, alert: dict) -> None:
         bet_side=bet_side,
         score=score,
         fill_price=fill_price or current_price or price_alert,
-        size=config.TRADING_BET_SIZE_USDC,
+        size=bet_size,
         slippage=slippage,
         status=status,
         error_msg=error_msg,
@@ -365,9 +615,12 @@ async def _notify_trade(
 
     if status == "filled":
         open_count = database.get_open_position_count()
-        remaining_balance = (
-            config.TRADING_MAX_CONCURRENT_POSITIONS - open_count
-        ) * config.TRADING_BET_SIZE_USDC
+        try:
+            remaining_balance = await _get_usdc_balance()
+        except Exception:
+            remaining_balance = (
+                config.TRADING_MAX_CONCURRENT_POSITIONS - open_count
+            ) * config.TRADING_BET_SIZE_USDC
 
         addr = _wallet_address
         wallet_display = (
@@ -559,17 +812,25 @@ async def trading_loop() -> None:
         log.critical("[Trader] Failed to initialise CLOB client: %s", exc)
         return
 
+    sizing_desc = (
+        f"dynamic({config.TRADING_BET_PERCENTAGE * 100:.0f}% "
+        f"[${config.TRADING_MIN_BET_USDC:.2f}–${config.TRADING_MAX_BET_USDC:.2f}])"
+        if config.TRADING_USE_DYNAMIC_SIZING
+        else f"fixed(${config.TRADING_BET_SIZE_USDC:.2f})"
+    )
     log.info(
-        "[Trader] Ready. min_score=%d bet_size=$%.2f max_daily_loss=$%.2f poll=%ds",
+        "[Trader] Ready. min_score=%d sizing=%s max_daily_loss=$%.2f poll=%ds sweep=%s",
         config.TRADING_MIN_SCORE,
-        config.TRADING_BET_SIZE_USDC,
+        sizing_desc,
         config.TRADING_MAX_DAILY_LOSS_USDC,
         config.TRADING_POLL_INTERVAL_SECONDS,
+        "enabled" if config.VAULT_SWEEP_ENABLED else "disabled",
     )
 
     # On startup, look back 24h to catch any alerts from before the restart.
     last_processed_ts: int = int(time.time()) - 86400
     last_resolution_check: float = 0.0
+    last_sweep_check: float = 0.0
 
     while True:
         try:
@@ -577,6 +838,11 @@ async def trading_loop() -> None:
             if time.time() - last_resolution_check >= _RESOLUTION_CHECK_INTERVAL_SECONDS:
                 await _resolve_pending_trades()
                 last_resolution_check = time.time()
+
+            # --- Vault sweep cycle ---
+            if time.time() - last_sweep_check >= config.VAULT_SWEEP_INTERVAL_SECONDS:
+                await _check_and_sweep()
+                last_sweep_check = time.time()
 
             # --- Risk check ---
             block_reason = await _check_risk_limits()

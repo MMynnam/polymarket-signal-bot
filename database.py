@@ -158,6 +158,19 @@ CREATE INDEX IF NOT EXISTS idx_te_created    ON trade_executions(created_at);
 CREATE INDEX IF NOT EXISTS idx_te_resolution ON trade_executions(resolution_status);
 
 -- ------------------------------------------------------------------
+-- vault_sweeps: accounting log for profit sweep transfers
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS vault_sweeps (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    amount_usdc    REAL NOT NULL,
+    balance_before REAL NOT NULL,
+    balance_after  REAL NOT NULL,
+    vault_address  TEXT NOT NULL,
+    tx_hash        TEXT NOT NULL,
+    swept_at       INTEGER NOT NULL
+);
+
+-- ------------------------------------------------------------------
 -- schema_version: simple migration tracking
 -- ------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -165,7 +178,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_SCHEMA_VERSION = 5
+_CURRENT_SCHEMA_VERSION = 6
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -307,6 +320,12 @@ def _apply_migrations() -> None:
         db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(5)")
         db.commit()
         log.info("Applied schema migration → version 5")
+
+    if current < 6:
+        # Version 6 — vault_sweeps table (created via _SCHEMA_SQL above).
+        db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(6)")
+        db.commit()
+        log.info("Applied schema migration → version 6")
 
 
 # ---------------------------------------------------------------------------
@@ -1013,15 +1032,55 @@ def get_trade_stats(since_timestamp: Optional[int] = None) -> dict[str, Any]:
     avg_slippage = slip_row[0]
     max_slippage = slip_row[1]
 
+    size_row = db.execute(
+        f"SELECT AVG(size_usdc) FROM trade_executions {w}", p
+    ).fetchone()
+    avg_size_usdc = size_row[0]
+
     return {
-        "total":        total,
-        "resolved":     resolved,
-        "won":          won,
-        "lost":         lost,
-        "total_pnl":    total_pnl,
-        "avg_pnl":      avg_pnl,
-        "avg_slippage": avg_slippage,
-        "max_slippage": max_slippage,
+        "total":         total,
+        "resolved":      resolved,
+        "won":           won,
+        "lost":          lost,
+        "total_pnl":     total_pnl,
+        "avg_pnl":       avg_pnl,
+        "avg_slippage":  avg_slippage,
+        "max_slippage":  max_slippage,
+        "avg_size_usdc": avg_size_usdc,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Vault sweep helpers
+# ---------------------------------------------------------------------------
+
+def log_vault_sweep(
+    amount_usdc: float,
+    balance_before: float,
+    balance_after: float,
+    vault_address: str,
+    tx_hash: str,
+) -> None:
+    """Record a completed vault sweep in the accounting log."""
+    with transaction() as db:
+        db.execute(
+            """
+            INSERT INTO vault_sweeps
+                (amount_usdc, balance_before, balance_after, vault_address, tx_hash, swept_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (amount_usdc, balance_before, balance_after, vault_address, tx_hash, int(time.time())),
+        )
+
+
+def get_vault_sweep_stats() -> dict[str, Any]:
+    """Return total sweep count and USDC swept (all time)."""
+    row = get_db().execute(
+        "SELECT COUNT(*), COALESCE(SUM(amount_usdc), 0.0) FROM vault_sweeps"
+    ).fetchone()
+    return {
+        "sweep_count": row[0] if row else 0,
+        "total_swept": row[1] if row else 0.0,
     }
 
 
