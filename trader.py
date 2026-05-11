@@ -24,6 +24,8 @@ import logging
 import time
 from typing import Optional
 
+import httpx
+
 import config
 import database
 
@@ -38,6 +40,9 @@ _pause_until: float = 0.0
 
 # How often (in seconds) to check pending trade resolution within the loop.
 _RESOLUTION_CHECK_INTERVAL_SECONDS: int = 600  # 10 minutes
+
+# Wallet address derived at startup (never contains the private key).
+_wallet_address: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -189,12 +194,15 @@ async def _execute_trade(client, alert: dict) -> None:
     from py_clob_client.order_builder.constants import BUY
     from py_clob_client.exceptions import PolyApiException
 
+    from market_discovery import get_market_slug
+
     alert_id    = alert["alert_id"]
     market_id   = alert["market_id"]
     market_q    = alert["market_question"] or market_id
     bet_side    = alert["bet_side"]
     price_alert = alert["bet_price_at_alert"]
     score       = alert["score"]
+    market_slug = get_market_slug(market_id) or ""
 
     # --- Resolve token ID ---
     token_id = _resolve_token_id(market_id, bet_side)
@@ -323,6 +331,8 @@ async def _execute_trade(client, alert: dict) -> None:
     # --- Telegram notification ---
     await _notify_trade(
         market_q=market_q,
+        market_id=market_id,
+        market_slug=market_slug,
         bet_side=bet_side,
         score=score,
         fill_price=fill_price or current_price or price_alert,
@@ -335,6 +345,8 @@ async def _execute_trade(client, alert: dict) -> None:
 
 async def _notify_trade(
     market_q: str,
+    market_id: str,
+    market_slug: str,
     bet_side: str,
     score: int,
     fill_price: float,
@@ -349,24 +361,105 @@ async def _notify_trade(
 
     from alerter import TelegramSender
 
-    status_emoji = "✅" if status == "filled" else "❌"
     slippage_str = f"{slippage:.4f}" if slippage is not None else "N/A"
-    err_line = f"\nError: <code>{error_msg}</code>" if error_msg and status != "filled" else ""
 
-    text = (
-        f"🤖 <b>TRADE {status.upper()}</b> {status_emoji}\n"
-        f"Market: {market_q[:80]}\n"
-        f"Side: <b>{bet_side}</b> @ {fill_price:.4f}\n"
-        f"Size: <b>${size:.2f} USDC</b>\n"
-        f"Score: {score}\n"
-        f"Slippage: {slippage_str}{err_line}"
-    )
+    if status == "filled":
+        open_count = database.get_open_position_count()
+        remaining_balance = (
+            config.TRADING_MAX_CONCURRENT_POSITIONS - open_count
+        ) * config.TRADING_BET_SIZE_USDC
+
+        addr = _wallet_address
+        wallet_display = (
+            f"{addr[:10]}...{addr[-6:]}" if len(addr) > 16 else addr
+        ) if addr else "unknown"
+
+        if market_slug:
+            link_line = f'🔗 <a href="https://polymarket.com/event/{market_slug}">View on Polymarket</a>\n\n'
+        else:
+            link_line = ""
+
+        text = (
+            "💰💰💰 <b>LIVE TRADE</b> 💰💰💰\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📋 <b>Market:</b> {market_q[:120]}\n"
+            f"{link_line}"
+            f"🎯 <b>Position:</b> <b>{bet_side}</b> @ {fill_price:.3f}\n"
+            f"💵 <b>Size:</b> ${size:.2f} USDC\n"
+            f"📊 <b>Signal score:</b> {score}\n"
+            f"📉 <b>Slippage:</b> {slippage_str}\n\n"
+            f"💼 <b>Bankroll available:</b> ${remaining_balance:.2f}\n"
+            f"📂 <b>Open positions:</b> {open_count}/{config.TRADING_MAX_CONCURRENT_POSITIONS}\n"
+            f"👛 <b>Wallet:</b> <code>{wallet_display}</code>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ <i>Automated trade. Not financial advice.</i>"
+        )
+    else:
+        err_line = f"\n❗ <code>{error_msg}</code>" if error_msg else ""
+        text = (
+            f"❌ <b>TRADE {status.upper()}</b>\n"
+            f"📋 {market_q[:100]}\n"
+            f"🎯 {bet_side} @ {fill_price:.3f} | Score: {score}{err_line}"
+        )
 
     try:
-        sender = TelegramSender()
-        await sender.send(text)
+        sender = TelegramSender(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
+        async with httpx.AsyncClient() as client:
+            await sender.send_message(text, client)
     except Exception as exc:
-        log.warning("[Trader] Failed to send Telegram notification: %s", exc)
+        log.warning("[Trader] Failed to send trade notification: %s", exc)
+
+
+async def _notify_trade_resolution(te: dict, resolution_status: str, pnl: float, winning_outcome: Optional[str]) -> None:
+    """Send a Telegram notification when a pending trade resolves."""
+    if config.DRY_RUN:
+        return
+
+    from alerter import TelegramSender
+
+    try:
+        market_q    = te.get("market_question") or te.get("market_id", "")
+        bet_side    = te.get("bet_side", "")
+        fill_price  = te.get("bet_price_filled") or te.get("bet_price_intended") or 0.0
+
+        if resolution_status == "won":
+            result_emoji = "✅"
+        elif resolution_status == "lost":
+            result_emoji = "❌"
+        else:
+            result_emoji = "↩️"
+
+        outcome_line = f"🏆 <b>Outcome:</b> {winning_outcome}\n" if winning_outcome else ""
+
+        stats = database.get_trade_stats()
+        if stats.get("total", 0) > 0 and stats.get("total_pnl") is not None:
+            total_capital = stats["total"] * config.TRADING_BET_SIZE_USDC
+            roi = stats["total_pnl"] / total_capital if total_capital > 0 else 0.0
+            stats_line = (
+                f"\n📈 <b>All-time stats:</b>\n"
+                f"  Trades: {stats['total']} | "
+                f"Won: {stats.get('won', 0)} | "
+                f"Lost: {stats.get('lost', 0)}\n"
+                f"  ROI: {roi:+.1%} | Net P&amp;L: ${stats['total_pnl']:+.2f}"
+            )
+        else:
+            stats_line = ""
+
+        text = (
+            "🏁 <b>TRADE RESOLVED</b>\n\n"
+            f"📋 <b>Market:</b> {market_q[:120]}\n"
+            f"🎯 <b>Position:</b> {bet_side} @ {fill_price:.3f}\n"
+            f"{outcome_line}"
+            f"{result_emoji} <b>Result:</b> {resolution_status.upper()}\n"
+            f"💰 <b>P&amp;L:</b> ${pnl:+.2f} USDC"
+            f"{stats_line}"
+        )
+
+        sender = TelegramSender(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
+        async with httpx.AsyncClient() as client:
+            await sender.send_message(text, client)
+    except Exception as exc:
+        log.warning("[Trader] Failed to send resolution notification: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +517,7 @@ async def _resolve_pending_trades() -> None:
             te["alert_id"][:12], resolution_status, pnl,
         )
         resolved_count += 1
+        await _notify_trade_resolution(te, resolution_status, pnl, winning_outcome)
 
     if resolved_count:
         log.info("[Trader] Resolution cycle: updated %d trade(s)", resolved_count)
@@ -451,8 +545,9 @@ async def trading_loop() -> None:
             await asyncio.sleep(3600)
 
     # Derive and log wallet address — never log the private key.
-    wallet_address = _get_wallet_address()
-    log.info("[Trader] Wallet address: %s", wallet_address)
+    global _wallet_address
+    _wallet_address = _get_wallet_address()
+    log.info("[Trader] Wallet address: %s", _wallet_address)
     log.info(
         "[Trader] Initialising CLOB client — host=%s chain=%d",
         config.TRADING_CLOB_HOST, config.TRADING_CHAIN_ID,
