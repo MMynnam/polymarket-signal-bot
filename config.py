@@ -162,7 +162,8 @@ FILTER_EXCLUDED_CATEGORIES: list[str] = [
     for c in os.getenv("FILTER_EXCLUDED_CATEGORIES", "sports").split(",")
     if c.strip()
 ]
-DIGEST_INTERVAL_SECONDS: int = int(os.getenv("DIGEST_INTERVAL_SECONDS", "7200"))  # 2 hours
+DIGEST_INTERVAL_SECONDS: int = int(os.getenv("DIGEST_INTERVAL_SECONDS", "86400"))  # 24 hours
+DIGEST_SEND_HOUR_UTC: int = int(os.getenv("DIGEST_SEND_HOUR_UTC", "0"))  # midnight UTC
 
 # Attach a full-data CSV to each digest message. Set to false if Telegram
 # file sends cause issues — the summary text is still sent either way.
@@ -356,11 +357,11 @@ def validate_config() -> None:
 
     log.info("Configuration validated OK")
     log.info(
-        "Instant threshold: %d | Digest threshold: %d | Digest interval: %ds | "
+        "Instant threshold: %d | Digest threshold: %d | Daily brief at %02d:00 UTC | "
         "Trade min size: $%.0f | Cache TTL: %dh",
         ALERT_INSTANT_THRESHOLD,
         ALERT_DIGEST_THRESHOLD,
-        DIGEST_INTERVAL_SECONDS,
+        DIGEST_SEND_HOUR_UTC,
         TRADE_MIN_SIZE_USD,
         WALLET_CACHE_TTL_SECONDS // 3600,
     )

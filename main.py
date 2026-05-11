@@ -389,11 +389,11 @@ async def amain(dry_run: bool) -> None:
     log.info("=" * 60)
     log.info("Polymarket Insider Signal Bot starting")
     log.info(
-        "dry_run=%s | instant≥%d | digest≥%d | digest_interval=%ds | min_trade=$%.0f",
+        "dry_run=%s | instant≥%d | digest≥%d | daily_brief=%02d:00 UTC | min_trade=$%.0f",
         dry_run,
         config.ALERT_INSTANT_THRESHOLD,
         config.ALERT_DIGEST_THRESHOLD,
-        config.DIGEST_INTERVAL_SECONDS,
+        config.DIGEST_SEND_HOUR_UTC,
         config.TRADE_MIN_SIZE_USD,
     )
     log.info("=" * 60)

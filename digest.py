@@ -42,6 +42,7 @@ from typing import Optional
 import httpx
 
 import config
+import database
 from alerter import AlertPayload, TelegramSender
 
 log = logging.getLogger("digest")
@@ -235,13 +236,11 @@ def _top_markets_lines(entries: list[AlertPayload], top_n: int = 3) -> list[str]
 
 def format_digest(
     entries: list[AlertPayload],
-    digest_id: str,
-    start_time: str,
-    end_time: str,
     date_human: str,
+    bot_activity_line: str = "",
 ) -> str:
     """
-    Build the full Telegram HTML digest message.
+    Build the full Telegram HTML digest message for the daily intelligence brief.
     Entries must be pre-sorted descending by score (drain() guarantees this).
     Returns empty string if entries is empty.
     """
@@ -250,14 +249,25 @@ def format_digest(
 
     total = len(entries)
     total_volume = sum(p.trade.size_usd for p in entries)
+    unique_markets = len({p.trade.market_id for p in entries})
     top = entries[:5]
     remainder = entries[5:]
 
     lines: list[str] = [
-        f"📊 <b>Signal Digest #{html.escape(digest_id)}</b>",
+        "📊 <b>Daily Intelligence Brief</b>",
+        f"<i>{html.escape(date_human)} UTC</i>",
         "",
-        f"<b>Window:</b> {start_time} – {end_time} UTC | {html.escape(date_human)}",
-        f"<b>Total signals:</b> {total} | <b>Volume tracked:</b> ${total_volume:,.0f}",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"<b>Signals detected:</b> {total}",
+        f"<b>Volume tracked:</b> ${total_volume:,.0f}",
+        f"<b>Markets covered:</b> {unique_markets}",
+    ]
+    if bot_activity_line:
+        lines.append(bot_activity_line)
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
 
@@ -403,16 +413,19 @@ def _write_digest_csv(entries: list[AlertPayload], digest_id: str) -> str:
 
 async def digest_loop(buffer: DigestBuffer, dry_run: bool = False) -> None:
     """
-    Long-running coroutine. Drains the DigestBuffer every
-    DIGEST_INTERVAL_SECONDS, formats an analytical briefing, and sends it
-    to Telegram. When DIGEST_CSV_ENABLED, also attaches a full-data CSV.
-    Designed to run as an asyncio.Task under the supervised_task wrapper.
+    Long-running coroutine. Sends a daily intelligence brief at
+    DIGEST_SEND_HOUR_UTC:00 UTC each day. Drains the DigestBuffer at that
+    time, formats an analytical briefing, and sends it to Telegram. When
+    DIGEST_CSV_ENABLED, also attaches a full-data CSV. Empty windows are
+    silently skipped. Designed to run as an asyncio.Task under supervised_task.
 
     Persistence contract: outcome rows are inserted by process_trade() at
     buffer time — nothing to do here.
     """
-    interval = config.DIGEST_INTERVAL_SECONDS
-    log.info("[Digest] Started (interval=%ds, dry_run=%s)", interval, dry_run)
+    log.info(
+        "[Digest] Started (daily brief at %02d:00 UTC, dry_run=%s)",
+        config.DIGEST_SEND_HOUR_UTC, dry_run,
+    )
 
     sender = TelegramSender(
         token=config.TELEGRAM_BOT_TOKEN,
@@ -421,27 +434,61 @@ async def digest_loop(buffer: DigestBuffer, dry_run: bool = False) -> None:
 
     async with httpx.AsyncClient() as client:
         while True:
-            await asyncio.sleep(interval)
+            # Sleep until the next DIGEST_SEND_HOUR_UTC:00 UTC.
+            now = datetime.utcnow()
+            target = now.replace(
+                hour=config.DIGEST_SEND_HOUR_UTC, minute=0, second=0, microsecond=0,
+            )
+            if target <= now:
+                target += timedelta(days=1)
+            wait_seconds = (target - now).total_seconds()
+            log.info(
+                "[Digest] Next daily brief at %s UTC (in %.1fh)",
+                target.strftime("%Y-%m-%d %H:%M"), wait_seconds / 3600,
+            )
+            await asyncio.sleep(wait_seconds)
 
             entries = await buffer.drain()
 
             if not entries:
-                log.debug("[Digest] No signals buffered this cycle — skipping")
+                log.info("[Digest] No signals buffered — skipping daily brief")
                 continue
 
             log.info("[Digest] Flushing %d buffered signal(s)", len(entries))
 
-            # Compute window metadata at flush time.
+            # Metadata at send time.
             now_utc = datetime.utcnow()
-            start_utc = now_utc - timedelta(seconds=interval)
             digest_id  = now_utc.strftime("%Y-%m%d-%H%MZ")
-            start_time = start_utc.strftime("%H:%M")
-            end_time   = now_utc.strftime("%H:%M")
-            date_human = now_utc.strftime("%a %d, %Y")
+            date_human = f"{now_utc.strftime('%A, %B')} {now_utc.day}, {now_utc.year}"
+
+            # Bot activity line: trades executed in the last 24 h.
+            bot_activity_line = ""
+            if config.TRADING_ENABLED:
+                try:
+                    day_start_ts = int(
+                        now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+                    )
+                    db = database.get_db()
+                    row = db.execute(
+                        "SELECT COUNT(*), COALESCE(SUM(pnl), 0) FROM trade_executions "
+                        "WHERE created_at >= ? AND status = 'filled'",
+                        (day_start_ts,),
+                    ).fetchone()
+                    trades_today = row[0] if row else 0
+                    daily_pnl   = row[1] if row else 0.0
+                    if trades_today > 0:
+                        pnl_emoji = "📈" if daily_pnl >= 0 else "📉"
+                        bot_activity_line = (
+                            f"🤖 <b>Bot activity:</b> {trades_today} trade"
+                            f"{'s' if trades_today != 1 else ''} | "
+                            f"P&amp;L: {pnl_emoji}${abs(daily_pnl):.2f}"
+                        )
+                except Exception as exc:
+                    log.warning("[Digest] Bot activity query failed: %s", exc)
 
             # Build and send the summary message.
             try:
-                text = format_digest(entries, digest_id, start_time, end_time, date_human)
+                text = format_digest(entries, date_human, bot_activity_line)
             except Exception as exc:
                 log.exception("[Digest] format_digest failed: %s", exc)
                 continue
