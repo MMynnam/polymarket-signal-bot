@@ -28,10 +28,13 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+import uvicorn
+
 import config
 import convergence as convergence_module
 import database
 import trader
+from api import app as fastapi_app
 from market_classifier import classify_market, bet_price_band as _bet_price_band
 import market_discovery
 import resolution_checker
@@ -379,6 +382,48 @@ async def supervised_task(coro_factory, name: str, restart_delay: float = 5.0):
 
 
 # ---------------------------------------------------------------------------
+# API server
+# ---------------------------------------------------------------------------
+
+async def api_server() -> None:
+    """
+    Run the FastAPI app with uvicorn. Railway injects PORT automatically;
+    API_SECRET_KEY must be set or every request will be refused (fail-closed).
+    """
+    uv_config = uvicorn.Config(
+        fastapi_app,
+        host="0.0.0.0",
+        port=config.PORT,
+        log_level="info",
+        access_log=False,
+    )
+    server = uvicorn.Server(uv_config)
+    log.info("[API] Starting on port %d", config.PORT)
+    await server.serve()
+
+
+# ---------------------------------------------------------------------------
+# Standalone trade resolution — keeps trade_executions in sync when the
+# local trading_loop is disabled (TRADING_ENABLED=false / Railway API mode).
+# When TRADING_ENABLED=true the trading_loop already handles resolution.
+# ---------------------------------------------------------------------------
+
+async def trade_resolution_loop() -> None:
+    if config.TRADING_ENABLED:
+        # trading_loop handles resolution; this task idles to avoid double-resolves.
+        while True:
+            await asyncio.sleep(3600)
+
+    log.info("[TradeResolution] Started (standalone — TRADING_ENABLED=false)")
+    while True:
+        await asyncio.sleep(600)  # same cadence as the embedded resolution check
+        try:
+            await trader._resolve_pending_trades()
+        except Exception as exc:
+            log.error("[TradeResolution] Failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -504,12 +549,27 @@ async def amain(dry_run: bool) -> None:
             ),
             name="trader",
         ),
+        asyncio.create_task(
+            supervised_task(
+                api_server,
+                name="api-server",
+            ),
+            name="api-server",
+        ),
+        asyncio.create_task(
+            supervised_task(
+                trade_resolution_loop,
+                name="trade-resolution",
+            ),
+            name="trade-resolution",
+        ),
     ]
 
     log.info(
-        "All %d tasks started | trading=%s",
+        "All %d tasks started | trading=%s | api=port %d",
         len(tasks),
         "ENABLED" if config.TRADING_ENABLED else "disabled",
+        config.PORT,
     )
 
     # --- Graceful shutdown on SIGINT / SIGTERM ---

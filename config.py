@@ -321,6 +321,16 @@ VAULT_SWEEP_THRESHOLD_USDC: float = float(os.getenv("VAULT_SWEEP_THRESHOLD_USDC"
 VAULT_SWEEP_FLOOR_USDC: float = float(os.getenv("VAULT_SWEEP_FLOOR_USDC", "110.0"))
 VAULT_SWEEP_INTERVAL_SECONDS: int = int(os.getenv("VAULT_SWEEP_INTERVAL_SECONDS", "3600"))
 
+# ---------------------------------------------------------------------------
+# API server (Railway auto-injects PORT; 8080 is the fallback)
+# ---------------------------------------------------------------------------
+
+# Shared secret between Railway API and Fly.io trader. Fail-closed when empty.
+API_SECRET_KEY: str = os.getenv("API_SECRET_KEY", "")
+
+# Railway injects its own PORT env var — always use this, never hard-code 8080.
+PORT: int = int(os.getenv("PORT", "8080"))
+
 
 # ---------------------------------------------------------------------------
 # Validation — fail loudly at startup if critical env vars are missing

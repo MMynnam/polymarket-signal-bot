@@ -1085,6 +1085,110 @@ def get_vault_sweep_stats() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# API helpers — used by api.py for the remote trader endpoints
+# ---------------------------------------------------------------------------
+
+def get_tradeable_alerts_for_api(
+    min_score: int,
+    since_timestamp: int,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Return alert_outcomes ready for the remote trader, with clob_token_id resolved.
+    Excludes alerts that already have a trade_execution row.
+    Joins against markets to resolve the correct CLOB token ID for bet_side.
+    """
+    rows = get_db().execute(
+        """
+        SELECT ao.alert_id, ao.market_id, ao.market_question, ao.wallet_address,
+               ao.score, ao.score_breakdown_json, ao.bet_side, ao.bet_price_at_alert,
+               ao.bet_size_usd, ao.created_at, ao.market_category,
+               ao.hours_to_close_at_alert, ao.is_contrarian,
+               m.clob_token_ids, m.raw_json
+        FROM alert_outcomes ao
+        LEFT JOIN trade_executions te ON ao.alert_id = te.alert_id
+        LEFT JOIN markets m ON ao.market_id = m.condition_id
+        WHERE ao.created_at >= ?
+          AND ao.score >= ?
+          AND ao.resolution_status = 'pending'
+          AND te.alert_id IS NULL
+        ORDER BY ao.score DESC
+        LIMIT ?
+        """,
+        (since_timestamp, min_score, limit),
+    ).fetchall()
+
+    results = []
+    for row in rows:
+        d = dict(row)
+        clob_token_ids_json = d.pop("clob_token_ids", None)
+        raw_json_str = d.pop("raw_json", None)
+
+        clob_token_id = None
+        if clob_token_ids_json:
+            try:
+                token_ids = json.loads(clob_token_ids_json)
+                if raw_json_str:
+                    raw = json.loads(raw_json_str)
+                    outcomes: list = raw.get("outcomes", [])
+                    target = d["bet_side"].strip().lower()
+                    for i, outcome in enumerate(outcomes):
+                        if outcome.strip().lower() == target and i < len(token_ids):
+                            clob_token_id = token_ids[i]
+                            break
+                if clob_token_id is None and token_ids:
+                    clob_token_id = token_ids[0]
+            except Exception:
+                pass
+
+        d["clob_token_id"] = clob_token_id
+        results.append(d)
+
+    return results
+
+
+def get_pending_trades_with_resolution() -> list[dict]:
+    """
+    Return filled trade_executions still pending resolution, joined with the
+    current alert_outcomes.resolution_status. Used by the remote trader to
+    detect resolutions and fire Telegram notifications.
+    """
+    rows = get_db().execute(
+        """
+        SELECT te.id, te.alert_id, te.market_id, te.market_question,
+               te.bet_side, te.bet_price_intended, te.bet_price_filled,
+               te.size_usdc, te.order_id, te.status, te.created_at,
+               te.resolution_status, te.pnl, te.resolved_at,
+               ao.resolution_status AS alert_resolution_status,
+               ao.winning_outcome
+        FROM trade_executions te
+        LEFT JOIN alert_outcomes ao ON te.alert_id = ao.alert_id
+        WHERE te.status = 'filled' AND te.resolution_status = 'pending'
+        ORDER BY te.created_at ASC
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_trade_resolution_by_alert_id(
+    alert_id: str,
+    resolution_status: str,
+    pnl: Optional[float],
+    resolved_at: int,
+) -> None:
+    """Update trade_executions resolution from the remote trader's report."""
+    with transaction() as db:
+        db.execute(
+            """
+            UPDATE trade_executions
+            SET resolution_status = ?, pnl = ?, resolved_at = ?
+            WHERE alert_id = ?
+            """,
+            (resolution_status, pnl, resolved_at, alert_id),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
 

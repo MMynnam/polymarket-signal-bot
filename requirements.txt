@@ -5,6 +5,10 @@
 # --- Polymarket CLOB client ---
 py-clob-client==0.34.6
 
+# --- API server (Railway endpoint for remote Fly.io trader) ---
+fastapi>=0.111.0,<1.0.0
+uvicorn>=0.30.0,<1.0.0
+
 # --- HTTP client (async, used everywhere) ---
 httpx>=0.27.0,<1.0.0
 

@@ -1,0 +1,11 @@
+app = "polymarket-trader"
+primary_region = "dub"  # Dublin, Ireland — outside Polymarket's US geo-block
+
+[build]
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
