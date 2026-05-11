@@ -1,11 +1,24 @@
-app = "polymarket-trader"
-primary_region = "dub"  # Dublin, Ireland — outside Polymarket's US geo-block
+# fly.toml app configuration file generated for polymarket-trader-vivid-mountain-9871 on 2026-05-11T10:26:59-04:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'polymarket-trader-vivid-mountain-9871'
+primary_region = 'arn'
 
 [build]
 
 [env]
-  PYTHONUNBUFFERED = "1"
+  PYTHONUNBUFFERED = '1'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = false
+  min_machines_running = 1
+  processes = ['app']
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "256mb"
+  size = 'shared-cpu-1x'
+  memory = '256mb'

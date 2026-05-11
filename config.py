@@ -125,8 +125,8 @@ ALCHEMY_RPC_URL: str = os.getenv("ALCHEMY_RPC_URL", "")  # Full URL including AP
 # Scores >= ALERT_INSTANT_THRESHOLD fire an immediate Telegram message.
 # Scores in [ALERT_DIGEST_THRESHOLD, ALERT_INSTANT_THRESHOLD) are buffered
 # and sent as a periodic digest every DIGEST_INTERVAL_SECONDS.
-ALERT_INSTANT_THRESHOLD: int = int(os.getenv("ALERT_INSTANT_THRESHOLD", "80"))
-ALERT_DIGEST_THRESHOLD: int = int(os.getenv("ALERT_DIGEST_THRESHOLD", "65"))
+ALERT_INSTANT_THRESHOLD: int = int(os.getenv("ALERT_INSTANT_THRESHOLD", "70"))
+ALERT_DIGEST_THRESHOLD: int = int(os.getenv("ALERT_DIGEST_THRESHOLD", "60"))
 
 # ---------------------------------------------------------------------------
 # Pre-scorer trade filter
@@ -146,14 +146,14 @@ FILTER_MIN_ACTIONABLE_MINUTES: int = int(os.getenv("FILTER_MIN_ACTIONABLE_MINUTE
 # Market duration window: skip markets closing too soon (sub-24h bucket was unprofitable)
 # or too far from close (> 7 days — insufficient urgency signal, likely noise).
 # When end_date is unavailable, the trade passes through unchanged.
-FILTER_MIN_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MIN_HOURS_TO_CLOSE", "26"))
-FILTER_MAX_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MAX_HOURS_TO_CLOSE", "96"))
+FILTER_MIN_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MIN_HOURS_TO_CLOSE", "6"))
+FILTER_MAX_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MAX_HOURS_TO_CLOSE", "336"))
 
 # Profitable price band: only alert on bets within this range.
 # Distinct from FILTER_MIN/MAX_PRICE (which reject glitch prices at 1-2¢).
 # Data: lean (35-72%) is the only band with positive ROI; longshots and favorites lose.
-FILTER_MIN_BET_PRICE: float = float(os.getenv("FILTER_MIN_BET_PRICE", "0.35"))
-FILTER_MAX_BET_PRICE: float = float(os.getenv("FILTER_MAX_BET_PRICE", "0.72"))
+FILTER_MIN_BET_PRICE: float = float(os.getenv("FILTER_MIN_BET_PRICE", "0.15"))
+FILTER_MAX_BET_PRICE: float = float(os.getenv("FILTER_MAX_BET_PRICE", "0.90"))
 
 # Market categories to exclude entirely. Parsed as comma-separated string from env.
 # Data: sports showed 51% win rate, -0.17 ROI across 79 resolved alerts.
@@ -162,6 +162,11 @@ FILTER_EXCLUDED_CATEGORIES: list[str] = [
     for c in os.getenv("FILTER_EXCLUDED_CATEGORIES", "sports").split(",")
     if c.strip()
 ]
+
+# Minimum 1-week CLOB volume (USD) required to pass pre-scorer.
+# Thin markets have unreliable prices and can't fill orders without slippage.
+# Source: raw_json.volume1wkClob from Gamma API. Pass-through when field is absent.
+FILTER_MIN_LIQUIDITY_USD: float = float(os.getenv("FILTER_MIN_LIQUIDITY_USD", "5000"))
 DIGEST_INTERVAL_SECONDS: int = int(os.getenv("DIGEST_INTERVAL_SECONDS", "86400"))  # 24 hours
 DIGEST_SEND_HOUR_UTC: int = int(os.getenv("DIGEST_SEND_HOUR_UTC", "0"))  # midnight UTC
 
@@ -296,7 +301,7 @@ TRADING_CONSECUTIVE_LOSS_PAUSE: int = int(os.getenv("TRADING_CONSECUTIVE_LOSS_PA
 TRADING_PAUSE_DURATION_SECONDS: int = int(os.getenv("TRADING_PAUSE_DURATION_SECONDS", "7200"))
 
 # Only execute alerts with score >= this value.
-TRADING_MIN_SCORE: int = int(os.getenv("TRADING_MIN_SCORE", "75"))
+TRADING_MIN_SCORE: int = int(os.getenv("TRADING_MIN_SCORE", "65"))
 
 # How often to poll alert_outcomes for new tradeable alerts.
 TRADING_POLL_INTERVAL_SECONDS: int = int(os.getenv("TRADING_POLL_INTERVAL_SECONDS", "30"))

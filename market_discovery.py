@@ -282,3 +282,23 @@ def get_market_slug(condition_id: str) -> Optional[str]:
         return None
     raw = market.get("raw_json", {})
     return raw.get("_event_slug") or raw.get("slug") or None
+
+
+def get_market_liquidity(condition_id: str) -> Optional[float]:
+    """
+    Return the 1-week CLOB volume as a liquidity proxy, or None if unavailable.
+    Gamma API field: volume1wkClob — rolling 7-day traded volume on the CLOB.
+    Returns None when the market is unknown or the field is missing; callers
+    should pass through (not reject) when None.
+    """
+    market = database.get_market(condition_id)
+    if market is None:
+        return None
+    raw = market.get("raw_json", {})
+    val = raw.get("volume1wkClob")
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None

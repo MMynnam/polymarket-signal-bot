@@ -42,7 +42,7 @@ import scorer
 import alerter as alerter_module
 from alerter import AlertPayload, AlertQueue
 from digest import DigestBuffer, digest_loop
-from market_discovery import get_market_end_date, get_market_title, get_market_slug
+from market_discovery import get_market_end_date, get_market_title, get_market_slug, get_market_liquidity
 from trade_monitor import Trade, WebSocketManager, RestTradePoller
 from wallet_profiler import get_wallet_profile
 
@@ -57,6 +57,7 @@ def _pre_scorer_filter(
     trade: Trade,
     market_end_date: Optional[str],
     market_category: str = "",
+    market_liquidity: Optional[float] = None,
 ) -> Optional[str]:
     """
     Return a human-readable rejection reason if the trade should be dropped
@@ -67,9 +68,10 @@ def _pre_scorer_filter(
       2. Price outside profitable band — longshots and favorites lose money.
       3. Bet too small — noise, not signal.
       4. Excluded market category — e.g. sports (51% win, -0.17 ROI).
-      5. Market already closed — stale REST data arriving post-resolution.
-      6. Market closing too soon — alert cannot be acted on before close.
-      7. Market duration outside profitable window (26–96h).
+      5. Insufficient liquidity — thin order book, unreliable prices.
+      6. Market already closed — stale REST data arriving post-resolution.
+      7. Market closing too soon — alert cannot be acted on before close.
+      8. Market duration outside profitable window.
     """
     if trade.price < config.FILTER_MIN_PRICE or trade.price > config.FILTER_MAX_PRICE:
         return f"price too extreme ({trade.price:.3f})"
@@ -85,6 +87,12 @@ def _pre_scorer_filter(
 
     if market_category and market_category in config.FILTER_EXCLUDED_CATEGORIES:
         return f"excluded category ({market_category})"
+
+    if market_liquidity is not None and market_liquidity < config.FILTER_MIN_LIQUIDITY_USD:
+        return (
+            f"insufficient liquidity (${market_liquidity:,.0f}, "
+            f"min ${config.FILTER_MIN_LIQUIDITY_USD:,.0f})"
+        )
 
     if market_end_date:
         try:
@@ -159,7 +167,8 @@ async def process_trade(
     market_title = get_market_title(trade.market_id)
     market_slug = get_market_slug(trade.market_id)
     market_category = classify_market(market_title or "")
-    filter_reason = _pre_scorer_filter(trade, market_end_date, market_category)
+    market_liquidity = get_market_liquidity(trade.market_id)
+    filter_reason = _pre_scorer_filter(trade, market_end_date, market_category, market_liquidity)
     if filter_reason:
         log.debug("[Filter] Rejected trade %s: %s", trade.trade_id, filter_reason)
         return

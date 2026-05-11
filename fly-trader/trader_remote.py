@@ -46,7 +46,7 @@ TRADING_MAX_DAILY_LOSS_USDC: float = float(os.getenv("TRADING_MAX_DAILY_LOSS_USD
 TRADING_MAX_CONCURRENT_POSITIONS: int = int(os.getenv("TRADING_MAX_CONCURRENT_POSITIONS", "10"))
 TRADING_CONSECUTIVE_LOSS_PAUSE: int = int(os.getenv("TRADING_CONSECUTIVE_LOSS_PAUSE", "3"))
 TRADING_PAUSE_DURATION_SECONDS: int = int(os.getenv("TRADING_PAUSE_DURATION_SECONDS", "7200"))
-TRADING_MIN_SCORE: int = int(os.getenv("TRADING_MIN_SCORE", "75"))
+TRADING_MIN_SCORE: int = int(os.getenv("TRADING_MIN_SCORE", "65"))
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -534,7 +534,7 @@ async def _execute_trade(
     alert: dict,
     stats: dict,
 ) -> None:
-    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType, PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import BUY
     from py_clob_client.exceptions import PolyApiException
 
@@ -584,8 +584,21 @@ async def _execute_trade(
     error_msg: Optional[str] = None
 
     try:
+        # Fetch neg_risk in a thread before building the order.
+        # create_market_order() auto-calls get_neg_risk() internally, but it does
+        # so synchronously in the async context which can silently fail and default
+        # to False — causing order_version_mismatch on neg-risk markets.
+        # Fetching it explicitly in asyncio.to_thread() and passing via options
+        # guarantees the order is signed for the correct exchange contract.
+        try:
+            neg_risk = await asyncio.to_thread(clob_client.get_neg_risk, token_id)
+        except Exception as _nr_exc:
+            log.warning("[Trade] get_neg_risk failed for %s: %s — defaulting to False", token_id, _nr_exc)
+            neg_risk = False
+
         order = MarketOrderArgs(token_id=token_id, amount=bet_size, side=BUY)
-        signed = clob_client.create_market_order(order)
+        options = PartialCreateOrderOptions(neg_risk=neg_risk)
+        signed = await asyncio.to_thread(clob_client.create_market_order, order, options)
         resp = await asyncio.to_thread(clob_client.post_order, signed, OrderType.FOK)
 
         if isinstance(resp, dict):
