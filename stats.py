@@ -424,14 +424,24 @@ def print_trade_stats(since_days: Optional[int] = None, db_path: Optional[str] =
 
     window_str = f"last {since_days} days" if since_days else "all time"
 
-    # Sizing mode description
-    if config.TRADING_USE_DYNAMIC_SIZING:
+    # Sizing mode — mirrors the three-state auto-graduation logic in trader.py
+    trade_resolved = stats.get("resolved", 0)
+    trade_pnl = stats.get("total_pnl") or 0.0
+    if trade_resolved < config.TRADING_DYNAMIC_MIN_RESOLVED:
+        sizing_mode = (
+            f"Warmup — fixed ${config.TRADING_BET_SIZE_USDC:.2f} "
+            f"({trade_resolved}/{config.TRADING_DYNAMIC_MIN_RESOLVED} resolved)"
+        )
+    elif trade_pnl <= 0:
+        sizing_mode = (
+            f"Fixed ${config.TRADING_BET_SIZE_USDC:.2f} "
+            f"(awaiting profitability, P&L ${trade_pnl:+.2f})"
+        )
+    else:
         sizing_mode = (
             f"Dynamic ({config.TRADING_BET_PERCENTAGE * 100:.0f}% of bankroll, "
             f"${config.TRADING_MIN_BET_USDC:.2f}–${config.TRADING_MAX_BET_USDC:.2f})"
         )
-    else:
-        sizing_mode = f"Fixed (${config.TRADING_BET_SIZE_USDC:.2f})"
 
     # Vault sweep stats
     sweep_stats = database.get_vault_sweep_stats()

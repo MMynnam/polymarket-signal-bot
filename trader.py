@@ -44,6 +44,10 @@ _RESOLUTION_CHECK_INTERVAL_SECONDS: int = 600  # 10 minutes
 # Wallet address derived at startup (never contains the private key).
 _wallet_address: str = ""
 
+# Set to True after the graduation-to-dynamic-sizing Telegram notification fires.
+# Resets on restart — acceptable per spec ("module-level variable" is explicit).
+_graduation_notified: bool = False
+
 # ---------------------------------------------------------------------------
 # USDC contract constants (Polygon — bridged USDC.e)
 # ---------------------------------------------------------------------------
@@ -150,25 +154,41 @@ def _get_matic_balance_sync() -> float:
 
 async def _calculate_bet_size() -> float:
     """
-    Return the USDC amount to bet on the next trade.
+    Auto-graduating bet size. Three states (no manual toggle):
 
-    Fixed mode (default): always returns config.TRADING_BET_SIZE_USDC.
-    Dynamic mode: balance × TRADING_BET_PERCENTAGE, clamped to [MIN, MAX].
-    Dynamic mode requires TRADING_DYNAMIC_MIN_RESOLVED resolved trades first;
-    falls back to fixed until the warmup guard is satisfied.
+    WARMUP  — fewer than TRADING_DYNAMIC_MIN_RESOLVED resolved trades.
+              Uses fixed TRADING_BET_SIZE_USDC.
+
+    FIXED   — enough resolved trades but cumulative P&L ≤ 0.
+              Uses fixed TRADING_BET_SIZE_USDC (circuit breaker).
+
+    DYNAMIC — enough resolved trades AND cumulative P&L > 0.
+              Uses balance × TRADING_BET_PERCENTAGE, clamped to [MIN, MAX].
+              Fires a one-time graduation Telegram notification on first entry.
     """
-    if not config.TRADING_USE_DYNAMIC_SIZING:
-        return config.TRADING_BET_SIZE_USDC
+    global _graduation_notified
 
     stats = database.get_trade_stats()
     resolved = stats.get("resolved", 0)
+    pnl = stats.get("total_pnl") or 0.0
+
+    # --- WARMUP ---
     if resolved < config.TRADING_DYNAMIC_MIN_RESOLVED:
         log.info(
-            "[Trader] Dynamic sizing requires %d resolved trades, have %d. Using fixed $%.2f",
-            config.TRADING_DYNAMIC_MIN_RESOLVED, resolved, config.TRADING_BET_SIZE_USDC,
+            "[Trader] Warmup phase: %d/%d resolved trades. Fixed $%.2f sizing.",
+            resolved, config.TRADING_DYNAMIC_MIN_RESOLVED, config.TRADING_BET_SIZE_USDC,
         )
         return config.TRADING_BET_SIZE_USDC
 
+    # --- FIXED (circuit breaker: unprofitable despite sufficient data) ---
+    if pnl <= 0:
+        log.info(
+            "[Trader] %d resolved trades but P&L is $%.2f. Staying on fixed $%.2f until profitable.",
+            resolved, pnl, config.TRADING_BET_SIZE_USDC,
+        )
+        return config.TRADING_BET_SIZE_USDC
+
+    # --- DYNAMIC ---
     try:
         balance = await _get_usdc_balance()
     except Exception as exc:
@@ -182,10 +202,39 @@ async def _calculate_bet_size() -> float:
     clamped = max(config.TRADING_MIN_BET_USDC, min(config.TRADING_MAX_BET_USDC, raw_size))
 
     log.info(
-        "[Trader] Dynamic sizing: balance=$%.2f × %.1f%% = $%.2f → clamped to $%.2f",
-        balance, config.TRADING_BET_PERCENTAGE * 100, raw_size, clamped,
+        "[Trader] Dynamic sizing active: $%.2f × %.1f%% = $%.2f",
+        balance, config.TRADING_BET_PERCENTAGE * 100, clamped,
     )
+
+    # One-time graduation notification (module-level flag resets on restart).
+    if not _graduation_notified:
+        _graduation_notified = True
+        await _notify_graduation(resolved, pnl, clamped)
+
     return clamped
+
+
+async def _notify_graduation(resolved: int, pnl: float, bet_size: float) -> None:
+    """Fire once when the bot graduates from fixed to dynamic sizing."""
+    if config.DRY_RUN:
+        return
+
+    from alerter import TelegramSender
+
+    try:
+        text = (
+            "📈 <b>TRADING UPGRADE</b>\n\n"
+            "The bot has graduated to dynamic position sizing.\n"
+            f"✅ {resolved} trades resolved\n"
+            f"✅ Cumulative P&amp;L: +${pnl:.2f}\n"
+            f"📊 Now sizing at {config.TRADING_BET_PERCENTAGE * 100:.1f}% of bankroll per trade\n\n"
+            "<i>Bet sizes will scale with performance.</i>"
+        )
+        sender = TelegramSender(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
+        async with httpx.AsyncClient() as client:
+            await sender.send_message(text, client)
+    except Exception as exc:
+        log.warning("[Trader] Failed to send graduation notification: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -231,12 +280,12 @@ async def _check_and_sweep() -> None:
     (balance − VAULT_SWEEP_FLOOR_USDC) to VAULT_WALLET_ADDRESS.
 
     Safety checks before any transfer:
-      1. VAULT_SWEEP_ENABLED must be true (env-var guard).
+      1. VAULT_WALLET_ADDRESS must be set — the only gate (no separate enable flag).
       2. Sweep amount is always balance − floor, never the full balance.
       3. Open-position check: floor must cover worst-case committed capital.
       4. MATIC gas check: skip if wallet cannot pay gas.
     """
-    if not config.VAULT_SWEEP_ENABLED:
+    if not config.VAULT_WALLET_ADDRESS:
         return
 
     try:
@@ -284,6 +333,7 @@ async def _check_and_sweep() -> None:
     )
 
     try:
+        is_first_sweep = database.get_vault_sweep_stats()["sweep_count"] == 0
         tx_hash = await asyncio.to_thread(_send_usdc_sync, config.VAULT_WALLET_ADDRESS, sweep_amount)
         remaining = balance - sweep_amount
         log.info("[Vault] Sweep complete: $%.2f → %s... (tx: %s)", sweep_amount, config.VAULT_WALLET_ADDRESS[:10], tx_hash)
@@ -295,7 +345,10 @@ async def _check_and_sweep() -> None:
             vault_address=config.VAULT_WALLET_ADDRESS,
             tx_hash=tx_hash,
         )
-        await _notify_sweep(sweep_amount, remaining, tx_hash)
+        if is_first_sweep:
+            await _notify_first_sweep(sweep_amount, remaining, tx_hash)
+        else:
+            await _notify_sweep(sweep_amount, remaining, tx_hash)
     except Exception as exc:
         log.error("[Vault] Sweep failed: %s", exc, exc_info=True)
 
@@ -326,6 +379,30 @@ async def _notify_sweep(sweep_amount: float, remaining: float, tx_hash: str) -> 
             await sender.send_message(text, client)
     except Exception as exc:
         log.warning("[Vault] Failed to send sweep notification: %s", exc)
+
+
+async def _notify_first_sweep(sweep_amount: float, remaining: float, tx_hash: str) -> None:
+    """Special notification for the very first vault sweep."""
+    if config.DRY_RUN:
+        return
+
+    from alerter import TelegramSender
+
+    try:
+        text = (
+            "🏦 <b>FIRST PROFIT SWEEP</b>\n\n"
+            f"The bot's bankroll exceeded ${config.VAULT_SWEEP_THRESHOLD_USDC:.0f} for the first time.\n"
+            "Profits are now being automatically secured.\n\n"
+            f"💸 ${sweep_amount:.2f} transferred to vault\n"
+            f"💰 Trading continues with ${remaining:.2f}\n"
+            f'🔗 <a href="https://polygonscan.com/tx/{tx_hash}">Verify transaction →</a>\n\n'
+            f"<i>Future sweeps happen automatically every hour when balance exceeds ${config.VAULT_SWEEP_THRESHOLD_USDC:.0f}.</i>"
+        )
+        sender = TelegramSender(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
+        async with httpx.AsyncClient() as client:
+            await sender.send_message(text, client)
+    except Exception as exc:
+        log.warning("[Vault] Failed to send first-sweep notification: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +854,79 @@ async def _resolve_pending_trades() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Startup status summary
+# ---------------------------------------------------------------------------
+
+async def _log_startup_status() -> None:
+    """Log a human-readable summary of the current bot state at startup."""
+    stats = database.get_trade_stats()
+    resolved = stats.get("resolved", 0)
+    pnl = stats.get("total_pnl") or 0.0
+    sweep_stats = database.get_vault_sweep_stats()
+
+    # Wallet display
+    addr = _wallet_address
+    wallet_display = f"{addr[:6]}...{addr[-4:]}" if len(addr) > 10 else addr
+
+    # On-chain balance (best-effort)
+    try:
+        balance = await _get_usdc_balance()
+        balance_str = f"${balance:.2f}"
+    except Exception:
+        balance_str = "(unavailable)"
+
+    # Sizing state
+    if resolved < config.TRADING_DYNAMIC_MIN_RESOLVED:
+        sizing_str = (
+            f"WARMUP (fixed ${config.TRADING_BET_SIZE_USDC:.2f}) — "
+            f"{resolved}/{config.TRADING_DYNAMIC_MIN_RESOLVED} trades resolved"
+        )
+    elif pnl <= 0:
+        sizing_str = (
+            f"FIXED (${config.TRADING_BET_SIZE_USDC:.2f}) — "
+            f"{resolved} resolved but P&L ${pnl:+.2f}, waiting for profitability"
+        )
+    else:
+        try:
+            bal = await _get_usdc_balance()
+            bet = max(config.TRADING_MIN_BET_USDC,
+                      min(config.TRADING_MAX_BET_USDC, bal * config.TRADING_BET_PERCENTAGE))
+            sizing_str = (
+                f"DYNAMIC ({config.TRADING_BET_PERCENTAGE * 100:.1f}% = ${bet:.2f} per trade)"
+            )
+        except Exception:
+            sizing_str = f"DYNAMIC ({config.TRADING_BET_PERCENTAGE * 100:.1f}% of bankroll)"
+
+    # Vault state
+    if config.VAULT_WALLET_ADDRESS:
+        total_swept = sweep_stats["total_swept"]
+        vault_addr = config.VAULT_WALLET_ADDRESS
+        vault_short = f"{vault_addr[:6]}...{vault_addr[-4:]}"
+        if total_swept > 0:
+            vault_str = f"ACTIVE — ${total_swept:.2f} swept to date (vault: {vault_short})"
+        else:
+            vault_str = (
+                f"ACTIVE (vault: {vault_short}, "
+                f"sweep above ${config.VAULT_SWEEP_THRESHOLD_USDC:.0f}, "
+                f"floor ${config.VAULT_SWEEP_FLOOR_USDC:.0f})"
+            )
+    else:
+        vault_str = "INACTIVE (no VAULT_WALLET_ADDRESS configured)"
+
+    log.info("[Trader] === Trading Bot Status ===")
+    log.info("[Trader] Wallet:  %s", wallet_display)
+    log.info("[Trader] Balance: %s USDC", balance_str)
+    log.info("[Trader] Sizing:  %s", sizing_str)
+    log.info("[Trader] Vault:   %s", vault_str)
+    log.info(
+        "[Trader] Risk:    max $%.0f/day loss, max %d positions, pause after %d losses",
+        config.TRADING_MAX_DAILY_LOSS_USDC,
+        config.TRADING_MAX_CONCURRENT_POSITIONS,
+        config.TRADING_CONSECUTIVE_LOSS_PAUSE,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main trading loop
 # ---------------------------------------------------------------------------
 
@@ -812,20 +962,7 @@ async def trading_loop() -> None:
         log.critical("[Trader] Failed to initialise CLOB client: %s", exc)
         return
 
-    sizing_desc = (
-        f"dynamic({config.TRADING_BET_PERCENTAGE * 100:.0f}% "
-        f"[${config.TRADING_MIN_BET_USDC:.2f}–${config.TRADING_MAX_BET_USDC:.2f}])"
-        if config.TRADING_USE_DYNAMIC_SIZING
-        else f"fixed(${config.TRADING_BET_SIZE_USDC:.2f})"
-    )
-    log.info(
-        "[Trader] Ready. min_score=%d sizing=%s max_daily_loss=$%.2f poll=%ds sweep=%s",
-        config.TRADING_MIN_SCORE,
-        sizing_desc,
-        config.TRADING_MAX_DAILY_LOSS_USDC,
-        config.TRADING_POLL_INTERVAL_SECONDS,
-        "enabled" if config.VAULT_SWEEP_ENABLED else "disabled",
-    )
+    await _log_startup_status()
 
     # On startup, look back 24h to catch any alerts from before the restart.
     last_processed_ts: int = int(time.time()) - 86400
