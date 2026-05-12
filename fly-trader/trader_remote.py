@@ -58,6 +58,9 @@ VAULT_SWEEP_THRESHOLD_USDC: float = float(os.getenv("VAULT_SWEEP_THRESHOLD_USDC"
 VAULT_SWEEP_FLOOR_USDC: float = float(os.getenv("VAULT_SWEEP_FLOOR_USDC", "110.0"))
 VAULT_SWEEP_INTERVAL_SECONDS: int = int(os.getenv("VAULT_SWEEP_INTERVAL_SECONDS", "3600"))
 
+REDEMPTION_CHECK_INTERVAL: int = int(os.getenv("REDEMPTION_CHECK_INTERVAL", "600"))
+LOW_BALANCE_WARN_USD: float = float(os.getenv("LOW_BALANCE_WARN_USD", "10.0"))
+
 TRADING_CLOB_HOST: str = "https://clob.polymarket.com"
 TRADING_CHAIN_ID: int = 137
 
@@ -82,6 +85,10 @@ _graduation_notified: bool = False
 _notified_resolutions: set[str] = set()
 _last_resolution_check: float = 0.0
 _last_sweep_check: float = 0.0
+_last_redemption_check: float = 0.0
+_redeemed_positions: set[str] = set()
+_low_balance_warned: bool = False
+_cached_usdc_balance: float = -1.0  # -1 = not yet fetched
 _RESOLUTION_POLL_INTERVAL: int = 600
 
 # ---------------------------------------------------------------------------
@@ -112,6 +119,24 @@ _USDC_TRANSFER_ABI = [
     }
 ]
 _SWEEP_MIN_MATIC: float = 0.01
+
+# Polymarket CTF (Conditional Token Framework) contract — used for redemption.
+# Same address for both regular and neg-risk markets on Polygon.
+_CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+_CTF_REDEEM_ABI = [
+    {
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSets", "type": "uint256[]"},
+        ],
+        "name": "redeemPositions",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    }
+]
 
 # ---------------------------------------------------------------------------
 # API helpers
@@ -343,6 +368,47 @@ def _send_usdc_sync(to_address: str, amount_usdc: float) -> str:
     return tx_hash.hex()
 
 
+def _redeem_positions_sync(condition_id: str) -> str:
+    """
+    Call CTF.redeemPositions(usdc, 0x0, conditionId, [1, 2]) on Polygon.
+    Burns all outcome tokens held by the wallet for this market and returns
+    the collateral (USDC) owed for the winning side. Safe to call with [1, 2]
+    (both slots) regardless of which outcome won — losing tokens return 0.
+    """
+    from web3 import Web3
+    from eth_account import Account
+
+    rpc = ALCHEMY_RPC_URL or "https://polygon-rpc.com"
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+    ctf = w3.eth.contract(
+        address=Web3.to_checksum_address(_CTF_CONTRACT),
+        abi=_CTF_REDEEM_ABI,
+    )
+
+    # Normalise condition_id to exactly 32 bytes (pad left with zeros if short)
+    hex_str = condition_id.replace("0x", "").zfill(64)
+    condition_bytes32 = bytes.fromhex(hex_str)
+
+    from_addr = Web3.to_checksum_address(_wallet_address)
+    tx = ctf.functions.redeemPositions(
+        Web3.to_checksum_address(_USDC_CONTRACT),  # collateralToken
+        b"\x00" * 32,                              # parentCollectionId = bytes32(0)
+        condition_bytes32,                          # conditionId
+        [1, 2],                                    # indexSets: YES slot + NO slot
+    ).build_transaction({
+        "from":     from_addr,
+        "nonce":    w3.eth.get_transaction_count(from_addr),
+        "gas":      200_000,
+        "gasPrice": w3.eth.gas_price,
+        "chainId":  TRADING_CHAIN_ID,
+    })
+    account = Account.from_key(TRADING_PRIVATE_KEY)
+    signed = account.sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    return tx_hash.hex()
+
+
 async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
     if not VAULT_WALLET_ADDRESS:
         return
@@ -489,6 +555,37 @@ async def _notify_sweep(
         f"💰 Trading wallet balance: ${remaining:.2f}\n"
         f'🔗 <a href="https://polygonscan.com/tx/{tx_hash}">Verify transaction →</a>\n\n'
         f"<i>Profits secured. Trading continues with ${remaining:.2f}.</i>"
+    )
+    await _send_telegram(http_client, text)
+
+
+async def _notify_redemption(
+    http_client: httpx.AsyncClient,
+    count: int,
+    recovered: float,
+    new_balance: float,
+) -> None:
+    plural = "positions" if count > 1 else "position"
+    text = (
+        f"💵 <b>POSITION REDEEMED</b>\n\n"
+        f"✅ {count} winning {plural} settled\n"
+        f"💰 <b>Recovered: ${recovered:.2f} USDC</b>\n"
+        f"🏦 <b>Wallet balance: ${new_balance:.2f}</b>"
+    )
+    await _send_telegram(http_client, text)
+
+
+async def _notify_low_balance(
+    http_client: httpx.AsyncClient,
+    balance: float,
+    open_positions: int,
+) -> None:
+    text = (
+        "⚠️ <b>LOW BALANCE</b>\n\n"
+        f"Trading wallet has <b>${balance:.2f} USDC</b> remaining.\n"
+        f"📂 {open_positions} position(s) still open awaiting resolution.\n"
+        f"Bot will pause new trades until redemptions replenish balance above "
+        f"${TRADING_MIN_BET_USDC:.2f}."
     )
     await _send_telegram(http_client, text)
 
@@ -716,11 +813,101 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Redemption and balance monitoring
+# ---------------------------------------------------------------------------
+
+async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
+    """
+    Poll /api/trades/pending for filled+resolved_won positions not yet redeemed,
+    call CTF.redeemPositions for each, and update the cached USDC balance.
+    Also fires a low-balance warning when the wallet drops below LOW_BALANCE_WARN_USD.
+    """
+    global _low_balance_warned, _cached_usdc_balance
+
+    data = await _api_get(http_client, "/api/trades/pending")
+    if not isinstance(data, list):
+        return
+
+    # Positions that are filled and won, not yet redeemed this session
+    redeemable = [
+        t for t in data
+        if t.get("status") == "filled"
+        and t.get("alert_resolution_status") == "resolved_won"
+        and t.get("alert_id") not in _redeemed_positions
+        and t.get("market_id")
+    ]
+
+    if redeemable:
+        # MATIC gas check before any on-chain calls
+        try:
+            matic = await asyncio.to_thread(_get_matic_balance_sync)
+            if matic < _SWEEP_MIN_MATIC:
+                log.warning("[Redeem] Insufficient MATIC (%.4f) — skipping redemption", matic)
+                return
+        except Exception as exc:
+            log.warning("[Redeem] MATIC check failed: %s — skipping redemption", exc)
+            return
+
+        try:
+            balance_before = await _get_usdc_balance()
+        except Exception as exc:
+            log.warning("[Redeem] Pre-redeem balance fetch failed: %s", exc)
+            balance_before = 0.0
+
+        for trade in redeemable:
+            alert_id = trade["alert_id"]
+            market_id = trade["market_id"]
+            log.info("[Redeem] Calling redeemPositions for market %s", market_id[:16])
+            try:
+                tx_hash = await asyncio.to_thread(_redeem_positions_sync, market_id)
+                _redeemed_positions.add(alert_id)
+                log.info("[Redeem] %s redeemed → tx=%s", alert_id[:12], tx_hash)
+            except Exception as exc:
+                log.error("[Redeem] redeemPositions failed for %s (%s): %s",
+                          alert_id[:12], market_id[:16], exc)
+
+        try:
+            balance_after = await _get_usdc_balance()
+        except Exception as exc:
+            log.warning("[Redeem] Post-redeem balance fetch failed: %s", exc)
+            balance_after = balance_before
+
+        recovered = max(0.0, balance_after - balance_before)
+        _cached_usdc_balance = balance_after
+        log.info("[Redeem] %d position(s) processed | recovered $%.2f | balance $%.2f",
+                 len(redeemable), recovered, balance_after)
+
+        if recovered > 0.01:
+            await _notify_redemption(http_client, len(redeemable), recovered, balance_after)
+
+    else:
+        # No redemptions due — still refresh cached balance for the low-balance check
+        try:
+            _cached_usdc_balance = await _get_usdc_balance()
+        except Exception as exc:
+            log.warning("[Redeem] Balance refresh failed: %s", exc)
+            return
+
+    # Low-balance warning + auto-pause logic (threshold is LOW_BALANCE_WARN_USD)
+    if _cached_usdc_balance >= 0:
+        open_count = sum(
+            1 for t in data
+            if t.get("status") == "filled" and t.get("alert_resolution_status") == "pending"
+        )
+        if _cached_usdc_balance < LOW_BALANCE_WARN_USD and not _low_balance_warned:
+            _low_balance_warned = True
+            log.warning("[Balance] Low balance: $%.2f — sending warning", _cached_usdc_balance)
+            await _notify_low_balance(http_client, _cached_usdc_balance, open_count)
+        elif _cached_usdc_balance >= LOW_BALANCE_WARN_USD:
+            _low_balance_warned = False  # reset so warning re-fires if balance drops again
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _wallet_address, _last_resolution_check, _last_sweep_check
+    global _wallet_address, _last_resolution_check, _last_sweep_check, _last_redemption_check
 
     if not RAILWAY_API_URL:
         log.critical("RAILWAY_API_URL is not set — exiting")
@@ -766,6 +953,22 @@ async def main() -> None:
                 if VAULT_WALLET_ADDRESS and now - _last_sweep_check >= VAULT_SWEEP_INTERVAL_SECONDS:
                     await _check_and_sweep(http_client)
                     _last_sweep_check = now
+
+                # Redemption check (also refreshes _cached_usdc_balance for the pause below)
+                if now - _last_redemption_check >= REDEMPTION_CHECK_INTERVAL:
+                    await _check_and_redeem(http_client)
+                    _last_redemption_check = now
+
+                # Pause trading when balance is too low to cover the minimum bet.
+                # Resumes automatically once redemptions replenish the wallet.
+                if _cached_usdc_balance >= 0 and _cached_usdc_balance < TRADING_MIN_BET_USDC:
+                    log.info(
+                        "[Risk] Balance $%.2f < min $%.2f — pausing new trades, "
+                        "waiting for redemptions",
+                        _cached_usdc_balance, TRADING_MIN_BET_USDC,
+                    )
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
 
                 # Fetch stats for risk management
                 stats = await _api_get(http_client, "/api/stats/trading") or {}
