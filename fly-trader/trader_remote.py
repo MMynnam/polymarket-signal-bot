@@ -100,10 +100,10 @@ _cached_usdc_balance: float = -1.0  # -1 = not yet fetched
 _RESOLUTION_POLL_INTERVAL: int = 600
 
 # ---------------------------------------------------------------------------
-# USDC / web3 constants (Polygon — bridged USDC.e)
+# Collateral token constants (Polygon — Polymarket USD / pUSD)
 # ---------------------------------------------------------------------------
 
-_USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+_USDC_CONTRACT = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 _USDC_DECIMALS = 6
 _USDC_BALANCE_ABI = [
     {
@@ -249,6 +249,9 @@ def _get_wallet_address() -> str:
 
 def _get_usdc_balance_sync() -> float:
     from web3 import Web3
+    # USDC lives in the proxy/safe wallet when TRADING_FUNDER_ADDRESS is set.
+    # Fall back to the EOA only when running in plain EOA mode (sig_type=0, no funder).
+    target = TRADING_FUNDER_ADDRESS if TRADING_FUNDER_ADDRESS else _wallet_address
     rpc = ALCHEMY_RPC_URL or "https://polygon-rpc.com"
     w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
     contract = w3.eth.contract(
@@ -256,7 +259,7 @@ def _get_usdc_balance_sync() -> float:
         abi=_USDC_BALANCE_ABI,
     )
     raw = contract.functions.balanceOf(
-        Web3.to_checksum_address(_wallet_address)
+        Web3.to_checksum_address(target)
     ).call()
     return raw / (10 ** _USDC_DECIMALS)
 
@@ -394,6 +397,13 @@ def _redeem_positions_sync(condition_id: str) -> str:
     Burns all outcome tokens held by the wallet for this market and returns
     the collateral (USDC) owed for the winning side. Safe to call with [1, 2]
     (both slots) regardless of which outcome won — losing tokens return 0.
+
+    NOTE (proxy wallet): outcome tokens are held by the proxy wallet
+    (TRADING_FUNDER_ADDRESS), not the EOA. This call is sent from the EOA
+    (_wallet_address) as msg.sender. Whether CTF honours it depends on whether
+    the EOA is the registered owner of the proxy. Behaviour is untested —
+    Polymarket may also auto-redeem via their own backend. We'll observe the
+    first resolved winning trade before deciding if this needs reworking.
     """
     from web3 import Web3
     from eth_account import Account
@@ -430,6 +440,18 @@ def _redeem_positions_sync(condition_id: str) -> str:
 
 
 async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
+    # TODO (proxy-wallet sweep): USDC lives in the proxy wallet, not the EOA.
+    # _send_usdc_sync() builds a transfer() tx signed by the EOA directly, which
+    # will fail because the EOA holds no USDC. A proxy-aware sweep would need to
+    # call the proxy contract's execTransaction() (Gnosis Safe) or equivalent to
+    # forward the transfer. Disabled until that logic is implemented.
+    if TRADING_FUNDER_ADDRESS:
+        log.info(
+            "[Vault] Sweep skipped — proxy-wallet sweep logic not yet implemented. "
+            "Funds remain in proxy at %s.", TRADING_FUNDER_ADDRESS,
+        )
+        return
+
     if not VAULT_WALLET_ADDRESS:
         return
 
@@ -494,30 +516,47 @@ async def _notify_trade_filled(
     size: float,
     score: int,
     slippage: Optional[float],
-    stats: dict,
+    market_url: Optional[str],
+    order_id: Optional[str],
 ) -> None:
-    addr = _wallet_address
-    wallet_display = f"{addr[:10]}...{addr[-6:]}" if len(addr) > 16 else addr
-    open_count = stats.get("open_positions", 0)
+    import html as _html
 
     try:
         remaining_balance = await _get_usdc_balance()
     except Exception:
-        remaining_balance = (TRADING_MAX_CONCURRENT_POSITIONS - open_count) * TRADING_BET_SIZE_USDC
+        remaining_balance = 0.0
 
-    slip_str = f"{slippage:.4f}" if slippage is not None else "N/A"
+    profit_if_win = (size / fill_price) - size if fill_price and fill_price > 0 else 0.0
+    slip_str = f"{slippage * 100:.1f}%" if slippage is not None else "N/A"
+    safe_q = _html.escape(market_q[:120])
+    funder = TRADING_FUNDER_ADDRESS or _wallet_address
+
+    market_line = (
+        f'🔮 <a href="{market_url}">View on Polymarket</a>\n'
+        if market_url else ""
+    )
+    order_line = (
+        f"🆔 <b>Order:</b> <code>{order_id}</code>\n"
+        if order_id else ""
+    )
+
     text = (
         "💰💰💰 <b>LIVE TRADE</b> 💰💰💰\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📋 <b>Market:</b> {market_q[:120]}\n\n"
-        f"🎯 <b>Position:</b> <b>{bet_side}</b> @ {fill_price:.3f}\n"
-        f"💵 <b>Size:</b> ${size:.2f} USDC\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📋 <b>Market:</b> {safe_q}\n"
+        f"{market_line}\n"
+        f"🎯 <b>Bet:</b> {_html.escape(bet_side)} @ ${fill_price:.3f}\n"
+        f"💵 <b>Stake:</b> ${size:.2f} USDC\n"
+        f"💰 <b>Profit if win:</b> ${profit_if_win:.2f}\n"
         f"📊 <b>Signal score:</b> {score}\n"
         f"📉 <b>Slippage:</b> {slip_str}\n\n"
-        f"💼 <b>Bankroll available:</b> ${remaining_balance:.2f}\n"
-        f"📂 <b>Open positions:</b> {open_count}/{TRADING_MAX_CONCURRENT_POSITIONS}\n"
-        f"👛 <b>Wallet:</b> <code>{wallet_display}</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 <b>Bankroll remaining:</b> ${remaining_balance:.2f} USDC\n\n"
+        f"{order_line}"
+        "🔍 <b>Verify on-chain:</b>\n"
+        f"Signer EOA: <code>{_wallet_address}</code>\n"
+        f"Deposit wallet: <code>{funder}</code>\n"
+        f'<a href="https://polygonscan.com/address/{funder}">View wallet on Polygonscan</a>\n\n'
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚠️ <i>Automated trade. Not financial advice.</i>"
     )
     await _send_telegram(http_client, text)
@@ -655,13 +694,15 @@ async def _execute_trade(
     from py_clob_client_v2.order_utils.model.side import Side
     from py_clob_client_v2.exceptions import PolyException
 
-    alert_id  = alert["alert_id"]
-    market_id = alert["market_id"]
-    market_q  = alert.get("market_question") or market_id
-    bet_side  = alert["bet_side"]
+    alert_id    = alert["alert_id"]
+    market_id   = alert["market_id"]
+    market_q    = alert.get("market_question") or market_id
+    bet_side    = alert["bet_side"]
     price_alert = float(alert["bet_price_at_alert"])
-    score     = int(alert["score"])
-    token_id  = alert.get("clob_token_id")
+    score       = int(alert["score"])
+    token_id    = alert.get("clob_token_id")
+    _slug       = alert.get("market_slug")
+    market_url  = f"https://polymarket.com/event/{_slug}" if _slug else None
 
     if not token_id:
         log.error("[Trade] No clob_token_id for alert %s — skipping", alert_id[:12])
@@ -777,7 +818,7 @@ async def _execute_trade(
         await _notify_trade_filled(
             http_client, market_q, bet_side,
             fill_price or current_price or price_alert,
-            bet_size, score, slippage, stats,
+            bet_size, score, slippage, market_url, order_id,
         )
     else:
         await _notify_trade_error(
@@ -846,6 +887,13 @@ async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
     Poll /api/trades/pending for filled+resolved_won positions not yet redeemed,
     call CTF.redeemPositions for each, and update the cached USDC balance.
     Also fires a low-balance warning when the wallet drops below LOW_BALANCE_WARN_USD.
+
+    NOTE (deposit wallet / auto-redemption): the user enabled Polymarket's
+    platform-level auto-redemption during onboarding. Polymarket's backend will
+    automatically redeem winning positions to the deposit wallet, making the
+    CTF call below a no-op in normal operation. This function is left running
+    as a safety net in case auto-redemption misses a position, but it can be
+    removed in a future cleanup once we confirm auto-redemption is reliable.
     """
     global _low_balance_warned, _cached_usdc_balance
 
@@ -949,7 +997,9 @@ async def main() -> None:
     log.info("=" * 60)
     log.info("Polymarket Remote Trader starting")
     log.info("Railway API: %s", RAILWAY_API_URL)
-    log.info("Wallet:      %s", _wallet_address)
+    log.info("Wallet (EOA, signs/gas): %s", _wallet_address)
+    log.info("Funder (USDC balance):   %s",
+             TRADING_FUNDER_ADDRESS if TRADING_FUNDER_ADDRESS else f"{_wallet_address} (EOA)")
     log.info("Poll:        every %ds | Min score: %d", POLL_INTERVAL, TRADING_MIN_SCORE)
     log.info("Vault:       %s", VAULT_WALLET_ADDRESS or "disabled")
     log.info("=" * 60)

@@ -125,7 +125,7 @@ ALCHEMY_RPC_URL: str = os.getenv("ALCHEMY_RPC_URL", "")  # Full URL including AP
 # Scores >= ALERT_INSTANT_THRESHOLD fire an immediate Telegram message.
 # Scores in [ALERT_DIGEST_THRESHOLD, ALERT_INSTANT_THRESHOLD) are buffered
 # and sent as a periodic digest every DIGEST_INTERVAL_SECONDS.
-ALERT_INSTANT_THRESHOLD: int = int(os.getenv("ALERT_INSTANT_THRESHOLD", "70"))
+ALERT_INSTANT_THRESHOLD: int = int(os.getenv("ALERT_INSTANT_THRESHOLD", "65"))
 ALERT_DIGEST_THRESHOLD: int = int(os.getenv("ALERT_DIGEST_THRESHOLD", "60"))
 
 # ---------------------------------------------------------------------------

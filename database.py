@@ -1142,6 +1142,16 @@ def get_tradeable_alerts_for_api(
                 pass
 
         d["clob_token_id"] = clob_token_id
+
+        market_slug = None
+        if raw_json_str:
+            try:
+                raw_for_slug = json.loads(raw_json_str)
+                market_slug = raw_for_slug.get("_event_slug") or raw_for_slug.get("slug") or None
+            except Exception:
+                pass
+        d["market_slug"] = market_slug
+
         results.append(d)
 
     return results
