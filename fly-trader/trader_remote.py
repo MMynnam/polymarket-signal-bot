@@ -57,6 +57,9 @@ VAULT_WALLET_ADDRESS: str = os.getenv("VAULT_WALLET_ADDRESS", "")
 VAULT_SWEEP_THRESHOLD_USDC: float = float(os.getenv("VAULT_SWEEP_THRESHOLD_USDC", "150.0"))
 VAULT_SWEEP_FLOOR_USDC: float = float(os.getenv("VAULT_SWEEP_FLOOR_USDC", "110.0"))
 VAULT_SWEEP_INTERVAL_SECONDS: int = int(os.getenv("VAULT_SWEEP_INTERVAL_SECONDS", "3600"))
+# Set to a positive value (e.g. 1.0) to sweep exactly that amount for first-run testing.
+# Set to 0 (default) for normal operation (sweeps balance − floor).
+VAULT_SWEEP_TEST_AMOUNT_USDC: float = float(os.getenv("VAULT_SWEEP_TEST_AMOUNT_USDC", "0"))
 
 REDEMPTION_CHECK_INTERVAL: int = int(os.getenv("REDEMPTION_CHECK_INTERVAL", "600"))
 LOW_BALANCE_WARN_USD: float = float(os.getenv("LOW_BALANCE_WARN_USD", "10.0"))
@@ -102,6 +105,8 @@ _cached_usdc_balance: float = -1.0  # -1 = not yet fetched
 _RESOLUTION_POLL_INTERVAL: int = 600
 _skip_notified: dict = {}  # (alert_id, reason_key) -> timestamp; skip notification rate-limit
 _SKIP_RATE_LIMIT_SECONDS: int = 300
+_sweep_state: str = "idle"   # idle | pause_pending | pause_ready
+_sweep_paused_at: float = 0.0
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -115,18 +120,6 @@ _USDC_BALANCE_ABI = [
         "name": "balanceOf",
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
-        "type": "function",
-    }
-]
-_USDC_TRANSFER_ABI = [
-    {
-        "inputs": [
-            {"name": "to", "type": "address"},
-            {"name": "amount", "type": "uint256"},
-        ],
-        "name": "transfer",
-        "outputs": [{"name": "", "type": "bool"}],
-        "stateMutability": "nonpayable",
         "type": "function",
     }
 ]
@@ -149,6 +142,35 @@ _CTF_REDEEM_ABI = [
         "type": "function",
     }
 ]
+
+# DepositWallet (ERC-1967 proxy implementation: 0x58CA52ebe0DadfdF531Cde7062e76746de4Db1eB).
+# execute() is onlyFactory — cannot be called by EOA. The only EOA-accessible path for moving
+# funds out is: pause() → wait timelockDelay → withdrawERC20() → unpause().
+# pause() does NOT block execute() (trading continues during the sweep window).
+_DEPOSIT_WALLET_ABI = [
+    {
+        "inputs": [],
+        "name": "paused",
+        "outputs": [{"internalType": "uint256", "name": "paused_", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {"inputs": [], "name": "pause",   "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+    {"inputs": [], "name": "unpause", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+    {
+        "inputs": [
+            {"name": "_token",  "type": "address"},
+            {"name": "_to",     "type": "address"},
+            {"name": "_amount", "type": "uint256"},
+        ],
+        "name": "withdrawERC20",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+# Verified: DepositWalletFactory.timelockDelay() == 3600 on Polygon mainnet.
+_DEPOSIT_WALLET_TIMELOCK_SECONDS: int = 3600
 
 # ---------------------------------------------------------------------------
 # API helpers
@@ -476,36 +498,6 @@ async def _check_risk_limits(stats: dict) -> Optional[str]:
 # Vault sweep
 # ---------------------------------------------------------------------------
 
-def _send_usdc_sync(to_address: str, amount_usdc: float) -> str:
-    from web3 import Web3
-    from eth_account import Account
-
-    rpc = ALCHEMY_RPC_URL or "https://polygon-rpc.com"
-    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
-    usdc = w3.eth.contract(
-        address=Web3.to_checksum_address(_USDC_CONTRACT),
-        abi=_USDC_TRANSFER_ABI,
-    )
-    amount_raw = int(amount_usdc * (10 ** _USDC_DECIMALS))
-    from_addr = Web3.to_checksum_address(_wallet_address)
-
-    tx = usdc.functions.transfer(
-        Web3.to_checksum_address(to_address),
-        amount_raw,
-    ).build_transaction({
-        "from":     from_addr,
-        "nonce":    w3.eth.get_transaction_count(from_addr),
-        "gas":      100_000,
-        "gasPrice": w3.eth.gas_price,
-        "chainId":  TRADING_CHAIN_ID,
-    })
-    account = Account.from_key(TRADING_PRIVATE_KEY)
-    signed = account.sign_transaction(tx)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-    return tx_hash.hex()
-
-
 def _redeem_positions_sync(condition_id: str) -> str:
     """
     Call CTF.redeemPositions(usdc, 0x0, conditionId, [1, 2]) on Polygon.
@@ -554,36 +546,221 @@ def _redeem_positions_sync(condition_id: str) -> str:
     return tx_hash.hex()
 
 
+def _get_wallet_paused_timestamp_sync() -> int:
+    """Return the paused timestamp from the deposit wallet (0 if not paused)."""
+    from web3 import Web3
+    rpc = ALCHEMY_RPC_URL or "https://polygon-rpc.com"
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
+    wallet = w3.eth.contract(
+        address=Web3.to_checksum_address(TRADING_FUNDER_ADDRESS),
+        abi=_DEPOSIT_WALLET_ABI,
+    )
+    return int(wallet.functions.paused().call())
+
+
+def _initiate_sweep_pause_sync() -> str:
+    """Call pause() on the deposit wallet from the EOA. Returns tx hash."""
+    from web3 import Web3
+    from eth_account import Account as _Account
+    rpc = ALCHEMY_RPC_URL or "https://polygon-rpc.com"
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+    wallet = w3.eth.contract(
+        address=Web3.to_checksum_address(TRADING_FUNDER_ADDRESS),
+        abi=_DEPOSIT_WALLET_ABI,
+    )
+    eoa_cs = Web3.to_checksum_address(_wallet_address)
+    tx = wallet.functions.pause().build_transaction({
+        "from":     eoa_cs,
+        "nonce":    w3.eth.get_transaction_count(eoa_cs),
+        "gas":      80_000,
+        "gasPrice": w3.eth.gas_price,
+        "chainId":  TRADING_CHAIN_ID,
+    })
+    signed = _Account.from_key(TRADING_PRIVATE_KEY).sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    if receipt.status != 1:
+        raise RuntimeError(f"pause() reverted: {tx_hash.hex()}")
+    return tx_hash.hex()
+
+
+def _execute_sweep_withdraw_sync(sweep_amount: float) -> str:
+    """
+    Pre-flight simulate then call withdrawERC20(pUSD, vault, amount) on the deposit wallet.
+    Requires wallet to be paused and timelockDelay elapsed.
+    Returns tx hash.
+    """
+    from web3 import Web3
+    from eth_account import Account as _Account
+    rpc = ALCHEMY_RPC_URL or "https://polygon-rpc.com"
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+    wallet = w3.eth.contract(
+        address=Web3.to_checksum_address(TRADING_FUNDER_ADDRESS),
+        abi=_DEPOSIT_WALLET_ABI,
+    )
+    eoa_cs   = Web3.to_checksum_address(_wallet_address)
+    pusd_cs  = Web3.to_checksum_address(_USDC_CONTRACT)
+    vault_cs = Web3.to_checksum_address(VAULT_WALLET_ADDRESS)
+    amount_raw = int(sweep_amount * (10 ** _USDC_DECIMALS))
+
+    # Pre-flight simulation — revert here means no gas burned on a broken call
+    wallet.functions.withdrawERC20(pusd_cs, vault_cs, amount_raw).call({"from": eoa_cs})
+
+    tx = wallet.functions.withdrawERC20(pusd_cs, vault_cs, amount_raw).build_transaction({
+        "from":     eoa_cs,
+        "nonce":    w3.eth.get_transaction_count(eoa_cs),
+        "gas":      120_000,
+        "gasPrice": w3.eth.gas_price,
+        "chainId":  TRADING_CHAIN_ID,
+    })
+    signed = _Account.from_key(TRADING_PRIVATE_KEY).sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+    if receipt.status != 1:
+        raise RuntimeError(f"withdrawERC20() reverted: {tx_hash.hex()}")
+    return tx_hash.hex()
+
+
+def _unpause_deposit_wallet_sync() -> str:
+    """Call unpause() on the deposit wallet from the EOA. Returns tx hash."""
+    from web3 import Web3
+    from eth_account import Account as _Account
+    rpc = ALCHEMY_RPC_URL or "https://polygon-rpc.com"
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))
+    wallet = w3.eth.contract(
+        address=Web3.to_checksum_address(TRADING_FUNDER_ADDRESS),
+        abi=_DEPOSIT_WALLET_ABI,
+    )
+    eoa_cs = Web3.to_checksum_address(_wallet_address)
+    tx = wallet.functions.unpause().build_transaction({
+        "from":     eoa_cs,
+        "nonce":    w3.eth.get_transaction_count(eoa_cs),
+        "gas":      80_000,
+        "gasPrice": w3.eth.gas_price,
+        "chainId":  TRADING_CHAIN_ID,
+    })
+    signed = _Account.from_key(TRADING_PRIVATE_KEY).sign_transaction(tx)
+    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+    if receipt.status != 1:
+        raise RuntimeError(f"unpause() reverted: {tx_hash.hex()}")
+    return tx_hash.hex()
+
+
+def _get_vault_pusd_balance_sync() -> float:
+    """Return the current pUSD balance of the vault wallet."""
+    from web3 import Web3
+    rpc = ALCHEMY_RPC_URL or "https://polygon-rpc.com"
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(_USDC_CONTRACT),
+        abi=_USDC_BALANCE_ABI,
+    )
+    raw = contract.functions.balanceOf(
+        Web3.to_checksum_address(VAULT_WALLET_ADDRESS)
+    ).call()
+    return raw / (10 ** _USDC_DECIMALS)
+
+
 async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
-    # TODO (proxy-wallet sweep): USDC lives in the proxy wallet, not the EOA.
-    # _send_usdc_sync() builds a transfer() tx signed by the EOA directly, which
-    # will fail because the EOA holds no USDC. A proxy-aware sweep would need to
-    # call the proxy contract's execTransaction() (Gnosis Safe) or equivalent to
-    # forward the transfer. Disabled until that logic is implemented.
-    if TRADING_FUNDER_ADDRESS:
-        log.info(
-            "[Vault] Sweep skipped — proxy-wallet sweep logic not yet implemented. "
-            "Funds remain in proxy at %s.", TRADING_FUNDER_ADDRESS,
-        )
+    """
+    Three-phase vault sweep via DepositWallet.pause() → 1h timelock → withdrawERC20() → unpause().
+
+    Phase 1 (idle): threshold met + no open positions → call pause(), enter pause_pending.
+    Phase 2 (pause_pending): wait _DEPOSIT_WALLET_TIMELOCK_SECONDS, then enter pause_ready.
+    Phase 3 (pause_ready): pre-flight sim → withdrawERC20 → unpause → notify → idle.
+
+    pause() does NOT block execute() — trading via Polymarket's relayer continues during the sweep.
+    On any phase-3 failure: log once, attempt unpause, reset to idle. No auto-retry.
+    """
+    global _sweep_state, _sweep_paused_at
+
+    if not VAULT_WALLET_ADDRESS or not TRADING_FUNDER_ADDRESS:
         return
 
-    if not VAULT_WALLET_ADDRESS:
+    # ------------------------------------------------------------------
+    # Phase 2 — wait for timelock
+    # ------------------------------------------------------------------
+    if _sweep_state == "pause_pending":
+        elapsed = time.time() - _sweep_paused_at
+        remaining_s = _DEPOSIT_WALLET_TIMELOCK_SECONDS - elapsed
+        if remaining_s > 0:
+            log.info("[Vault] Pause timelock: %.0fs remaining", remaining_s)
+            return
+        log.info("[Vault] Timelock elapsed — advancing to pause_ready")
+        _sweep_state = "pause_ready"
+        return  # execute withdraw on the next cycle
+
+    # ------------------------------------------------------------------
+    # Phase 3 — withdraw + unpause
+    # ------------------------------------------------------------------
+    if _sweep_state == "pause_ready":
+        try:
+            balance = await _get_usdc_balance()
+            if VAULT_SWEEP_TEST_AMOUNT_USDC > 0:
+                sweep_amount = VAULT_SWEEP_TEST_AMOUNT_USDC
+            else:
+                sweep_amount = balance - VAULT_SWEEP_FLOOR_USDC
+
+            if sweep_amount <= 0:
+                log.warning("[Vault] Sweep amount $%.2f <= 0 — aborting", sweep_amount)
+                try:
+                    await asyncio.to_thread(_unpause_deposit_wallet_sync)
+                except Exception as ue:
+                    log.error("[Vault] Unpause after abort failed: %s", ue)
+                _sweep_state = "idle"
+                return
+
+            log.info("[Vault] withdrawERC20: $%.2f pUSD → %s", sweep_amount, VAULT_WALLET_ADDRESS[:12])
+            tx_hash = await asyncio.to_thread(_execute_sweep_withdraw_sync, sweep_amount)
+            log.info("[Vault] withdrawERC20 success: tx=%s", tx_hash)
+
+            remaining_balance = await _get_usdc_balance()
+            try:
+                vault_total = await asyncio.to_thread(_get_vault_pusd_balance_sync)
+            except Exception:
+                vault_total = 0.0
+
+            try:
+                await asyncio.to_thread(_unpause_deposit_wallet_sync)
+                log.info("[Vault] Deposit wallet unpaused")
+            except Exception as ue:
+                log.error("[Vault] Unpause failed — wallet stays paused: %s", ue)
+
+            _sweep_state = "idle"
+            await _notify_sweep(http_client, sweep_amount, remaining_balance, vault_total, tx_hash)
+
+        except Exception as exc:
+            log.error(
+                "[Vault] Phase 3 failed: %s — resetting to idle. Manual investigation required.",
+                exc, exc_info=True,
+            )
+            try:
+                await asyncio.to_thread(_unpause_deposit_wallet_sync)
+            except Exception as ue:
+                log.error("[Vault] Unpause on error failed: %s", ue)
+            _sweep_state = "idle"
         return
 
+    # ------------------------------------------------------------------
+    # Phase 1 (idle) — check threshold and initiate pause
+    # ------------------------------------------------------------------
     try:
         balance = await _get_usdc_balance()
     except Exception as exc:
-        log.warning("[Vault] Balance fetch failed: %s — skipping sweep", exc)
+        log.warning("[Vault] Balance fetch failed: %s — skipping sweep check", exc)
         return
 
-    if balance <= VAULT_SWEEP_THRESHOLD_USDC:
+    threshold = VAULT_SWEEP_TEST_AMOUNT_USDC if VAULT_SWEEP_TEST_AMOUNT_USDC > 0 else VAULT_SWEEP_THRESHOLD_USDC
+    if balance < threshold:
         return
 
-    sweep_amount = balance - VAULT_SWEEP_FLOOR_USDC
-    if sweep_amount <= 0:
+    stats = await _api_get(http_client, "/api/stats/trading") or {}
+    open_positions = stats.get("open_positions", 0)
+    if open_positions > 0:
+        log.info("[Vault] Sweep deferred — %d position(s) still open", open_positions)
         return
 
-    # Gas check
     try:
         matic = await asyncio.to_thread(_get_matic_balance_sync)
         if matic < _SWEEP_MIN_MATIC:
@@ -593,14 +770,15 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
         log.warning("[Vault] MATIC check failed: %s — skipping sweep", exc)
         return
 
-    log.info("[Vault] Sweeping $%.2f to vault (balance $%.2f)", sweep_amount, balance)
+    log.info("[Vault] Initiating pause on deposit wallet (balance $%.2f)...", balance)
     try:
-        tx_hash = await asyncio.to_thread(_send_usdc_sync, VAULT_WALLET_ADDRESS, sweep_amount)
-        remaining = balance - sweep_amount
-        log.info("[Vault] Sweep complete: tx=%s", tx_hash)
-        await _notify_sweep(http_client, sweep_amount, remaining, tx_hash)
+        await asyncio.to_thread(_initiate_sweep_pause_sync)
+        _sweep_paused_at = time.time()
+        _sweep_state = "pause_pending"
+        log.info("[Vault] pause() submitted. Withdraw unlocks in %ds.", _DEPOSIT_WALLET_TIMELOCK_SECONDS)
     except Exception as exc:
-        log.error("[Vault] Sweep failed: %s", exc, exc_info=True)
+        log.error("[Vault] pause() failed: %s — sweep aborted", exc, exc_info=True)
+        _sweep_state = "idle"
 
 
 # ---------------------------------------------------------------------------
@@ -710,19 +888,17 @@ async def _notify_sweep(
     http_client: httpx.AsyncClient,
     sweep_amount: float,
     remaining: float,
+    vault_total: float,
     tx_hash: str,
 ) -> None:
-    def _short(addr: str) -> str:
-        return f"{addr[:10]}...{addr[-6:]}" if len(addr) > 16 else addr
-
     text = (
-        "🏦 <b>PROFIT SWEEP</b>\n\n"
-        f"💸 <b>${sweep_amount:.2f}</b> USDC transferred to vault\n"
-        f"📤 From: <code>{_short(_wallet_address)}</code>\n"
-        f"📥 To: <code>{_short(VAULT_WALLET_ADDRESS)}</code>\n\n"
-        f"💰 Trading wallet balance: ${remaining:.2f}\n"
-        f'🔗 <a href="https://polygonscan.com/tx/{tx_hash}">Verify transaction →</a>\n\n'
-        f"<i>Profits secured. Trading continues with ${remaining:.2f}.</i>"
+        "🏦 <b>PROFIT SWEEP</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"💸 Swept: ${sweep_amount:.2f} pUSD\n"
+        f"💰 Trading wallet remaining: ${remaining:.2f}\n"
+        f"🏛️ Vault total received: ${vault_total:.2f}\n\n"
+        f'🔍 <a href="https://polygonscan.com/tx/{tx_hash}">View transaction</a>\n\n'
+        "━━━━━━━━━━━━━━━━━━"
     )
     await _send_telegram(http_client, text)
 
@@ -1091,7 +1267,7 @@ async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _wallet_address, _last_resolution_check, _last_sweep_check, _last_redemption_check, _last_positions_summary
+    global _wallet_address, _last_resolution_check, _last_sweep_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at
 
     if not RAILWAY_API_URL:
         log.critical("RAILWAY_API_URL is not set — exiting")
@@ -1122,6 +1298,27 @@ async def main() -> None:
         log.critical("CLOB client init failed: %s", exc)
         sys.exit(1)
 
+    # Recover sweep state if the bot restarted mid-sweep (wallet may be paused).
+    if TRADING_FUNDER_ADDRESS and VAULT_WALLET_ADDRESS:
+        try:
+            paused_ts = await asyncio.to_thread(_get_wallet_paused_timestamp_sync)
+            if paused_ts > 0:
+                elapsed = time.time() - paused_ts
+                log.warning("[Vault] Deposit wallet is paused (since %d, %.0fs ago)", paused_ts, elapsed)
+                if elapsed >= _DEPOSIT_WALLET_TIMELOCK_SECONDS:
+                    log.warning("[Vault] Timelock already elapsed — unpausing on startup")
+                    try:
+                        await asyncio.to_thread(_unpause_deposit_wallet_sync)
+                        log.info("[Vault] Deposit wallet unpaused on startup")
+                    except Exception as ue:
+                        log.error("[Vault] Startup unpause failed: %s", ue)
+                else:
+                    _sweep_paused_at = float(paused_ts)
+                    _sweep_state = "pause_pending"
+                    log.warning("[Vault] Restoring sweep state=pause_pending (%.0fs remaining)", _DEPOSIT_WALLET_TIMELOCK_SECONDS - elapsed)
+        except Exception as exc:
+            log.warning("[Vault] Could not check pause state on startup: %s", exc)
+
     # Look back 2h on startup — long enough to catch alerts from a brief restart,
     # short enough to avoid re-trading pre-filter stale alerts from before a deploy.
     last_processed_ts = int(time.time()) - 7200
@@ -1136,10 +1333,16 @@ async def main() -> None:
                     await _check_pending_resolutions(http_client)
                     _last_resolution_check = now
 
-                # Vault sweep check
-                if VAULT_WALLET_ADDRESS and now - _last_sweep_check >= VAULT_SWEEP_INTERVAL_SECONDS:
+                # Vault sweep check — runs every cycle during an active sweep (pause_pending /
+                # pause_ready) so the timelock expiry is detected promptly; otherwise respects
+                # VAULT_SWEEP_INTERVAL_SECONDS to avoid unnecessary balance reads.
+                if VAULT_WALLET_ADDRESS and (
+                    _sweep_state != "idle"
+                    or now - _last_sweep_check >= VAULT_SWEEP_INTERVAL_SECONDS
+                ):
                     await _check_and_sweep(http_client)
-                    _last_sweep_check = now
+                    if _sweep_state == "idle":
+                        _last_sweep_check = now
 
                 # Redemption check (also refreshes _cached_usdc_balance for the pause below)
                 if now - _last_redemption_check >= REDEMPTION_CHECK_INTERVAL:
