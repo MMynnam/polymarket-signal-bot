@@ -1157,6 +1157,23 @@ def get_tradeable_alerts_for_api(
     return results
 
 
+def get_open_positions_for_api() -> list[dict]:
+    """Return filled, pending-resolution trades joined with score from alert_outcomes."""
+    rows = get_db().execute(
+        """
+        SELECT te.alert_id, te.market_id, te.market_question,
+               te.bet_side, te.bet_price_filled, te.bet_price_intended,
+               te.size_usdc, te.created_at,
+               ao.score
+        FROM trade_executions te
+        LEFT JOIN alert_outcomes ao ON te.alert_id = ao.alert_id
+        WHERE te.status = 'filled' AND te.resolution_status = 'pending'
+        ORDER BY te.created_at ASC
+        """,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_pending_trades_with_resolution() -> list[dict]:
     """
     Return filled trade_executions still pending resolution, joined with the

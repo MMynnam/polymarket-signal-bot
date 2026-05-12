@@ -60,6 +60,7 @@ VAULT_SWEEP_INTERVAL_SECONDS: int = int(os.getenv("VAULT_SWEEP_INTERVAL_SECONDS"
 
 REDEMPTION_CHECK_INTERVAL: int = int(os.getenv("REDEMPTION_CHECK_INTERVAL", "600"))
 LOW_BALANCE_WARN_USD: float = float(os.getenv("LOW_BALANCE_WARN_USD", "10.0"))
+POSITIONS_SUMMARY_INTERVAL_SECONDS: int = int(os.getenv("POSITIONS_SUMMARY_INTERVAL_SECONDS", "21600"))
 
 TRADING_CLOB_HOST: str = "https://clob.polymarket.com"
 TRADING_CHAIN_ID: int = 137
@@ -94,10 +95,13 @@ _notified_resolutions: set[str] = set()
 _last_resolution_check: float = 0.0
 _last_sweep_check: float = 0.0
 _last_redemption_check: float = 0.0
+_last_positions_summary: float = 0.0
 _redeemed_positions: set[str] = set()
 _low_balance_warned: bool = False
 _cached_usdc_balance: float = -1.0  # -1 = not yet fetched
 _RESOLUTION_POLL_INTERVAL: int = 600
+_skip_notified: dict = {}  # (alert_id, reason_key) -> timestamp; skip notification rate-limit
+_SKIP_RATE_LIMIT_SECONDS: int = 300
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -327,6 +331,117 @@ async def _calculate_bet_size(http_client: httpx.AsyncClient, stats: dict) -> fl
 
 
 # ---------------------------------------------------------------------------
+# Skip notification
+# ---------------------------------------------------------------------------
+
+def _skip_reason_key(reason: str) -> str:
+    r = reason.lower()
+    if "max concurrent" in r:
+        return "max_concurrent"
+    if "consecutive loss" in r or "cooling down" in r:
+        return "consecutive_loss"
+    if "daily loss" in r:
+        return "daily_loss"
+    if "slippage" in r:
+        return "slippage"
+    if "balance" in r or "bankroll" in r:
+        return "balance"
+    if "already" in r:
+        return "already_traded"
+    return reason[:40]
+
+
+def _skip_reason_plain(reason: str) -> str:
+    import re
+    r = reason.lower()
+    if "max concurrent" in r:
+        m = re.search(r'\((\d+/\d+)\)', reason)
+        count = m.group(1) if m else str(TRADING_MAX_CONCURRENT_POSITIONS)
+        return f"at max concurrent positions ({count})"
+    if "consecutive loss" in r or "cooling down" in r:
+        return "paused after consecutive losses"
+    if "daily loss" in r:
+        return "daily loss limit reached"
+    if "slippage" in r:
+        return "price moved too much since alert"
+    if "balance" in r or "bankroll" in r:
+        return "bankroll below minimum bet"
+    if "already" in r:
+        return "already holding a position on this market"
+    return reason[:80]
+
+
+async def _notify_skip(
+    http_client: httpx.AsyncClient,
+    alert: dict,
+    reason: str,
+) -> None:
+    import html as _html
+    global _skip_notified
+
+    alert_id = alert.get("alert_id", "")
+    score = alert.get("score", 0)
+    market_q = alert.get("market_question") or alert.get("market_id", "")
+
+    cache_key = (alert_id, _skip_reason_key(reason))
+    now = time.time()
+    if _skip_notified.get(cache_key, 0) + _SKIP_RATE_LIMIT_SECONDS > now:
+        return
+    _skip_notified[cache_key] = now
+
+    text = (
+        "🔄 <b>Bot skipped this signal</b>\n"
+        f"{_html.escape(market_q[:60])}\n"
+        f"Score: {score}  •  Reason: {_skip_reason_plain(reason)}"
+    )
+    await _send_telegram(http_client, text)
+
+
+# ---------------------------------------------------------------------------
+# Positions summary
+# ---------------------------------------------------------------------------
+
+async def _send_positions_summary(http_client: httpx.AsyncClient) -> None:
+    import html as _html
+
+    positions = await _api_get(http_client, "/api/positions/open") or []
+    if not positions:
+        return
+
+    now = time.time()
+    bankroll = _cached_usdc_balance if _cached_usdc_balance >= 0 else 0.0
+    total_size = sum(p.get("size_usdc") or 0.0 for p in positions)
+    total_potential = sum(
+        (p.get("size_usdc") or 0.0) / max(p.get("bet_price_filled") or p.get("bet_price_intended") or 0.5, 0.001)
+        - (p.get("size_usdc") or 0.0)
+        for p in positions
+    )
+
+    lines = []
+    for p in positions:
+        market_q = (p.get("market_question") or p.get("market_id", ""))[:50]
+        side = p.get("bet_side", "")
+        fill = p.get("bet_price_filled") or p.get("bet_price_intended") or 0.0
+        size = p.get("size_usdc") or 0.0
+        score = p.get("score") or 0
+        hours_ago = (now - (p.get("created_at") or now)) / 3600
+        lines.append(
+            f"- {_html.escape(market_q)}\n"
+            f"  {_html.escape(side)} @ ${fill:.3f}  •  ${size:.2f}\n"
+            f"  Score: {score}  •  Opened: {hours_ago:.1f}h ago"
+        )
+
+    text = (
+        f"📊 <b>Open Positions ({len(positions)})</b>\n\n"
+        + "\n\n".join(lines) + "\n\n"
+        f"💼 <b>Total at risk:</b> ${total_size:.2f}\n"
+        f"💰 <b>Potential profit if all win:</b> ${total_potential:.2f}\n"
+        f"💵 <b>Bankroll available:</b> ${bankroll:.2f}"
+    )
+    await _send_telegram(http_client, text)
+
+
+# ---------------------------------------------------------------------------
 # Risk check (state from Railway API)
 # ---------------------------------------------------------------------------
 
@@ -517,7 +632,6 @@ async def _notify_trade_filled(
     score: int,
     slippage: Optional[float],
     market_url: Optional[str],
-    order_id: Optional[str],
 ) -> None:
     import html as _html
 
@@ -535,10 +649,6 @@ async def _notify_trade_filled(
         f'🔮 <a href="{market_url}">View on Polymarket</a>\n'
         if market_url else ""
     )
-    order_line = (
-        f"🆔 <b>Order:</b> <code>{order_id}</code>\n"
-        if order_id else ""
-    )
 
     text = (
         "💰💰💰 <b>LIVE TRADE</b> 💰💰💰\n"
@@ -551,11 +661,10 @@ async def _notify_trade_filled(
         f"📊 <b>Signal score:</b> {score}\n"
         f"📉 <b>Slippage:</b> {slip_str}\n\n"
         f"💼 <b>Bankroll remaining:</b> ${remaining_balance:.2f} USDC\n\n"
-        f"{order_line}"
         "🔍 <b>Verify on-chain:</b>\n"
-        f"Signer EOA: <code>{_wallet_address}</code>\n"
-        f"Deposit wallet: <code>{funder}</code>\n"
-        f'<a href="https://polygonscan.com/address/{funder}">View wallet on Polygonscan</a>\n\n'
+        f"Trading wallet: <code>{funder}</code>\n"
+        f'<a href="https://polygonscan.com/address/{funder}">View activity on Polygonscan</a>\n'
+        f'<a href="https://polymarket.com/profile/{funder}">View on Polymarket</a>\n\n'
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚠️ <i>Automated trade. Not financial advice.</i>"
     )
@@ -732,9 +841,11 @@ async def _execute_trade(
 
     if slippage is not None and slippage > 0.05:
         log.warning(
-            "[Trade] High slippage for alert %s: intended=%.3f current=%.3f",
+            "[Trade] High slippage for alert %s: intended=%.3f current=%.3f — skipping",
             alert_id[:12], price_alert, current_price,
         )
+        await _notify_skip(http_client, alert, "slippage")
+        return
 
     fill_price: Optional[float] = None
     order_id:   Optional[str]   = None
@@ -818,7 +929,7 @@ async def _execute_trade(
         await _notify_trade_filled(
             http_client, market_q, bet_side,
             fill_price or current_price or price_alert,
-            bet_size, score, slippage, market_url, order_id,
+            bet_size, score, slippage, market_url,
         )
     else:
         await _notify_trade_error(
@@ -980,7 +1091,7 @@ async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _wallet_address, _last_resolution_check, _last_sweep_check, _last_redemption_check
+    global _wallet_address, _last_resolution_check, _last_sweep_check, _last_redemption_check, _last_positions_summary
 
     if not RAILWAY_API_URL:
         log.critical("RAILWAY_API_URL is not set — exiting")
@@ -1035,6 +1146,11 @@ async def main() -> None:
                     await _check_and_redeem(http_client)
                     _last_redemption_check = now
 
+                # Periodic open-positions summary (every POSITIONS_SUMMARY_INTERVAL_SECONDS)
+                if now - _last_positions_summary >= POSITIONS_SUMMARY_INTERVAL_SECONDS:
+                    await _send_positions_summary(http_client)
+                    _last_positions_summary = now
+
                 # Pause trading when balance is too low to cover the minimum bet.
                 # Resumes automatically once redemptions replenish the wallet.
                 if _cached_usdc_balance >= 0 and _cached_usdc_balance < TRADING_MIN_BET_USDC:
@@ -1080,6 +1196,7 @@ async def main() -> None:
                     block_reason = await _check_risk_limits(stats)
                     if block_reason:
                         log.info("[Risk] Mid-loop block: %s — halting batch", block_reason)
+                        await _notify_skip(http_client, alert, block_reason)
                         break
 
                     await _execute_trade(clob_client, http_client, alert, stats)

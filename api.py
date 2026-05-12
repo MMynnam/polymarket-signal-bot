@@ -2,10 +2,11 @@
 api.py — FastAPI app exposing alert data for the remote Fly.io trader.
 
 Endpoints:
-  GET  /api/alerts/tradeable      — alerts ready for execution (not yet traded)
-  POST /api/trades                — accept a trade execution report
-  GET  /api/stats/trading         — trading stats for remote risk management
-  GET  /api/trades/pending        — pending trades + current resolution status
+  GET  /api/alerts/tradeable             — alerts ready for execution (not yet traded)
+  POST /api/trades                       — accept a trade execution report
+  GET  /api/stats/trading                — trading stats for remote risk management
+  GET  /api/trades/pending               — pending trades + current resolution status
+  GET  /api/positions/open               — currently open (filled, unresolved) positions
   PATCH /api/trades/{alert_id}/resolution — remote trader reports a resolution
 
 Authentication: every request must include X-API-Key matching API_SECRET_KEY.
@@ -154,6 +155,16 @@ def get_trading_stats(_key: None = Depends(_verify_api_key)):
         }
     except Exception as exc:
         log.error("[API] get_trading_stats failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@app.get("/api/positions/open")
+def get_open_positions(_key: None = Depends(_verify_api_key)):
+    """Return filled, pending-resolution positions for the periodic summary."""
+    try:
+        return database.get_open_positions_for_api()
+    except Exception as exc:
+        log.error("[API] get_open_positions failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Database error")
 
 
