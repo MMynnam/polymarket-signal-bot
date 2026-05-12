@@ -1,7 +1,7 @@
 # fly-trader/requirements.txt — minimal dependencies for the standalone trader
 # Python 3.12
 
-py-clob-client==0.34.6
+py-clob-client-v2>=1.0.1
 httpx>=0.27.0,<1.0.0
 web3>=6.0.0,<8.0.0
 python-dotenv>=1.0.0,<2.0.0

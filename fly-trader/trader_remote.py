@@ -206,7 +206,7 @@ async def _api_patch(
 # ---------------------------------------------------------------------------
 
 async def _init_clob_client():
-    from py_clob_client.client import ClobClient
+    from py_clob_client_v2.client import ClobClient
 
     if not TRADING_PRIVATE_KEY:
         raise ValueError("TRADING_PRIVATE_KEY is not set")
@@ -224,7 +224,7 @@ async def _init_clob_client():
         signature_type=TRADING_SIGNATURE_TYPE,
         funder=TRADING_FUNDER_ADDRESS or None,
     )
-    creds = await asyncio.to_thread(client.create_or_derive_api_creds)
+    creds = await asyncio.to_thread(client.create_or_derive_api_key)
     client.set_api_creds(creds)
     log.info(
         "CLOB client initialised (sig_type=%d, funder=%s)",
@@ -651,9 +651,9 @@ async def _execute_trade(
     alert: dict,
     stats: dict,
 ) -> None:
-    from py_clob_client.clob_types import MarketOrderArgs, OrderType, PartialCreateOrderOptions
-    from py_clob_client.order_builder.constants import BUY
-    from py_clob_client.exceptions import PolyApiException
+    from py_clob_client_v2.clob_types import MarketOrderArgs, OrderType, PartialCreateOrderOptions
+    from py_clob_client_v2.order_utils.model.side import Side
+    from py_clob_client_v2.exceptions import PolyException
 
     alert_id  = alert["alert_id"]
     market_id = alert["market_id"]
@@ -717,15 +717,11 @@ async def _execute_trade(
                   token_id[:16], neg_risk, TRADING_SIGNATURE_TYPE,
                   TRADING_FUNDER_ADDRESS[:10] + "..." if TRADING_FUNDER_ADDRESS else "self")
 
-        order = MarketOrderArgs(token_id=token_id, amount=bet_size, side=BUY)
-        # Pass neg_risk=True explicitly. The library has a truthiness bug:
-        #   `if options and options.neg_risk` evaluates False when neg_risk=False,
-        #   causing a redundant get_neg_risk() call. For True this is correct.
-        # For non-neg-risk markets the redundant call hits the in-memory cache
-        # and returns False anyway — no API call, no incorrect result.
+        order = MarketOrderArgs(token_id=token_id, amount=bet_size, side=Side.BUY)
         options = PartialCreateOrderOptions(neg_risk=neg_risk)
-        signed = await asyncio.to_thread(clob_client.create_market_order, order, options)
-        resp = await asyncio.to_thread(clob_client.post_order, signed, OrderType.FOK)
+        resp = await asyncio.to_thread(
+            clob_client.create_and_post_market_order, order, options
+        )
 
         if isinstance(resp, dict):
             success = resp.get("success", False)
@@ -746,7 +742,7 @@ async def _execute_trade(
             status = "rejected"
             error_msg = f"unexpected CLOB response type: {type(resp)}"
 
-    except PolyApiException as exc:
+    except PolyException as exc:
         status = "error"
         error_msg = str(exc)
         log.error("[Trade] CLOB API error for alert %s: %s", alert_id[:12], exc)
