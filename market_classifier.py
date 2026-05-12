@@ -11,8 +11,31 @@ _CATEGORIES: list[tuple[str, list[str]]] = [
         "price above", "price below", "above $", "below $",
     ]),
     ("sports", [
-        "ufc", "nba", "nfl", "nhl", "mlb", "mls", "epl", "match",
-        "fight", "game", "league", "vs.", "championship", "lol:", "esports",
+        # League / org abbreviations
+        "ufc", "nba", "nfl", "nhl", "mlb", "mls", "epl", "ncaa", "pga",
+        # Generic terms
+        "esports", "lol:", "championship", "match", "fight",
+        # "X vs. Y" with period (already worked) and "X vs Y" without period
+        "vs.", " vs ",
+        # NBA teams (titles often omit "nba")
+        "lakers", "celtics", "warriors", "bucks", "heat", "nets", "knicks",
+        "sixers", "suns", "nuggets", "clippers", "mavericks", "mavs",
+        "raptors", "hawks", "bulls", "cavaliers", "pistons", "pacers",
+        "hornets", "magic", "wizards", "thunder", "blazers", "jazz",
+        "grizzlies", "pelicans", "spurs", "rockets", "kings", "timberwolves",
+        # NFL teams
+        "chiefs", "eagles", "patriots", "cowboys", "packers", "steelers",
+        "ravens", "seahawks", "bills", "49ers", "rams", "broncos", "raiders",
+        "bengals", "dolphins", "giants", "jets", "commanders", "bears",
+        "lions", "vikings", "jaguars", "texans", "titans", "colts", "chargers",
+        "saints", "falcons", "panthers", "buccaneers", "cardinals", "browns",
+        # MLB teams
+        "yankees", "dodgers", "red sox", "cubs", "astros", "braves",
+        "mets", "phillies", "padres", "brewers", "orioles", "tigers",
+        # NHL teams
+        "bruins", "penguins", "capitals", "lightning", "rangers", "oilers",
+        # CS:GO / Valorant esports orgs that slip past "esports" keyword
+        "vitality", "natus vincere", "navi", "faze", "astralis", "liquid",
     ]),
     ("politics", [
         "election", "president", "congress", "senate", "vote", "governor",

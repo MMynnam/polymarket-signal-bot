@@ -64,6 +64,14 @@ LOW_BALANCE_WARN_USD: float = float(os.getenv("LOW_BALANCE_WARN_USD", "10.0"))
 TRADING_CLOB_HOST: str = "https://clob.polymarket.com"
 TRADING_CHAIN_ID: int = 137
 
+# Polymarket wallet type configuration.
+# signature_type=0  EOA — use for a raw private key wallet created outside Polymarket
+# signature_type=2  POLY_GNOSIS_SAFE — use for wallets created via Polymarket's web UI.
+#   Requires TRADING_FUNDER_ADDRESS = the proxy/safe wallet address that holds USDC.
+#   The private key signs on behalf of that address; TRADING_PRIVATE_KEY is the signer.
+TRADING_SIGNATURE_TYPE: int = int(os.getenv("TRADING_SIGNATURE_TYPE", "0"))
+TRADING_FUNDER_ADDRESS: str = os.getenv("TRADING_FUNDER_ADDRESS", "")
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -203,14 +211,26 @@ async def _init_clob_client():
     if not TRADING_PRIVATE_KEY:
         raise ValueError("TRADING_PRIVATE_KEY is not set")
 
+    # signature_type=0 (EOA): raw private-key wallet, no proxy.
+    # signature_type=2 (POLY_GNOSIS_SAFE): Polymarket web-UI wallet.
+    #   Set TRADING_FUNDER_ADDRESS to the proxy/safe address that holds the USDC;
+    #   TRADING_PRIVATE_KEY is the signer key that controls it.
+    #   Without TRADING_FUNDER_ADDRESS, orders will carry the wrong maker address
+    #   and will be rejected with order_version_mismatch.
     client = ClobClient(
         TRADING_CLOB_HOST,
         key=TRADING_PRIVATE_KEY,
         chain_id=TRADING_CHAIN_ID,
-        signature_type=0,
+        signature_type=TRADING_SIGNATURE_TYPE,
+        funder=TRADING_FUNDER_ADDRESS or None,
     )
     creds = await asyncio.to_thread(client.create_or_derive_api_creds)
     client.set_api_creds(creds)
+    log.info(
+        "CLOB client initialised (sig_type=%d, funder=%s)",
+        TRADING_SIGNATURE_TYPE,
+        TRADING_FUNDER_ADDRESS[:10] + "..." if TRADING_FUNDER_ADDRESS else "self",
+    )
     return client
 
 
@@ -693,7 +713,16 @@ async def _execute_trade(
             log.warning("[Trade] get_neg_risk failed for %s: %s — defaulting to False", token_id, _nr_exc)
             neg_risk = False
 
+        log.debug("[Trade] token=%s neg_risk=%s sig_type=%d funder=%s",
+                  token_id[:16], neg_risk, TRADING_SIGNATURE_TYPE,
+                  TRADING_FUNDER_ADDRESS[:10] + "..." if TRADING_FUNDER_ADDRESS else "self")
+
         order = MarketOrderArgs(token_id=token_id, amount=bet_size, side=BUY)
+        # Pass neg_risk=True explicitly. The library has a truthiness bug:
+        #   `if options and options.neg_risk` evaluates False when neg_risk=False,
+        #   causing a redundant get_neg_risk() call. For True this is correct.
+        # For non-neg-risk markets the redundant call hits the in-memory cache
+        # and returns False anyway — no API call, no incorrect result.
         options = PartialCreateOrderOptions(neg_risk=neg_risk)
         signed = await asyncio.to_thread(clob_client.create_market_order, order, options)
         resp = await asyncio.to_thread(clob_client.post_order, signed, OrderType.FOK)
@@ -936,8 +965,9 @@ async def main() -> None:
         log.critical("CLOB client init failed: %s", exc)
         sys.exit(1)
 
-    # Look back 24h on startup to catch any missed alerts
-    last_processed_ts = int(time.time()) - 86400
+    # Look back 2h on startup — long enough to catch alerts from a brief restart,
+    # short enough to avoid re-trading pre-filter stale alerts from before a deploy.
+    last_processed_ts = int(time.time()) - 7200
 
     async with httpx.AsyncClient(timeout=30.0) as http_client:
         while True:
