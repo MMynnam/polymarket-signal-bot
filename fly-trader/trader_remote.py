@@ -665,7 +665,7 @@ def _execute_sweep_withdraw_sync(sweep_amount: float) -> str:
 
     tx = wallet.functions.withdrawERC20(pusd_cs, eoa_cs, amount_raw).build_transaction({
         "from":     eoa_cs,
-        "nonce":    w3.eth.get_transaction_count(eoa_cs),
+        "nonce":    w3.eth.get_transaction_count(eoa_cs, "pending"),
         "gas":      120_000,
         "gasPrice": w3.eth.gas_price,
         "chainId":  TRADING_CHAIN_ID,
@@ -706,7 +706,7 @@ def _execute_sweep_unwrap_sync(sweep_amount: float) -> str:
         log.info("[Vault] Approving offramp to spend pUSD (current allowance %d < needed %d)...", allowance, amount_raw)
         approve_tx = pusd.functions.approve(offramp_cs, 2**256 - 1).build_transaction({
             "from":     eoa_cs,
-            "nonce":    w3.eth.get_transaction_count(eoa_cs),
+            "nonce":    w3.eth.get_transaction_count(eoa_cs, "pending"),
             "gas":      60_000,
             "gasPrice": w3.eth.gas_price,
             "chainId":  TRADING_CHAIN_ID,
@@ -721,7 +721,7 @@ def _execute_sweep_unwrap_sync(sweep_amount: float) -> str:
     # Unwrap pUSD (in EOA) → USDC.e (sent directly to vault)
     tx = offramp.functions.unwrap(usdce_cs, vault_cs, amount_raw).build_transaction({
         "from":     eoa_cs,
-        "nonce":    w3.eth.get_transaction_count(eoa_cs),
+        "nonce":    w3.eth.get_transaction_count(eoa_cs, "pending"),
         "gas":      150_000,
         "gasPrice": w3.eth.gas_price,
         "chainId":  TRADING_CHAIN_ID,
@@ -747,7 +747,7 @@ def _unpause_deposit_wallet_sync() -> str:
     eoa_cs = Web3.to_checksum_address(_wallet_address)
     tx = wallet.functions.unpause().build_transaction({
         "from":     eoa_cs,
-        "nonce":    w3.eth.get_transaction_count(eoa_cs),
+        "nonce":    w3.eth.get_transaction_count(eoa_cs, "pending"),
         "gas":      80_000,
         "gasPrice": w3.eth.gas_price,
         "chainId":  TRADING_CHAIN_ID,
@@ -771,6 +771,21 @@ def _get_vault_usdce_balance_sync() -> float:
     )
     raw = contract.functions.balanceOf(
         Web3.to_checksum_address(VAULT_WALLET_ADDRESS)
+    ).call()
+    return raw / (10 ** _USDC_DECIMALS)
+
+
+def _get_eoa_pusd_balance_sync() -> float:
+    """Return the EOA's pUSD balance — detects orphaned funds from a failed previous unwrap."""
+    from web3 import Web3
+    rpc = ALCHEMY_RPC_URL or "https://polygon-rpc.com"
+    w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 15}))
+    contract = w3.eth.contract(
+        address=Web3.to_checksum_address(_USDC_CONTRACT),
+        abi=_USDC_BALANCE_ABI,
+    )
+    raw = contract.functions.balanceOf(
+        Web3.to_checksum_address(_wallet_address)
     ).call()
     return raw / (10 ** _USDC_DECIMALS)
 
@@ -837,6 +852,15 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
                 intended_amount = _sweep_intended_amount
                 actual_amount   = min(intended_amount, available)
 
+            # Check for orphaned pUSD in EOA left by a previous failed unwrap
+            try:
+                orphaned_pusd = await asyncio.to_thread(_get_eoa_pusd_balance_sync)
+                if orphaned_pusd > 0:
+                    log.info("[Vault] Recovering orphaned pUSD in EOA: $%.4f", orphaned_pusd)
+            except Exception as exc:
+                log.warning("[Vault] Could not check EOA pUSD balance: %s — assuming 0", exc)
+                orphaned_pusd = 0.0
+
             log.info(
                 "[Vault] Step 1 — withdrawERC20: $%.2f pUSD → EOA (intended $%.2f)",
                 actual_amount, intended_amount,
@@ -850,17 +874,22 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
             except Exception:
                 vault_before = 0.0
 
-            # Step 3: approve (first sweep only) + unwrap pUSD → USDC.e to vault
+            # Step 3: approve (first sweep only) + unwrap all pUSD in EOA → USDC.e to vault
+            # unwrap_amount = this sweep + any orphaned pUSD from a prior failed sweep
+            unwrap_amount = actual_amount + orphaned_pusd
             try:
-                log.info("[Vault] Step 2 — unwrap $%.2f pUSD → USDC.e to vault %s", actual_amount, VAULT_WALLET_ADDRESS[:12])
-                unwrap_tx = await asyncio.to_thread(_execute_sweep_unwrap_sync, actual_amount)
+                log.info(
+                    "[Vault] Step 2 — unwrap $%.4f pUSD → USDC.e to vault %s",
+                    unwrap_amount, VAULT_WALLET_ADDRESS[:12],
+                )
+                unwrap_tx = await asyncio.to_thread(_execute_sweep_unwrap_sync, unwrap_amount)
                 log.info("[Vault] unwrap success: tx=%s", unwrap_tx)
             except Exception as exc:
                 log.error(
                     "[Vault] pUSD withdrawn to EOA but unwrap failed — manual intervention required. "
                     "Call unwrap(%s, %s, %d) on offramp from EOA. Error: %s",
                     _USDCE_CONTRACT, VAULT_WALLET_ADDRESS,
-                    int(actual_amount * 10 ** _USDC_DECIMALS), exc,
+                    int(unwrap_amount * 10 ** _USDC_DECIMALS), exc,
                 )
                 try:
                     await asyncio.to_thread(_unpause_deposit_wallet_sync)
@@ -874,17 +903,17 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
             try:
                 vault_after = await asyncio.to_thread(_get_vault_usdce_balance_sync)
                 usdce_received = vault_after - vault_before
-                if actual_amount > 0 and usdce_received < actual_amount * 0.995:
+                if unwrap_amount > 0 and usdce_received < unwrap_amount * 0.995:
                     log.warning(
                         "[Vault] USDC.e received $%.4f < expected $%.4f (%.2f%% shortfall) — check offramp",
-                        usdce_received, actual_amount,
-                        (1 - usdce_received / actual_amount) * 100,
+                        usdce_received, unwrap_amount,
+                        (1 - usdce_received / unwrap_amount) * 100,
                     )
                 else:
                     log.info("[Vault] USDC.e vault: $%.4f → $%.4f (+$%.4f)", vault_before, vault_after, usdce_received)
                 vault_total = vault_after
             except Exception:
-                usdce_received = actual_amount  # assume 1:1 if balance check fails
+                usdce_received = unwrap_amount  # assume 1:1 if balance check fails
                 vault_total    = 0.0
 
             remaining_balance = await _get_usdc_balance()
