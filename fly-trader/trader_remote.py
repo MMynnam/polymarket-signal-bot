@@ -54,9 +54,25 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 ALCHEMY_RPC_URL: str = os.getenv("ALCHEMY_RPC_URL", "")
 
+# ---------------------------------------------------------------------------
+# Core scaling parameters — change ONLY these three to re-calibrate the system.
+# ---------------------------------------------------------------------------
+
+# How much USDC to keep in the trading wallet at all times (= sweep floor).
+TRADING_WORKING_CAPITAL_USDC: float = float(os.getenv("TRADING_WORKING_CAPITAL_USDC", "110.0"))
+# How much above working capital triggers a sweep (threshold = working_capital + headroom).
+TRADING_SWEEP_HEADROOM_USDC: float = float(os.getenv("TRADING_SWEEP_HEADROOM_USDC", "40.0"))
+# Fraction of bankroll to keep deployed across open positions at once.
+TRADING_TARGET_EXPOSURE_PCT: float = float(os.getenv("TRADING_TARGET_EXPOSURE_PCT", "0.50"))
+
+# Position count safety clamps — floor/ceiling regardless of exposure calc.
+TRADING_MAX_POSITIONS_FLOOR: int = int(os.getenv("TRADING_MAX_POSITIONS_FLOOR", "10"))
+TRADING_MAX_POSITIONS_CEILING: int = int(os.getenv("TRADING_MAX_POSITIONS_CEILING", "50"))
+
 VAULT_WALLET_ADDRESS: str = os.getenv("VAULT_WALLET_ADDRESS", "")
-VAULT_SWEEP_THRESHOLD_USDC: float = float(os.getenv("VAULT_SWEEP_THRESHOLD_USDC", "150.0"))
-VAULT_SWEEP_FLOOR_USDC: float = float(os.getenv("VAULT_SWEEP_FLOOR_USDC", "110.0"))
+# Derived from core scaling params; direct env override still works for backward compat.
+VAULT_SWEEP_THRESHOLD_USDC: float = float(os.getenv("VAULT_SWEEP_THRESHOLD_USDC", str(TRADING_WORKING_CAPITAL_USDC + TRADING_SWEEP_HEADROOM_USDC)))
+VAULT_SWEEP_FLOOR_USDC: float = float(os.getenv("VAULT_SWEEP_FLOOR_USDC", str(TRADING_WORKING_CAPITAL_USDC)))
 # Hour (0–23 UTC) at which the daily sweep check fires in production mode.
 VAULT_SWEEP_HOUR_UTC: int = int(os.getenv("VAULT_SWEEP_HOUR_UTC", "4"))
 # Set to a positive value (e.g. 1.0) to sweep exactly that amount for first-run testing.
@@ -111,6 +127,8 @@ _sweep_state: str = "idle"      # idle | pause_pending | pause_ready
 _sweep_paused_at: float = 0.0
 _sweep_intended_amount: float = 0.0  # calculated at pause time; rechecked at withdraw time
 _sweep_last_date: str = ""          # "YYYY-MM-DD" UTC; prevents double-firing on restart
+_current_max_positions: int = TRADING_MAX_CONCURRENT_POSITIONS  # updated each cycle by _compute_max_positions
+_legacy_max_positions_ceiling: Optional[int] = None  # set at startup if old env var is detected
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -423,7 +441,7 @@ def _skip_reason_plain(reason: str) -> str:
     r = reason.lower()
     if "max concurrent" in r:
         m = re.search(r'\((\d+/\d+)\)', reason)
-        count = m.group(1) if m else str(TRADING_MAX_CONCURRENT_POSITIONS)
+        count = m.group(1) if m else str(_current_max_positions)
         return f"at max concurrent positions ({count})"
     if "consecutive loss" in r or "cooling down" in r:
         return "paused after consecutive losses"
@@ -511,12 +529,16 @@ async def _send_positions_summary(http_client: httpx.AsyncClient) -> None:
         pass
 
     text = (
-        f"📊 <b>Open Positions ({len(positions)})</b>\n\n"
+        f"📊 <b>Open Positions ({len(positions)}/{_current_max_positions})</b>\n\n"
         + "\n\n".join(lines) + "\n\n"
         f"💼 <b>Total at risk:</b> ${total_size:.2f}\n"
         f"💰 <b>Potential profit if all win:</b> ${total_potential:.2f}\n"
         f"💵 <b>Bankroll available:</b> ${bankroll:.2f}"
-        f"{vault_footer}"
+        f"{vault_footer}\n\n"
+        f"🎯 <b>System config:</b>\n"
+        f"   Working capital: ${TRADING_WORKING_CAPITAL_USDC:.2f}\n"
+        f"   Sweep at: ${VAULT_SWEEP_THRESHOLD_USDC:.2f} → floor ${VAULT_SWEEP_FLOOR_USDC:.2f}\n"
+        f"   Target exposure: {TRADING_TARGET_EXPOSURE_PCT * 100:.0f}%  •  Current cap: {_current_max_positions}"
     )
     await _send_telegram(http_client, text)
 
@@ -525,7 +547,20 @@ async def _send_positions_summary(http_client: httpx.AsyncClient) -> None:
 # Risk check (state from Railway API)
 # ---------------------------------------------------------------------------
 
-async def _check_risk_limits(stats: dict) -> Optional[str]:
+def _compute_max_positions(bankroll: float, bet_size: float) -> int:
+    """Dynamic position cap = exposure budget / per-trade cost, clamped to floor/ceiling."""
+    if bet_size <= 0:
+        return TRADING_MAX_POSITIONS_FLOOR
+    ceiling = (
+        min(_legacy_max_positions_ceiling, TRADING_MAX_POSITIONS_CEILING)
+        if _legacy_max_positions_ceiling is not None
+        else TRADING_MAX_POSITIONS_CEILING
+    )
+    raw = int((bankroll * TRADING_TARGET_EXPOSURE_PCT) / bet_size)
+    return max(TRADING_MAX_POSITIONS_FLOOR, min(raw, ceiling))
+
+
+async def _check_risk_limits(stats: dict, max_positions: Optional[int] = None) -> Optional[str]:
     global _pause_until
 
     now = time.time()
@@ -545,9 +580,10 @@ async def _check_risk_limits(stats: dict) -> Optional[str]:
     if daily_loss >= TRADING_MAX_DAILY_LOSS_USDC:
         return f"daily loss limit reached (${daily_loss:.2f} >= ${TRADING_MAX_DAILY_LOSS_USDC:.2f})"
 
+    cap = max_positions if max_positions is not None else _current_max_positions
     open_positions = stats.get("open_positions", 0)
-    if open_positions >= TRADING_MAX_CONCURRENT_POSITIONS:
-        return f"max concurrent positions ({open_positions}/{TRADING_MAX_CONCURRENT_POSITIONS})"
+    if open_positions >= cap:
+        return f"max concurrent positions ({open_positions}/{cap})"
 
     return None
 
@@ -1167,6 +1203,22 @@ async def _notify_sweep_cancelled(
     await _send_telegram(http_client, text)
 
 
+async def _notify_cap_change(
+    http_client: httpx.AsyncClient,
+    old_cap: int,
+    new_cap: int,
+    bankroll: float,
+    bet_size: float,
+) -> None:
+    text = (
+        "📊 <b>Position cap adjusted</b>\n\n"
+        f"{old_cap} → <b>{new_cap}</b> concurrent positions\n"
+        f"💵 Bankroll: ${bankroll:.2f}  •  Bet size: ${bet_size:.2f}\n"
+        f"🎯 Target exposure: {TRADING_TARGET_EXPOSURE_PCT * 100:.0f}%"
+    )
+    await _send_telegram(http_client, text)
+
+
 async def _notify_sweep_stuck(http_client: httpx.AsyncClient) -> None:
     text = (
         "⚠️ <b>VAULT SWEEP — MANUAL ACTION REQUIRED</b>\n\n"
@@ -1548,7 +1600,7 @@ async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date
+    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling
 
     if not RAILWAY_API_URL:
         log.critical("RAILWAY_API_URL is not set — exiting")
@@ -1570,7 +1622,19 @@ async def main() -> None:
              TRADING_FUNDER_ADDRESS if TRADING_FUNDER_ADDRESS else f"{_wallet_address} (EOA)")
     log.info("Poll:        every %ds | Min score: %d", POLL_INTERVAL, TRADING_MIN_SCORE)
     log.info("Vault:       %s", VAULT_WALLET_ADDRESS or "disabled")
+    log.info("Scaling:     capital=$%.0f  headroom=$%.0f  exposure=%.0f%%  floor=%d  ceil=%d",
+             TRADING_WORKING_CAPITAL_USDC, TRADING_SWEEP_HEADROOM_USDC,
+             TRADING_TARGET_EXPOSURE_PCT * 100,
+             TRADING_MAX_POSITIONS_FLOOR, TRADING_MAX_POSITIONS_CEILING)
     log.info("=" * 60)
+
+    if os.getenv("TRADING_MAX_CONCURRENT_POSITIONS"):
+        _legacy_max_positions_ceiling = TRADING_MAX_CONCURRENT_POSITIONS
+        log.warning(
+            "[Trader] DEPRECATED: TRADING_MAX_CONCURRENT_POSITIONS=%d is set. "
+            "Using as ceiling override. New approach uses TRADING_TARGET_EXPOSURE_PCT.",
+            TRADING_MAX_CONCURRENT_POSITIONS,
+        )
 
     try:
         clob_client = await _init_clob_client()
@@ -1662,7 +1726,24 @@ async def main() -> None:
                 # Fetch stats for risk management
                 stats = await _api_get(http_client, "/api/stats/trading") or {}
 
-                block_reason = await _check_risk_limits(stats)
+                # Dynamic position cap — recompute every cycle from current bankroll + bet size
+                _bankroll = max(_cached_usdc_balance, 0.0)
+                _est_bet = (
+                    max(TRADING_MIN_BET_USDC, min(TRADING_MAX_BET_USDC, _bankroll * TRADING_BET_PERCENTAGE))
+                    if _bankroll > 0 else TRADING_BET_SIZE_USDC
+                )
+                new_cap = _compute_max_positions(_bankroll, _est_bet)
+                if new_cap != _current_max_positions:
+                    log.info(
+                        "[Trader] Max positions: %d → %d (bankroll $%.2f, bet $%.2f, exposure %.0f%%)",
+                        _current_max_positions, new_cap, _bankroll, _est_bet,
+                        TRADING_TARGET_EXPOSURE_PCT * 100,
+                    )
+                    if _current_max_positions > 0 and abs(new_cap - _current_max_positions) >= 5:
+                        await _notify_cap_change(http_client, _current_max_positions, new_cap, _bankroll, _est_bet)
+                    _current_max_positions = new_cap
+
+                block_reason = await _check_risk_limits(stats, max_positions=_current_max_positions)
                 if block_reason:
                     log.info("[Risk] Skipping cycle — %s", block_reason)
                     await asyncio.sleep(POLL_INTERVAL)
@@ -1690,7 +1771,7 @@ async def main() -> None:
 
                     # Re-check risk before each individual trade
                     stats = await _api_get(http_client, "/api/stats/trading") or {}
-                    block_reason = await _check_risk_limits(stats)
+                    block_reason = await _check_risk_limits(stats, max_positions=_current_max_positions)
                     if block_reason:
                         log.info("[Risk] Mid-loop block: %s — halting batch", block_reason)
                         await _notify_skip(http_client, alert, block_reason)

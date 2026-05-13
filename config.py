@@ -321,9 +321,26 @@ TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED"
 # Profit sweeping — active whenever VAULT_WALLET_ADDRESS is set (non-empty).
 # The user must consciously choose a vault address; the bot never auto-generates one.
 # Once set, sweeping runs automatically every VAULT_SWEEP_INTERVAL_SECONDS.
+# ---------------------------------------------------------------------------
+# Core scaling parameters — change ONLY these three to re-calibrate the system.
+# Bet size, max concurrent positions, sweep threshold and floor all derive from them.
+# ---------------------------------------------------------------------------
+
+# How much USDC to keep in the trading wallet at all times (= sweep floor).
+TRADING_WORKING_CAPITAL_USDC: float = float(os.getenv("TRADING_WORKING_CAPITAL_USDC", "110.0"))
+# How much above working capital triggers a sweep (sweep threshold = working_capital + headroom).
+TRADING_SWEEP_HEADROOM_USDC: float = float(os.getenv("TRADING_SWEEP_HEADROOM_USDC", "40.0"))
+# Fraction of bankroll to keep deployed across open positions at once.
+TRADING_TARGET_EXPOSURE_PCT: float = float(os.getenv("TRADING_TARGET_EXPOSURE_PCT", "0.50"))
+
+# Position count safety clamps — hard floor/ceiling regardless of exposure calc.
+TRADING_MAX_POSITIONS_FLOOR: int = int(os.getenv("TRADING_MAX_POSITIONS_FLOOR", "10"))
+TRADING_MAX_POSITIONS_CEILING: int = int(os.getenv("TRADING_MAX_POSITIONS_CEILING", "50"))
+
 VAULT_WALLET_ADDRESS: str = os.getenv("VAULT_WALLET_ADDRESS", "")
-VAULT_SWEEP_THRESHOLD_USDC: float = float(os.getenv("VAULT_SWEEP_THRESHOLD_USDC", "150.0"))
-VAULT_SWEEP_FLOOR_USDC: float = float(os.getenv("VAULT_SWEEP_FLOOR_USDC", "110.0"))
+# Derived from core scaling params; can still be overridden directly for backward compat.
+VAULT_SWEEP_THRESHOLD_USDC: float = float(os.getenv("VAULT_SWEEP_THRESHOLD_USDC", str(TRADING_WORKING_CAPITAL_USDC + TRADING_SWEEP_HEADROOM_USDC)))
+VAULT_SWEEP_FLOOR_USDC: float = float(os.getenv("VAULT_SWEEP_FLOOR_USDC", str(TRADING_WORKING_CAPITAL_USDC)))
 VAULT_SWEEP_INTERVAL_SECONDS: int = int(os.getenv("VAULT_SWEEP_INTERVAL_SECONDS", "3600"))
 
 # ---------------------------------------------------------------------------
