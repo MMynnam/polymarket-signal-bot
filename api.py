@@ -7,6 +7,7 @@ Endpoints:
   GET  /api/stats/trading                — trading stats for remote risk management
   GET  /api/trades/pending               — pending trades + current resolution status
   GET  /api/positions/open               — currently open (filled, unresolved) positions
+  GET  /api/stats/vault                  — vault sweep history (count, total, last timestamp)
   PATCH /api/trades/{alert_id}/resolution — remote trader reports a resolution
 
 Authentication: every request must include X-API-Key matching API_SECRET_KEY.
@@ -165,6 +166,16 @@ def get_open_positions(_key: None = Depends(_verify_api_key)):
         return database.get_open_positions_for_api()
     except Exception as exc:
         log.error("[API] get_open_positions failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@app.get("/api/stats/vault")
+def get_vault_stats(_key: None = Depends(_verify_api_key)):
+    """Return vault sweep history: count, total USDC swept, last sweep timestamp."""
+    try:
+        return database.get_vault_sweep_stats()
+    except Exception as exc:
+        log.error("[API] get_vault_stats failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Database error")
 
 

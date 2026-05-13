@@ -1074,13 +1074,14 @@ def log_vault_sweep(
 
 
 def get_vault_sweep_stats() -> dict[str, Any]:
-    """Return total sweep count and USDC swept (all time)."""
+    """Return total sweep count, total USDC swept, and timestamp of most recent sweep."""
     row = get_db().execute(
-        "SELECT COUNT(*), COALESCE(SUM(amount_usdc), 0.0) FROM vault_sweeps"
+        "SELECT COUNT(*), COALESCE(SUM(amount_usdc), 0.0), MAX(swept_at) FROM vault_sweeps"
     ).fetchone()
     return {
-        "sweep_count": row[0] if row else 0,
-        "total_swept": row[1] if row else 0.0,
+        "sweep_count":   row[0] if row else 0,
+        "total_swept":   row[1] if row else 0.0,
+        "last_swept_at": row[2] if row else None,
     }
 
 
