@@ -106,6 +106,8 @@ _cached_usdc_balance: float = -1.0  # -1 = not yet fetched
 _RESOLUTION_POLL_INTERVAL: int = 600
 _skip_notified: dict = {}  # (alert_id, reason_key) -> timestamp; skip notification rate-limit
 _SKIP_RATE_LIMIT_SECONDS: int = 300
+_alert_skip_cache: dict[str, float] = {}  # alert_id -> expiry timestamp; avoids re-evaluating
+_SKIP_DECISION_TTL_SECONDS: int = 300     # 5 min: re-evaluate after price may have stabilised
 _sweep_state: str = "idle"      # idle | pause_pending | pause_ready
 _sweep_paused_at: float = 0.0
 _sweep_intended_amount: float = 0.0  # calculated at pause time; rechecked at withdraw time
@@ -1275,6 +1277,11 @@ async def _execute_trade(
         })
         return
 
+    # Skip-decision cache: if we already rejected this alert for a price-based reason
+    # within the last 5 min, skip silently without hitting the price API again.
+    if _alert_skip_cache.get(alert_id, 0) > time.time():
+        return
+
     bet_size = await _calculate_bet_size(http_client, stats)
 
     # Current ask price for slippage measurement
@@ -1295,6 +1302,7 @@ async def _execute_trade(
             "[Trade] High slippage for alert %s: intended=%.3f current=%.3f — skipping",
             alert_id[:12], price_alert, current_price,
         )
+        _alert_skip_cache[alert_id] = time.time() + _SKIP_DECISION_TTL_SECONDS
         await _notify_skip(http_client, alert, "slippage")
         return
 
