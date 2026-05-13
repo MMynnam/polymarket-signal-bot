@@ -104,8 +104,7 @@ _redeemed_positions: set[str] = set()
 _low_balance_warned: bool = False
 _cached_usdc_balance: float = -1.0  # -1 = not yet fetched
 _RESOLUTION_POLL_INTERVAL: int = 600
-_skip_notified: dict = {}  # (alert_id, reason_key) -> timestamp; skip notification rate-limit
-_SKIP_RATE_LIMIT_SECONDS: int = 300
+_skip_notified: set[tuple[str, str]] = set()  # (alert_id, reason_key); one notification per alert per lifetime
 _alert_skip_cache: dict[str, float] = {}  # alert_id -> expiry timestamp; avoids re-evaluating
 _SKIP_DECISION_TTL_SECONDS: int = 300     # 5 min: re-evaluate after price may have stabilised
 _sweep_state: str = "idle"      # idle | pause_pending | pause_ready
@@ -452,10 +451,9 @@ async def _notify_skip(
     market_q = alert.get("market_question") or alert.get("market_id", "")
 
     cache_key = (alert_id, _skip_reason_key(reason))
-    now = time.time()
-    if _skip_notified.get(cache_key, 0) + _SKIP_RATE_LIMIT_SECONDS > now:
+    if cache_key in _skip_notified:
         return
-    _skip_notified[cache_key] = now
+    _skip_notified.add(cache_key)
 
     text = (
         "🔄 <b>Bot skipped this signal</b>\n"
