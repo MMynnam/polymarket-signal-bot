@@ -70,6 +70,16 @@ TRADING_TARGET_EXPOSURE_PCT: float = float(os.getenv("TRADING_TARGET_EXPOSURE_PC
 TRADING_MAX_POSITIONS_FLOOR: int = int(os.getenv("TRADING_MAX_POSITIONS_FLOOR", "10"))
 TRADING_MAX_POSITIONS_CEILING: int = int(os.getenv("TRADING_MAX_POSITIONS_CEILING", "50"))
 
+# Tiered position cap.
+# Normal mode: all qualifying alerts admitted up to TRADING_NORMAL_POSITIONS_MAX (or the
+# bankroll-derived cap if lower — whichever is smaller is the effective normal ceiling).
+# Premium mode: between normal cap and TRADING_PREMIUM_POSITIONS_MAX, only alerts with
+# score >= TRADING_PREMIUM_SCORE_THRESHOLD are admitted.
+# Hard ceiling: TRADING_PREMIUM_POSITIONS_MAX is an absolute block — no trades at all.
+TRADING_NORMAL_POSITIONS_MAX: int = int(os.getenv("TRADING_NORMAL_POSITIONS_MAX", "50"))
+TRADING_PREMIUM_POSITIONS_MAX: int = int(os.getenv("TRADING_PREMIUM_POSITIONS_MAX", "60"))
+TRADING_PREMIUM_SCORE_THRESHOLD: int = int(os.getenv("TRADING_PREMIUM_SCORE_THRESHOLD", "85"))
+
 VAULT_WALLET_ADDRESS: str = os.getenv("VAULT_WALLET_ADDRESS", "")
 # Derived from core scaling params; direct env override still works for backward compat.
 VAULT_SWEEP_THRESHOLD_USDC: float = float(os.getenv("VAULT_SWEEP_THRESHOLD_USDC", str(TRADING_WORKING_CAPITAL_USDC + TRADING_SWEEP_HEADROOM_USDC)))
@@ -132,6 +142,7 @@ _sweep_intended_amount: float = 0.0  # calculated at pause time; rechecked at wi
 _sweep_last_date: str = ""          # "YYYY-MM-DD" UTC; prevents double-firing on restart
 _current_max_positions: int = TRADING_MAX_CONCURRENT_POSITIONS  # updated each cycle by _compute_max_positions
 _legacy_max_positions_ceiling: Optional[int] = None  # set at startup if old env var is detected
+_current_tier: str = "normal"  # "normal" | "premium" | "hardcap"; drives transition notifications
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -551,22 +562,44 @@ async def _send_positions_summary(http_client: httpx.AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 def _compute_max_positions(bankroll: float, bet_size: float) -> int:
-    """Dynamic position cap = exposure budget / per-trade cost, clamped to floor/ceiling."""
+    """Dynamic position cap = exposure budget / per-trade cost, clamped to [floor, NORMAL_MAX].
+    This is the safety floor for the normal tier; premium tier adds capacity above this."""
     if bet_size <= 0:
         return TRADING_MAX_POSITIONS_FLOOR
     ceiling = (
-        min(_legacy_max_positions_ceiling, TRADING_MAX_POSITIONS_CEILING)
+        min(_legacy_max_positions_ceiling, TRADING_NORMAL_POSITIONS_MAX)
         if _legacy_max_positions_ceiling is not None
-        else TRADING_MAX_POSITIONS_CEILING
+        else TRADING_NORMAL_POSITIONS_MAX
     )
     raw = int((bankroll * TRADING_TARGET_EXPOSURE_PCT) / bet_size)
     return max(TRADING_MAX_POSITIONS_FLOOR, min(raw, ceiling))
 
 
+def _get_tier(open_positions: int) -> str:
+    """Return 'normal', 'premium', or 'hardcap' for the current position count."""
+    if open_positions >= TRADING_PREMIUM_POSITIONS_MAX:
+        return "hardcap"
+    effective_normal = min(_current_max_positions, TRADING_NORMAL_POSITIONS_MAX)
+    if open_positions >= effective_normal:
+        return "premium"
+    return "normal"
+
+
+def _check_tier_for_alert(open_positions: int, score: int) -> Optional[str]:
+    """Return a skip reason if this alert is blocked by the tier system, or None to proceed."""
+    tier = _get_tier(open_positions)
+    if tier == "premium" and score < TRADING_PREMIUM_SCORE_THRESHOLD:
+        effective_normal = min(_current_max_positions, TRADING_NORMAL_POSITIONS_MAX)
+        return (
+            f"premium tier: score {score} < {TRADING_PREMIUM_SCORE_THRESHOLD} "
+            f"({open_positions}/{effective_normal} positions filled)"
+        )
+    return None
+
+
 async def _check_risk_limits(
     stats: dict,
     http_client: Optional[httpx.AsyncClient] = None,
-    max_positions: Optional[int] = None,
 ) -> Optional[str]:
     global _pause_until, _pause_triggered_at_streak, _warning_sent
 
@@ -620,10 +653,11 @@ async def _check_risk_limits(
     if daily_loss >= TRADING_MAX_DAILY_LOSS_USDC:
         return f"daily loss limit reached (${daily_loss:.2f} >= ${TRADING_MAX_DAILY_LOSS_USDC:.2f})"
 
-    cap = max_positions if max_positions is not None else _current_max_positions
+    # Hard ceiling — absolute block regardless of tier or score.
+    # The 50–60 premium tier is handled per-alert in the main loop.
     open_positions = stats.get("open_positions", 0)
-    if open_positions >= cap:
-        return f"max concurrent positions ({open_positions}/{cap})"
+    if open_positions >= TRADING_PREMIUM_POSITIONS_MAX:
+        return f"hard cap reached ({open_positions}/{TRADING_PREMIUM_POSITIONS_MAX})"
 
     return None
 
@@ -1259,6 +1293,33 @@ async def _notify_cap_change(
     await _send_telegram(http_client, text)
 
 
+async def _notify_tier_transition(
+    http_client: httpx.AsyncClient,
+    new_tier: str,
+    open_positions: int,
+) -> None:
+    effective_normal = min(_current_max_positions, TRADING_NORMAL_POSITIONS_MAX)
+    if new_tier == "premium":
+        text = (
+            f"📈 <b>Position cap: entering premium tier ({open_positions}/{TRADING_PREMIUM_POSITIONS_MAX} filled)</b>\n\n"
+            f"Only alerts ≥{TRADING_PREMIUM_SCORE_THRESHOLD} will fire until positions drop below {effective_normal}.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+    elif new_tier == "hardcap":
+        text = (
+            f"🛑 <b>Position cap: {TRADING_PREMIUM_POSITIONS_MAX}/{TRADING_PREMIUM_POSITIONS_MAX} reached</b>\n\n"
+            f"All new alerts skipped until a position resolves.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+    else:  # normal
+        text = (
+            f"📉 <b>Position cap: back to normal tier ({open_positions}/{effective_normal})</b>\n\n"
+            f"All qualifying alerts admitted.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+    await _send_telegram(http_client, text)
+
+
 async def _notify_sweep_stuck(http_client: httpx.AsyncClient) -> None:
     text = (
         "⚠️ <b>VAULT SWEEP — MANUAL ACTION REQUIRED</b>\n\n"
@@ -1708,7 +1769,7 @@ async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling
+    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling, _current_tier
 
     if not RAILWAY_API_URL:
         log.critical("RAILWAY_API_URL is not set — exiting")
@@ -1730,10 +1791,11 @@ async def main() -> None:
              TRADING_FUNDER_ADDRESS if TRADING_FUNDER_ADDRESS else f"{_wallet_address} (EOA)")
     log.info("Poll:        every %ds | Min score: %d", POLL_INTERVAL, TRADING_MIN_SCORE)
     log.info("Vault:       %s", VAULT_WALLET_ADDRESS or "disabled")
-    log.info("Scaling:     capital=$%.0f  headroom=$%.0f  exposure=%.0f%%  floor=%d  ceil=%d",
+    log.info("Scaling:     capital=$%.0f  headroom=$%.0f  exposure=%.0f%%  floor=%d  normal=%d  premium=%d  score_floor=%d",
              TRADING_WORKING_CAPITAL_USDC, TRADING_SWEEP_HEADROOM_USDC,
              TRADING_TARGET_EXPOSURE_PCT * 100,
-             TRADING_MAX_POSITIONS_FLOOR, TRADING_MAX_POSITIONS_CEILING)
+             TRADING_MAX_POSITIONS_FLOOR, TRADING_NORMAL_POSITIONS_MAX,
+             TRADING_PREMIUM_POSITIONS_MAX, TRADING_PREMIUM_SCORE_THRESHOLD)
     log.info("=" * 60)
 
     if os.getenv("TRADING_MAX_CONCURRENT_POSITIONS"):
@@ -1851,7 +1913,24 @@ async def main() -> None:
                         await _notify_cap_change(http_client, _current_max_positions, new_cap, _bankroll, _est_bet)
                     _current_max_positions = new_cap
 
-                block_reason = await _check_risk_limits(stats, http_client=http_client, max_positions=_current_max_positions)
+                # Per-cycle tier state log + transition notification
+                _open_now = stats.get("open_positions", 0)
+                _tier_now = _get_tier(_open_now)
+                _eff_normal = min(_current_max_positions, TRADING_NORMAL_POSITIONS_MAX)
+                if _tier_now == "normal":
+                    log.info("[Trader] Position tier: normal (%d/%d)", _open_now, _eff_normal)
+                elif _tier_now == "premium":
+                    log.info("[Trader] Position tier: premium (%d/%d, score floor %d)",
+                             _open_now, TRADING_PREMIUM_POSITIONS_MAX, TRADING_PREMIUM_SCORE_THRESHOLD)
+                else:
+                    log.info("[Trader] Position tier: hard-cap reached (%d/%d)",
+                             _open_now, TRADING_PREMIUM_POSITIONS_MAX)
+                if _tier_now != _current_tier:
+                    log.info("[Trader] Tier transition: %s → %s", _current_tier, _tier_now)
+                    await _notify_tier_transition(http_client, _tier_now, _open_now)
+                    _current_tier = _tier_now
+
+                block_reason = await _check_risk_limits(stats, http_client=http_client)
                 if block_reason:
                     log.info("[Risk] Skipping cycle — %s", block_reason)
                     await asyncio.sleep(POLL_INTERVAL)
@@ -1879,11 +1958,18 @@ async def main() -> None:
 
                     # Re-check risk before each individual trade
                     stats = await _api_get(http_client, "/api/stats/trading") or {}
-                    block_reason = await _check_risk_limits(stats, http_client=http_client, max_positions=_current_max_positions)
+                    block_reason = await _check_risk_limits(stats, http_client=http_client)
                     if block_reason:
                         log.info("[Risk] Mid-loop block: %s — halting batch", block_reason)
                         await _notify_skip(http_client, alert, block_reason)
                         break
+
+                    # Tier check: premium mode requires minimum score
+                    _alert_open = stats.get("open_positions", 0)
+                    tier_reason = _check_tier_for_alert(_alert_open, alert.get("score", 0))
+                    if tier_reason:
+                        log.info("[Trader] Tier skip: %s", tier_reason)
+                        continue
 
                     await _execute_trade(clob_client, http_client, alert, stats)
 
