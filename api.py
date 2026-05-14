@@ -6,6 +6,7 @@ Endpoints:
   POST /api/trades                       — accept a trade execution report
   GET  /api/stats/trading                — trading stats for remote risk management
   GET  /api/trades/pending               — pending trades + current resolution status
+  GET  /api/trades/recent-losses         — N most recently resolved-lost trades (for notifications)
   GET  /api/positions/open               — currently open (filled, unresolved) positions
   GET  /api/stats/vault                  — vault sweep history (count, total, last timestamp)
   PATCH /api/trades/{alert_id}/resolution — remote trader reports a resolution
@@ -190,6 +191,19 @@ def get_pending_trades(_key: None = Depends(_verify_api_key)):
         return database.get_pending_trades_with_resolution()
     except Exception as exc:
         log.error("[API] get_pending_trades failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@app.get("/api/trades/recent-losses")
+def get_recent_losses(
+    limit: int = 6,
+    _key: None = Depends(_verify_api_key),
+):
+    """Return the N most recently resolved-lost trades with score, for streak notifications."""
+    try:
+        return database.get_recent_resolved_losses(limit=limit)
+    except Exception as exc:
+        log.error("[API] get_recent_losses failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Database error")
 
 

@@ -45,8 +45,9 @@ TRADING_MIN_BET_USDC: float = float(os.getenv("TRADING_MIN_BET_USDC", "1.0"))
 TRADING_MAX_BET_USDC: float = float(os.getenv("TRADING_MAX_BET_USDC", "10.0"))
 TRADING_MAX_DAILY_LOSS_USDC: float = float(os.getenv("TRADING_MAX_DAILY_LOSS_USDC", "10.0"))
 TRADING_MAX_CONCURRENT_POSITIONS: int = int(os.getenv("TRADING_MAX_CONCURRENT_POSITIONS", "10"))
-TRADING_CONSECUTIVE_LOSS_PAUSE: int = int(os.getenv("TRADING_CONSECUTIVE_LOSS_PAUSE", "3"))
-TRADING_PAUSE_DURATION_SECONDS: int = int(os.getenv("TRADING_PAUSE_DURATION_SECONDS", "7200"))
+TRADING_CONSECUTIVE_LOSS_PAUSE: int = int(os.getenv("TRADING_CONSECUTIVE_LOSS_PAUSE", "6"))
+TRADING_PAUSE_DURATION_SECONDS: int = int(os.getenv("TRADING_PAUSE_DURATION_SECONDS", "1800"))
+TRADING_LOSS_STREAK_WARNING: int = int(os.getenv("TRADING_LOSS_STREAK_WARNING", "4"))
 TRADING_MIN_SCORE: int = int(os.getenv("TRADING_MIN_SCORE", "65"))
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
@@ -110,6 +111,8 @@ log = logging.getLogger("trader_remote")
 # ---------------------------------------------------------------------------
 
 _pause_until: float = 0.0
+_pause_triggered_at_streak: int = 0  # streak level at which we last set _pause_until; prevents re-trigger deadlock
+_warning_sent: bool = False           # True once the mid-streak warning fires; resets after a win
 _wallet_address: str = ""
 _graduation_notified: bool = False
 _notified_resolutions: set[str] = set()
@@ -560,8 +563,12 @@ def _compute_max_positions(bankroll: float, bet_size: float) -> int:
     return max(TRADING_MAX_POSITIONS_FLOOR, min(raw, ceiling))
 
 
-async def _check_risk_limits(stats: dict, max_positions: Optional[int] = None) -> Optional[str]:
-    global _pause_until
+async def _check_risk_limits(
+    stats: dict,
+    http_client: Optional[httpx.AsyncClient] = None,
+    max_positions: Optional[int] = None,
+) -> Optional[str]:
+    global _pause_until, _pause_triggered_at_streak, _warning_sent
 
     now = time.time()
     if _pause_until > 0:
@@ -569,11 +576,44 @@ async def _check_risk_limits(stats: dict, max_positions: Optional[int] = None) -
             return f"cooling down after consecutive losses ({int(_pause_until - now)}s remaining)"
         log.info("[Risk] Consecutive-loss pause expired — resuming")
         _pause_until = 0.0
+        # _pause_triggered_at_streak intentionally NOT reset here: prevents re-triggering
+        # at the same streak level once the pause expires (re-trigger deadlock fix).
 
     consecutive = stats.get("consecutive_losses", 0)
-    if consecutive >= TRADING_CONSECUTIVE_LOSS_PAUSE:
+
+    # Reset per-episode tracking once a win has broken the streak.
+    if consecutive < TRADING_LOSS_STREAK_WARNING:
+        _warning_sent = False
+    if consecutive < TRADING_CONSECUTIVE_LOSS_PAUSE:
+        _pause_triggered_at_streak = 0
+
+    # Mid-streak warning at TRADING_LOSS_STREAK_WARNING (default 4), once per streak episode.
+    if (TRADING_LOSS_STREAK_WARNING > 0
+            and consecutive >= TRADING_LOSS_STREAK_WARNING
+            and not _warning_sent
+            and http_client is not None):
+        _warning_sent = True
+        recent = await _api_get(http_client, "/api/trades/recent-losses") or []
+        await _notify_loss_streak_warning(http_client, consecutive, recent)
+
+    # Circuit-breaker pause at TRADING_CONSECUTIVE_LOSS_PAUSE (default 6).
+    # Only fires when the streak grows beyond the level at which we last paused,
+    # preventing the re-trigger deadlock where an expired pause immediately re-fires
+    # because consecutive_losses hasn't changed.
+    if consecutive >= TRADING_CONSECUTIVE_LOSS_PAUSE and consecutive > _pause_triggered_at_streak:
+        _pause_triggered_at_streak = consecutive
+        _warning_sent = True  # suppress redundant warning if it fires exactly at pause threshold
         _pause_until = now + TRADING_PAUSE_DURATION_SECONDS
-        log.warning("[Risk] %d consecutive losses — pausing %ds", consecutive, TRADING_PAUSE_DURATION_SECONDS)
+        resume_str = time.strftime("%H:%M UTC", time.gmtime(int(_pause_until)))
+        log.warning(
+            "[Risk] %d consecutive losses — pausing %ds until %s",
+            consecutive, TRADING_PAUSE_DURATION_SECONDS, resume_str,
+        )
+        if http_client is not None:
+            recent = await _api_get(http_client, "/api/trades/recent-losses") or []
+            await _notify_loss_streak_pause(
+                http_client, consecutive, _cached_usdc_balance, int(_pause_until), recent
+            )
         return f"pausing after {consecutive} consecutive losses"
 
     daily_loss = stats.get("daily_loss", 0.0)
@@ -1261,6 +1301,59 @@ async def _notify_low_balance(
     await _send_telegram(http_client, text)
 
 
+def _format_loss_lines(recent_losses: list) -> str:
+    """Format the recent-loss list into Telegram HTML lines."""
+    if not recent_losses:
+        return "  (no resolved trades available)"
+    lines = []
+    for t in recent_losses:
+        q     = (t.get("market_question") or "Unknown")[:60]
+        side  = t.get("bet_side") or "?"
+        price = t.get("bet_price_intended") or 0.0
+        score = t.get("score") or "?"
+        lines.append(f"  • {q}\n    {side} @ {price:.3f} · Score {score}")
+    return "\n".join(lines)
+
+
+async def _notify_loss_streak_warning(
+    http_client: httpx.AsyncClient,
+    consecutive: int,
+    recent_losses: list,
+) -> None:
+    loss_lines = _format_loss_lines(recent_losses)
+    balance = _cached_usdc_balance if _cached_usdc_balance >= 0 else 0.0
+    text = (
+        f"⚠️ <b>Loss streak: {consecutive} consecutive losses</b>\n\n"
+        f"💵 Bankroll: <b>${balance:.2f} USDC</b>\n"
+        f"📊 No pause yet — circuit breaker fires at {TRADING_CONSECUTIVE_LOSS_PAUSE}.\n\n"
+        f"<b>Recent losses:</b>\n{loss_lines}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    await _send_telegram(http_client, text)
+
+
+async def _notify_loss_streak_pause(
+    http_client: httpx.AsyncClient,
+    consecutive: int,
+    balance: float,
+    resume_ts: int,
+    recent_losses: list,
+) -> None:
+    resume_str = time.strftime("%H:%M UTC", time.gmtime(resume_ts))
+    loss_lines = _format_loss_lines(recent_losses)
+    bal_str = f"${balance:.2f} USDC" if balance >= 0 else "unknown"
+    text = (
+        f"🚨 <b>CIRCUIT BREAKER — TRADING PAUSED</b>\n\n"
+        f"<b>{consecutive} consecutive losses detected.</b>\n"
+        f"⏸ Paused for {TRADING_PAUSE_DURATION_SECONDS // 60} min · resumes at {resume_str}\n"
+        f"💵 Bankroll: <b>{bal_str}</b>\n\n"
+        f"<b>Recent losses:</b>\n{loss_lines}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Investigate if unexpected. Bot resumes automatically."
+    )
+    await _send_telegram(http_client, text)
+
+
 async def _notify_trade_resolution(
     http_client: httpx.AsyncClient,
     trade: dict,
@@ -1758,7 +1851,7 @@ async def main() -> None:
                         await _notify_cap_change(http_client, _current_max_positions, new_cap, _bankroll, _est_bet)
                     _current_max_positions = new_cap
 
-                block_reason = await _check_risk_limits(stats, max_positions=_current_max_positions)
+                block_reason = await _check_risk_limits(stats, http_client=http_client, max_positions=_current_max_positions)
                 if block_reason:
                     log.info("[Risk] Skipping cycle — %s", block_reason)
                     await asyncio.sleep(POLL_INTERVAL)
@@ -1786,7 +1879,7 @@ async def main() -> None:
 
                     # Re-check risk before each individual trade
                     stats = await _api_get(http_client, "/api/stats/trading") or {}
-                    block_reason = await _check_risk_limits(stats, max_positions=_current_max_positions)
+                    block_reason = await _check_risk_limits(stats, http_client=http_client, max_positions=_current_max_positions)
                     if block_reason:
                         log.info("[Risk] Mid-loop block: %s — halting batch", block_reason)
                         await _notify_skip(http_client, alert, block_reason)

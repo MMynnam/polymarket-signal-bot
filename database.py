@@ -999,6 +999,22 @@ def get_consecutive_losses() -> int:
     return count
 
 
+def get_recent_resolved_losses(limit: int = 6) -> list[dict]:
+    """Return the N most recently resolved-lost trade executions with alert score."""
+    rows = get_db().execute(
+        """
+        SELECT te.market_question, te.bet_side, te.bet_price_intended, ao.score
+        FROM trade_executions te
+        LEFT JOIN alert_outcomes ao ON te.alert_id = ao.alert_id
+        WHERE te.resolution_status = 'lost'
+        ORDER BY te.resolved_at DESC
+        LIMIT ?
+        """,
+        (max(1, min(20, limit)),),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def is_market_already_traded(market_id: str) -> bool:
     """Return True if any trade_execution exists for this market_id (regardless of status)."""
     row = get_db().execute(
