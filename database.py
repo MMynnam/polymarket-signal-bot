@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_SCHEMA_VERSION = 6
+_CURRENT_SCHEMA_VERSION = 7
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -326,6 +326,19 @@ def _apply_migrations() -> None:
         db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(6)")
         db.commit()
         log.info("Applied schema migration → version 6")
+
+    if current < 7:
+        # Version 7 — retry_count column on trade_executions for the re-queue mechanism.
+        try:
+            db.execute(
+                "ALTER TABLE trade_executions ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"
+            )
+            log.info("Migration 7: added retry_count column to trade_executions")
+        except Exception:
+            pass  # Column already exists (idempotent re-run)
+        db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(7)")
+        db.commit()
+        log.info("Applied schema migration → version 7")
 
 
 # ---------------------------------------------------------------------------
@@ -868,7 +881,13 @@ def insert_trade_execution(
     order_id: Optional[str] = None,
     error_message: Optional[str] = None,
 ) -> int:
-    """Log a trade attempt. Returns the new row id. Uses INSERT OR IGNORE so retries are safe."""
+    """Log a trade attempt. Returns the new row id.
+
+    INSERT OR IGNORE for most cases (idempotent on duplicate alert_id).
+    Exception: if the existing row has status='error' and retry_count=0 (a
+    re-queued alert getting its one allowed retry), UPDATE that row and
+    increment retry_count so it can't be re-queued again.
+    """
     now = int(time.time())
     with transaction() as db:
         cursor = db.execute(
@@ -876,8 +895,8 @@ def insert_trade_execution(
             INSERT OR IGNORE INTO trade_executions
                 (alert_id, market_id, market_question, clob_token_id, bet_side,
                  bet_price_intended, bet_price_filled, slippage, size_usdc,
-                 order_type, order_id, status, error_message, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'FOK', ?, ?, ?, ?)
+                 order_type, order_id, status, error_message, created_at, retry_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'FOK', ?, ?, ?, ?, 0)
             """,
             (
                 alert_id, market_id, market_question, clob_token_id, bet_side,
@@ -885,7 +904,26 @@ def insert_trade_execution(
                 order_id, status, error_message, now,
             ),
         )
-        return cursor.lastrowid
+        if cursor.rowcount > 0:
+            return cursor.lastrowid
+        # Row already exists — update only if it is the re-queue window (error, retry_count=0).
+        db.execute(
+            """
+            UPDATE trade_executions
+               SET status          = ?,
+                   error_message   = ?,
+                   order_id        = ?,
+                   bet_price_filled = ?,
+                   slippage        = ?,
+                   created_at      = ?,
+                   retry_count     = retry_count + 1
+             WHERE alert_id   = ?
+               AND status     = 'error'
+               AND retry_count = 0
+            """,
+            (status, error_message, order_id, bet_price_filled, slippage, now, alert_id),
+        )
+        return 0
 
 
 def get_pending_trade_executions() -> list[dict]:
@@ -1105,52 +1143,81 @@ def get_tradeable_alerts_for_api(
                ao.score, ao.score_breakdown_json, ao.bet_side, ao.bet_price_at_alert,
                ao.bet_size_usd, ao.created_at, ao.market_category,
                ao.hours_to_close_at_alert, ao.is_contrarian,
-               m.clob_token_ids, m.raw_json
+               m.clob_token_ids, m.raw_json,
+               te.status     AS te_status,
+               te.error_message AS te_error_msg,
+               te.created_at AS te_created_at
         FROM alert_outcomes ao
         LEFT JOIN trade_executions te ON ao.alert_id = te.alert_id
         LEFT JOIN markets m ON ao.market_id = m.condition_id
         WHERE ao.created_at >= ?
           AND ao.score >= ?
           AND ao.resolution_status = 'pending'
-          AND te.alert_id IS NULL
+          AND (
+              te.alert_id IS NULL
+              OR (
+                  te.status     = 'error'
+                  AND te.retry_count = 0
+                  AND te.created_at > (CAST(strftime('%s', 'now') AS INTEGER) - 14400)
+              )
+          )
         ORDER BY ao.score DESC
         LIMIT ?
         """,
         (since_timestamp, min_score, limit),
     ).fetchall()
 
+    now_ts = int(time.time())
     results = []
     for row in rows:
         d = dict(row)
         clob_token_ids_json = d.pop("clob_token_ids", None)
         raw_json_str = d.pop("raw_json", None)
 
+        # Log re-queue events (errored alerts being given a second chance).
+        te_status    = d.pop("te_status",    None)
+        te_error_msg = d.pop("te_error_msg", None)
+        te_created_at = d.pop("te_created_at", None)
+        if te_status == "error":
+            age_min = (now_ts - te_created_at) / 60 if te_created_at else 0
+            log.info(
+                "[DB] Re-queuing errored alert %s — original error: %s (%.0f min ago)",
+                d["alert_id"][:12], te_error_msg, age_min,
+            )
+
         clob_token_id = None
+        neg_risk: Optional[bool] = None
+        market_slug = None
+
+        raw: dict = {}
+        if raw_json_str:
+            try:
+                raw = json.loads(raw_json_str)
+            except Exception:
+                pass
+
         if clob_token_ids_json:
             try:
                 token_ids = json.loads(clob_token_ids_json)
-                if raw_json_str:
-                    raw = json.loads(raw_json_str)
-                    outcomes: list = raw.get("outcomes", [])
-                    target = d["bet_side"].strip().lower()
-                    for i, outcome in enumerate(outcomes):
-                        if outcome.strip().lower() == target and i < len(token_ids):
-                            clob_token_id = token_ids[i]
-                            break
+                outcomes: list = raw.get("outcomes", [])
+                target = d["bet_side"].strip().lower()
+                for i, outcome in enumerate(outcomes):
+                    if outcome.strip().lower() == target and i < len(token_ids):
+                        clob_token_id = token_ids[i]
+                        break
                 if clob_token_id is None and token_ids:
                     clob_token_id = token_ids[0]
             except Exception:
                 pass
 
-        d["clob_token_id"] = clob_token_id
+        if raw:
+            neg_risk_val = raw.get("negRisk")
+            if neg_risk_val is not None:
+                neg_risk = bool(neg_risk_val)
+            market_slug = raw.get("_event_slug") or raw.get("slug") or None
 
-        market_slug = None
-        if raw_json_str:
-            try:
-                raw_for_slug = json.loads(raw_json_str)
-                market_slug = raw_for_slug.get("_event_slug") or raw_for_slug.get("slug") or None
-            except Exception:
-                pass
+        d["clob_token_id"] = clob_token_id
+        d["neg_risk"] = neg_risk
         d["market_slug"] = market_slug
 
         results.append(d)

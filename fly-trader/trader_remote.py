@@ -1362,17 +1362,32 @@ async def _execute_trade(
     error_msg: Optional[str] = None
 
     try:
-        # Fetch neg_risk in a thread before building the order.
-        # create_market_order() auto-calls get_neg_risk() internally, but it does
-        # so synchronously in the async context which can silently fail and default
-        # to False — causing order_version_mismatch on neg-risk markets.
-        # Fetching it explicitly in asyncio.to_thread() and passing via options
-        # guarantees the order is signed for the correct exchange contract.
-        try:
-            neg_risk = await asyncio.to_thread(clob_client.get_neg_risk, token_id)
-        except Exception as _nr_exc:
-            log.warning("[Trade] get_neg_risk failed for %s: %s — defaulting to False", token_id, _nr_exc)
-            neg_risk = False
+        # Resolve neg_risk from the DB-supplied market record first (populated by
+        # the Railway side from markets.raw_json). Fall back to the CLOB API only
+        # if the DB value is absent (e.g., market record predates the negRisk field).
+        # If neither source works, skip the trade — defaulting to False previously
+        # caused order_version_mismatch on negRisk=True markets (May 2026 incident).
+        _neg_risk_from_db = alert.get("neg_risk")
+        if _neg_risk_from_db is not None:
+            neg_risk = _neg_risk_from_db
+        else:
+            try:
+                neg_risk = await asyncio.to_thread(clob_client.get_neg_risk, token_id)
+            except Exception as _nr_exc:
+                log.error(
+                    "[Trade] get_neg_risk failed for token %s and no DB fallback — "
+                    "skipping alert %s: %s",
+                    token_id, alert_id[:12], _nr_exc,
+                )
+                await _api_post(http_client, "/api/trades", {
+                    "alert_id": alert_id, "market_id": market_id,
+                    "market_question": market_q, "clob_token_id": token_id,
+                    "bet_side": bet_side, "bet_price_intended": price_alert,
+                    "size_usdc": TRADING_BET_SIZE_USDC,
+                    "status": "error",
+                    "error_message": f"get_neg_risk failed: {_nr_exc}",
+                })
+                return
 
         log.debug("[Trade] token=%s neg_risk=%s sig_type=%d funder=%s",
                   token_id[:16], neg_risk, TRADING_SIGNATURE_TYPE,
