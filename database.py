@@ -178,7 +178,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_SCHEMA_VERSION = 7
+_CURRENT_SCHEMA_VERSION = 8
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -339,6 +339,17 @@ def _apply_migrations() -> None:
         db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(7)")
         db.commit()
         log.info("Applied schema migration → version 7")
+
+    if current < 8:
+        # Version 8 — invalidate wallet_profiles cache built against the deprecated
+        # /closed-positions endpoint (returned empty list). Setting fetched_at=0 makes
+        # every cached profile appear older than WALLET_CACHE_TTL_SECONDS so it gets
+        # re-fetched with the correct /v1/closed-positions endpoint on next access.
+        db.execute("UPDATE wallet_profiles SET fetched_at = 0")
+        db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(8)")
+        db.commit()
+        log.info("Migration 8: invalidated %d stale wallet_profiles cache entries",
+                 db.execute("SELECT COUNT(*) FROM wallet_profiles").fetchone()[0])
 
 
 # ---------------------------------------------------------------------------

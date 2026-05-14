@@ -198,8 +198,8 @@ async def _fetch_closed_positions(
     client: httpx.AsyncClient, address: str
 ) -> tuple[list[dict], Optional[str]]:
     """Fetch resolved (closed) positions — source of win/loss data."""
-    url = f"{config.DATA_API_BASE}/closed-positions"
-    params = {"user": address}
+    url = f"{config.DATA_API_BASE}/v1/closed-positions"
+    params = {"user": address, "limit": 500}
     data, err = await _get_with_retry(client, url, params=params, component_name="closed-pos")
     if err or data is None:
         return [], err
@@ -420,18 +420,17 @@ async def _fetch_last_inbound_ts(address: str) -> Optional[float]:
 def _compute_win_rate(closed_positions: list[dict]) -> tuple[int, int, Optional[float]]:
     """
     Count wins and losses from closed positions.
-    A 'win' is a position where pnl > 0 or outcome == 'WON' etc.
+    v1/closed-positions schema: {"realizedPnl": float, "curPrice": float, ...}
     Returns (win_count, loss_count, win_rate_or_None).
     """
     wins = 0
     losses = 0
 
     for pos in closed_positions:
-        # Polymarket closed-position objects have a 'pnl' or 'won' field.
-        # Schema is: {"outcome": "YES", "resolved_outcome": "YES"/"NO", "pnl": 123.45}
-        pnl = pos.get("pnl") or pos.get("profit") or None
-        resolved = pos.get("resolvedOutcome") or pos.get("resolved_outcome") or ""
-        outcome = pos.get("outcome") or pos.get("side") or ""
+        # v1 API uses realizedPnl (positive = won, negative = lost)
+        pnl = pos.get("realizedPnl")
+        if pnl is None:
+            pnl = pos.get("pnl") if pos.get("pnl") is not None else pos.get("profit")
 
         if pnl is not None:
             try:
@@ -441,7 +440,19 @@ def _compute_win_rate(closed_positions: list[dict]) -> tuple[int, int, Optional[
             except (TypeError, ValueError):
                 pass
 
-        # Fallback: compare outcome vs resolved outcome.
+        # Fallback: curPrice (resolved winner token = 1.0, loser = 0.0)
+        cur_price = pos.get("curPrice")
+        if cur_price is not None:
+            try:
+                wins += 1 if float(cur_price) >= 0.999 else 0
+                losses += 1 if float(cur_price) < 0.999 else 0
+                continue
+            except (TypeError, ValueError):
+                pass
+
+        # Legacy fallback: compare outcome vs resolved outcome
+        resolved = pos.get("resolvedOutcome") or pos.get("resolved_outcome") or ""
+        outcome = pos.get("outcome") or pos.get("side") or ""
         if resolved and outcome:
             if resolved.upper() == outcome.upper():
                 wins += 1
