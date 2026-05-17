@@ -48,6 +48,12 @@ TRADING_MAX_CONCURRENT_POSITIONS: int = int(os.getenv("TRADING_MAX_CONCURRENT_PO
 TRADING_CONSECUTIVE_LOSS_PAUSE: int = int(os.getenv("TRADING_CONSECUTIVE_LOSS_PAUSE", "6"))
 TRADING_PAUSE_DURATION_SECONDS: int = int(os.getenv("TRADING_PAUSE_DURATION_SECONDS", "1800"))
 TRADING_LOSS_STREAK_WARNING: int = int(os.getenv("TRADING_LOSS_STREAK_WARNING", "4"))
+# Magnitude-based circuit breaker: pause when rolling realized loss over the last
+# TRADING_CB_WINDOW_HOURS exceeds TRADING_CB_DRAWDOWN_PCT of current bankroll.
+# Replaces the consecutive-count auto-pause; TRADING_CONSECUTIVE_LOSS_PAUSE is now
+# a warning-only heads-up (no pause). Rolling state is in-process only — resets on restart.
+TRADING_CB_WINDOW_HOURS: float = float(os.getenv("TRADING_CB_WINDOW_HOURS", "6"))
+TRADING_CB_DRAWDOWN_PCT: float = float(os.getenv("TRADING_CB_DRAWDOWN_PCT", "0.15"))
 TRADING_MIN_SCORE: int = int(os.getenv("TRADING_MIN_SCORE", "65"))
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
@@ -124,8 +130,10 @@ log = logging.getLogger("trader_remote")
 # ---------------------------------------------------------------------------
 
 _pause_until: float = 0.0
-_pause_triggered_at_streak: int = 0  # streak level at which we last set _pause_until; prevents re-trigger deadlock
+_cb_triggered_at_loss: float = 0.0   # USD loss that last triggered magnitude CB; re-trigger guard
 _warning_sent: bool = False           # True once the mid-streak warning fires; resets after a win
+_heavy_warning_sent: bool = False     # True once the level-CONSECUTIVE_LOSS_PAUSE warning fires
+_cb_pnl_history: list = []            # [(unix_ts, pnl_float), ...] accumulated from resolutions
 _wallet_address: str = ""
 _graduation_notified: bool = False
 _notified_resolutions: set[str] = set()
@@ -613,30 +621,35 @@ def _check_tier_for_alert(open_positions: int, score: int) -> Optional[str]:
     return None
 
 
+def _get_rolling_pnl(window_hours: float) -> float:
+    """Sum realized P&L from _cb_pnl_history entries within the last window_hours."""
+    cutoff = time.time() - window_hours * 3600
+    return sum(pnl for ts, pnl in _cb_pnl_history if ts >= cutoff)
+
+
 async def _check_risk_limits(
     stats: dict,
     http_client: Optional[httpx.AsyncClient] = None,
 ) -> Optional[str]:
-    global _pause_until, _pause_triggered_at_streak, _warning_sent
+    global _pause_until, _cb_triggered_at_loss, _warning_sent, _heavy_warning_sent
 
     now = time.time()
     if _pause_until > 0:
         if now < _pause_until:
-            return f"cooling down after consecutive losses ({int(_pause_until - now)}s remaining)"
-        log.info("[Risk] Consecutive-loss pause expired — resuming")
+            return f"CB cooling down ({int(_pause_until - now)}s remaining)"
+        log.info("[Risk] CB pause expired — resuming")
         _pause_until = 0.0
-        # _pause_triggered_at_streak intentionally NOT reset here: prevents re-triggering
-        # at the same streak level once the pause expires (re-trigger deadlock fix).
+        # _cb_triggered_at_loss intentionally NOT reset here: prevents re-triggering
+        # at the same loss level once the pause expires (re-trigger guard).
 
     consecutive = stats.get("consecutive_losses", 0)
 
-    # Reset per-episode tracking once a win has broken the streak.
+    # Reset per-episode warning flags once a win has broken the streak.
     if consecutive < TRADING_LOSS_STREAK_WARNING:
         _warning_sent = False
-    if consecutive < TRADING_CONSECUTIVE_LOSS_PAUSE:
-        _pause_triggered_at_streak = 0
+        _heavy_warning_sent = False
 
-    # Mid-streak warning at TRADING_LOSS_STREAK_WARNING (default 4), once per streak episode.
+    # Level-1 warning at TRADING_LOSS_STREAK_WARNING (default 4) — heads-up, no pause.
     if (TRADING_LOSS_STREAK_WARNING > 0
             and consecutive >= TRADING_LOSS_STREAK_WARNING
             and not _warning_sent
@@ -645,25 +658,47 @@ async def _check_risk_limits(
         recent = await _api_get(http_client, "/api/trades/recent-losses") or []
         await _notify_loss_streak_warning(http_client, consecutive, recent)
 
-    # Circuit-breaker pause at TRADING_CONSECUTIVE_LOSS_PAUSE (default 6).
-    # Only fires when the streak grows beyond the level at which we last paused,
-    # preventing the re-trigger deadlock where an expired pause immediately re-fires
-    # because consecutive_losses hasn't changed.
-    if consecutive >= TRADING_CONSECUTIVE_LOSS_PAUSE and consecutive > _pause_triggered_at_streak:
-        _pause_triggered_at_streak = consecutive
-        _warning_sent = True  # suppress redundant warning if it fires exactly at pause threshold
+    # Level-2 warning at TRADING_CONSECUTIVE_LOSS_PAUSE (default 6) — heads-up only, no pause.
+    # The actual pause is now magnitude-based (below).
+    if (TRADING_CONSECUTIVE_LOSS_PAUSE > 0
+            and consecutive >= TRADING_CONSECUTIVE_LOSS_PAUSE
+            and not _heavy_warning_sent
+            and http_client is not None):
+        _heavy_warning_sent = True
+        recent = await _api_get(http_client, "/api/trades/recent-losses") or []
+        await _notify_loss_streak_warning(http_client, consecutive, recent)
+
+    # Magnitude-based circuit breaker: pause when rolling realized loss over
+    # TRADING_CB_WINDOW_HOURS exceeds TRADING_CB_DRAWDOWN_PCT of bankroll.
+    # Re-trigger guard: only fires when rolling_loss worsens past the level that
+    # last triggered (analogous to _pause_triggered_at_streak for streak-based CB).
+    # Guard resets when loss recovers below half the threshold.
+    bankroll = max(_cached_usdc_balance, 1.0)
+    threshold_usdc = TRADING_CB_DRAWDOWN_PCT * bankroll
+    rolling_pnl = _get_rolling_pnl(TRADING_CB_WINDOW_HOURS)
+    rolling_loss = max(0.0, -rolling_pnl)
+
+    if rolling_loss < threshold_usdc * 0.5:
+        _cb_triggered_at_loss = 0.0  # reset re-trigger guard on meaningful recovery
+
+    if rolling_loss >= threshold_usdc and rolling_loss > _cb_triggered_at_loss:
+        _cb_triggered_at_loss = rolling_loss
+        _warning_sent = True
+        _heavy_warning_sent = True
         _pause_until = now + TRADING_PAUSE_DURATION_SECONDS
         resume_str = time.strftime("%H:%M UTC", time.gmtime(int(_pause_until)))
         log.warning(
-            "[Risk] %d consecutive losses — pausing %ds until %s",
-            consecutive, TRADING_PAUSE_DURATION_SECONDS, resume_str,
+            "[Risk] CB: rolling loss $%.2f >= $%.2f (%.0f%% of $%.2f bankroll) over %.0fh — "
+            "pausing %ds until %s",
+            rolling_loss, threshold_usdc, TRADING_CB_DRAWDOWN_PCT * 100,
+            bankroll, TRADING_CB_WINDOW_HOURS, TRADING_PAUSE_DURATION_SECONDS, resume_str,
         )
         if http_client is not None:
             recent = await _api_get(http_client, "/api/trades/recent-losses") or []
-            await _notify_loss_streak_pause(
-                http_client, consecutive, _cached_usdc_balance, int(_pause_until), recent
+            await _notify_cb_drawdown_pause(
+                http_client, rolling_loss, threshold_usdc, bankroll, int(_pause_until), recent
             )
-        return f"pausing after {consecutive} consecutive losses"
+        return f"CB: drawdown ${rolling_loss:.2f} >= ${threshold_usdc:.2f} over {TRADING_CB_WINDOW_HOURS:.0f}h"
 
     daily_loss = stats.get("daily_loss", 0.0)
     if daily_loss >= TRADING_MAX_DAILY_LOSS_USDC:
@@ -1431,6 +1466,30 @@ async def _notify_loss_streak_pause(
     await _send_telegram(http_client, text)
 
 
+async def _notify_cb_drawdown_pause(
+    http_client: httpx.AsyncClient,
+    rolling_loss: float,
+    threshold_usdc: float,
+    bankroll: float,
+    resume_ts: int,
+    recent_losses: list,
+) -> None:
+    resume_str = time.strftime("%H:%M UTC", time.gmtime(resume_ts))
+    loss_lines = _format_loss_lines(recent_losses)
+    pct = (rolling_loss / max(bankroll, 1.0)) * 100
+    text = (
+        f"🚨 <b>CIRCUIT BREAKER — TRADING PAUSED</b>\n\n"
+        f"Rolling {TRADING_CB_WINDOW_HOURS:.0f}h loss: <b>${rolling_loss:.2f}</b> "
+        f"({pct:.1f}% of bankroll, threshold {TRADING_CB_DRAWDOWN_PCT * 100:.0f}%)\n"
+        f"⏸ Paused for {TRADING_PAUSE_DURATION_SECONDS // 60} min · resumes at {resume_str}\n"
+        f"💵 Bankroll: <b>${bankroll:.2f} USDC</b>\n\n"
+        f"<b>Recent losses:</b>\n{loss_lines}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Investigate if unexpected. Bot resumes automatically."
+    )
+    await _send_telegram(http_client, text)
+
+
 async def _notify_trade_resolution(
     http_client: httpx.AsyncClient,
     trade: dict,
@@ -1668,11 +1727,18 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
             pnl = 0.0
 
         # Write resolution back to Railway so stats stay accurate
+        resolved_ts = int(time.time())
         await _api_patch(http_client, f"/api/trades/{alert_id}/resolution", {
             "resolution_status": resolution_status,
             "pnl": pnl,
-            "resolved_at": int(time.time()),
+            "resolved_at": resolved_ts,
         })
+
+        # Accumulate for magnitude-based circuit breaker; prune entries outside 2× window
+        _cb_pnl_history.append((float(resolved_ts), pnl))
+        cutoff = resolved_ts - TRADING_CB_WINDOW_HOURS * 3600 * 2
+        while _cb_pnl_history and _cb_pnl_history[0][0] < cutoff:
+            _cb_pnl_history.pop(0)
 
         _notified_resolutions.add(alert_id)
         await _notify_trade_resolution(http_client, trade, resolution_status, pnl)
@@ -1785,7 +1851,7 @@ async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling, _current_tier
+    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling, _current_tier, _cb_pnl_history
 
     if not RAILWAY_API_URL:
         log.critical("RAILWAY_API_URL is not set — exiting")
