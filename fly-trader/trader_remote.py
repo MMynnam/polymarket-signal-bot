@@ -627,6 +627,32 @@ def _get_rolling_pnl(window_hours: float) -> float:
     return sum(pnl for ts, pnl in _cb_pnl_history if ts >= cutoff)
 
 
+async def _backfill_cb_pnl_history(http_client: httpx.AsyncClient) -> int:
+    """Seed _cb_pnl_history from Railway on startup so the CB isn't blind after a restart."""
+    global _cb_pnl_history
+    since_ts = int(time.time() - TRADING_CB_WINDOW_HOURS * 3600)
+    try:
+        data = await _api_get(http_client, "/api/trades/resolved-recent", params={"since": since_ts})
+    except Exception as exc:
+        log.warning("[CB] Backfill fetch failed: %s", exc)
+        return 0
+    if not isinstance(data, list):
+        log.warning("[CB] Backfill returned unexpected type: %s", type(data))
+        return 0
+    added = 0
+    for entry in data:
+        if entry.get("alert_id") and entry.get("pnl") is not None and entry.get("resolved_at"):
+            _cb_pnl_history.append((float(entry["resolved_at"]), float(entry["pnl"])))
+            added += 1
+    if added:
+        rolling_loss = max(0.0, -_get_rolling_pnl(TRADING_CB_WINDOW_HOURS))
+        log.info("[CB] Backfilled %d entries; rolling loss=$%.2f over last %.0fh",
+                 added, rolling_loss, TRADING_CB_WINDOW_HOURS)
+    else:
+        log.info("[CB] Backfill: no resolved trades in last %.0fh", TRADING_CB_WINDOW_HOURS)
+    return added
+
+
 async def _check_risk_limits(
     stats: dict,
     http_client: Optional[httpx.AsyncClient] = None,
@@ -1937,6 +1963,12 @@ async def main() -> None:
                         log.info("[Vault] Sweep already recorded today (%s) — per-day guard set", _today_utc)
             except Exception as exc:
                 log.warning("[Vault] Could not check last sweep date on startup: %s", exc)
+
+        # Seed CB history from Railway so the circuit breaker isn't blind after a restart.
+        try:
+            await _backfill_cb_pnl_history(http_client)
+        except Exception as exc:
+            log.warning("[CB] Backfill startup error (non-fatal): %s", exc)
 
         while True:
             try:

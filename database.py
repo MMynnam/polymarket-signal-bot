@@ -1026,6 +1026,22 @@ def get_recent_resolved_losses(limit: int = 6) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_resolved_executions_since(since_ts: int) -> list[dict]:
+    """Return won/lost trade_executions since since_ts, for CB history backfill on restart."""
+    rows = get_db().execute(
+        """
+        SELECT alert_id, pnl, resolved_at
+        FROM trade_executions
+        WHERE resolution_status IN ('won', 'lost')
+          AND resolved_at IS NOT NULL
+          AND resolved_at >= ?
+        ORDER BY resolved_at ASC
+        """,
+        (since_ts,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def is_market_already_traded(market_id: str) -> bool:
     """Return True if any trade_execution exists for this market_id (regardless of status)."""
     row = get_db().execute(

@@ -7,6 +7,7 @@ Endpoints:
   GET  /api/stats/trading                — trading stats for remote risk management
   GET  /api/trades/pending               — pending trades + current resolution status
   GET  /api/trades/recent-losses         — N most recently resolved-lost trades (for notifications)
+  GET  /api/trades/resolved-recent       — won/lost trades since ?since=<ts> (CB backfill on restart)
   GET  /api/positions/open               — currently open (filled, unresolved) positions
   GET  /api/stats/vault                  — vault sweep history (count, total, last timestamp)
   PATCH /api/trades/{alert_id}/resolution — remote trader reports a resolution
@@ -204,6 +205,21 @@ def get_recent_losses(
         return database.get_recent_resolved_losses(limit=limit)
     except Exception as exc:
         log.error("[API] get_recent_losses failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@app.get("/api/trades/resolved-recent")
+def get_resolved_recent(
+    since: Optional[int] = None,
+    _key: None = Depends(_verify_api_key),
+):
+    """Return won/lost trade_executions since ?since=<ts> for CB history backfill on restart."""
+    if since is None:
+        since = int(time.time()) - 86400
+    try:
+        return database.get_resolved_executions_since(since_ts=since)
+    except Exception as exc:
+        log.error("[API] get_resolved_recent failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Database error")
 
 
