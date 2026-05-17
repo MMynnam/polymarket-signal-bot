@@ -1877,7 +1877,7 @@ async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling, _current_tier, _cb_pnl_history
+    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling, _current_tier, _cb_pnl_history, _cached_usdc_balance
 
     if not RAILWAY_API_URL:
         log.critical("RAILWAY_API_URL is not set — exiting")
@@ -1965,10 +1965,16 @@ async def main() -> None:
                 log.warning("[Vault] Could not check last sweep date on startup: %s", exc)
 
         # Seed CB history from Railway so the circuit breaker isn't blind after a restart.
+        # Then evaluate immediately — if the reconstructed window already breaches the
+        # threshold, engage the pause now rather than on the first poll cycle.
         try:
             await _backfill_cb_pnl_history(http_client)
+            _cached_usdc_balance = await _get_usdc_balance()
+            block = await _check_risk_limits({}, http_client=http_client)
+            if block:
+                log.warning("[CB] Post-seed evaluation triggered on boot: %s", block)
         except Exception as exc:
-            log.warning("[CB] Backfill startup error (non-fatal): %s", exc)
+            log.warning("[CB] Backfill/post-seed evaluation error (non-fatal): %s", exc)
 
         while True:
             try:
