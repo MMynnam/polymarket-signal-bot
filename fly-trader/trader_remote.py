@@ -2014,7 +2014,11 @@ async def main() -> None:
                     continue
 
                 # Fetch stats for risk management
-                stats = await _api_get(http_client, "/api/stats/trading") or {}
+                stats = await _api_get(http_client, "/api/stats/trading")
+                if stats is None:
+                    log.warning("[Trader] Stats unavailable — skipping trade cycle (fail-closed)")
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
 
                 # Dynamic position cap — recompute every cycle from current bankroll + bet size
                 _bankroll = max(_cached_usdc_balance, 0.0)
@@ -2077,7 +2081,10 @@ async def main() -> None:
                     last_processed_ts = max(last_processed_ts, ts)
 
                     # Re-check risk before each individual trade
-                    stats = await _api_get(http_client, "/api/stats/trading") or {}
+                    stats = await _api_get(http_client, "/api/stats/trading")
+                    if stats is None:
+                        log.warning("[Trader] Stats unavailable mid-batch — halting batch (fail-closed)")
+                        break
                     block_reason = await _check_risk_limits(stats, http_client=http_client)
                     if block_reason:
                         log.info("[Risk] Mid-loop block: %s — halting batch", block_reason)
