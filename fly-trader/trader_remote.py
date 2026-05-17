@@ -79,6 +79,9 @@ TRADING_MAX_POSITIONS_CEILING: int = int(os.getenv("TRADING_MAX_POSITIONS_CEILIN
 TRADING_NORMAL_POSITIONS_MAX: int = int(os.getenv("TRADING_NORMAL_POSITIONS_MAX", "50"))
 TRADING_PREMIUM_POSITIONS_MAX: int = int(os.getenv("TRADING_PREMIUM_POSITIONS_MAX", "60"))
 TRADING_PREMIUM_SCORE_THRESHOLD: int = int(os.getenv("TRADING_PREMIUM_SCORE_THRESHOLD", "85"))
+# Hysteresis band: once in premium, don't return to normal until positions drop
+# to (effective_normal - TRADING_TIER_DEADBAND). Prevents ±1 flapping at the cap boundary.
+TRADING_TIER_DEADBAND: int = int(os.getenv("TRADING_TIER_DEADBAND", "5"))
 
 VAULT_WALLET_ADDRESS: str = os.getenv("VAULT_WALLET_ADDRESS", "")
 # Derived from core scaling params; direct env override still works for backward compat.
@@ -575,19 +578,32 @@ def _compute_max_positions(bankroll: float, bet_size: float) -> int:
     return max(TRADING_MAX_POSITIONS_FLOOR, min(raw, ceiling))
 
 
-def _get_tier(open_positions: int) -> str:
-    """Return 'normal', 'premium', or 'hardcap' for the current position count."""
+def _get_tier(open_positions: int, current_tier: str) -> str:
+    """Return 'normal', 'premium', or 'hardcap' with deadband hysteresis.
+
+    Enter premium when open_positions >= effective_normal.
+    Exit premium only when open_positions <= effective_normal - TRADING_TIER_DEADBAND.
+    The deadband zone [(effective_normal - deadband), effective_normal) is sticky:
+    the tier stays whatever it was, preventing ±1 flapping at the cap boundary.
+
+    Hardcap has no deadband — one resolved position immediately drops to premium.
+    Dynamic floor interaction: if effective_normal drops due to bankroll erosion,
+    positions >= new effective_normal are still correctly caught by the first check.
+    """
     if open_positions >= TRADING_PREMIUM_POSITIONS_MAX:
         return "hardcap"
     effective_normal = min(_current_max_positions, TRADING_NORMAL_POSITIONS_MAX)
     if open_positions >= effective_normal:
         return "premium"
-    return "normal"
+    if open_positions <= effective_normal - TRADING_TIER_DEADBAND:
+        return "normal"
+    # In the deadband: maintain the incoming tier (sticky)
+    return "premium" if current_tier in ("premium", "hardcap") else "normal"
 
 
 def _check_tier_for_alert(open_positions: int, score: int) -> Optional[str]:
     """Return a skip reason if this alert is blocked by the tier system, or None to proceed."""
-    tier = _get_tier(open_positions)
+    tier = _get_tier(open_positions, _current_tier)
     if tier == "premium" and score < TRADING_PREMIUM_SCORE_THRESHOLD:
         effective_normal = min(_current_max_positions, TRADING_NORMAL_POSITIONS_MAX)
         return (
@@ -1915,7 +1931,7 @@ async def main() -> None:
 
                 # Per-cycle tier state log + transition notification
                 _open_now = stats.get("open_positions", 0)
-                _tier_now = _get_tier(_open_now)
+                _tier_now = _get_tier(_open_now, _current_tier)
                 _eff_normal = min(_current_max_positions, TRADING_NORMAL_POSITIONS_MAX)
                 if _tier_now == "normal":
                     log.info("[Trader] Position tier: normal (%d/%d)", _open_now, _eff_normal)
