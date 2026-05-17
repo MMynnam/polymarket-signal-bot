@@ -1,26 +1,34 @@
 """
-scorer.py — Insider Confidence Score (0–100 + up to +10 cluster bonus).
+scorer.py — Insider Confidence Score (0–100).
 
 Each component is isolated in its own function with detailed comments
 explaining the weight rationale and the math used.
 
-Score layout:
+All max-point values are env-driven (set via Railway env vars; see config.py).
+Defaults below reflect the May 2026 evidence-backed reweight.
+
+Score layout (env-driven defaults):
   Component              Max pts  Rationale
   ─────────────────────  ───────  ──────────────────────────────────────────
-  Timing                    25    Close-to-resolution bets are highest risk/conviction
-  Funding velocity          10    Short gap between inbound transfer and bet = rapid deploy
-  Win rate                  10    Historical accuracy on resolved bets
-  Size anomaly              20    Statistically unusual bets signal conviction
-  Wallet age                25    Fresh wallets are often purpose-built for one tip
-  Concentration             10    Single-market concentration = high conviction
-  Underdog bet               0    DISABLED — 128-alert backtest: 14% win rate, -0.60 ROI
-  Cluster bonus           +10    Coordinated wallets multiply signal strength
-  Convergence bonus       +20    Multiple independent wallets, same side, same market
+  Size anomaly              33    Strongest cross-regime predictor (backtest)
+  Timing                    20    Positive in current regime; partial cut from 25
+  Win rate                  15    Restored gradation via API cap fix + wider band
+  Funding velocity          10    Borderline positive; held
+  Concentration             10    Noise in current regime; held
+  Wallet age                12    Inverted signal in current regime; cut sharply
+  Underdog bet               0    DISABLED — 128-alert backtest: 14% WR, -0.60 ROI
+  Cluster bonus              0    DISABLED — fired universally, no information
+  Convergence bonus          0    DISABLED — anti-predictive in production data
   ─────────────────────  ───────
-  TOTAL (max)              130
+  TOTAL (max)              100
 
-Score ≥ ALERT_INSTANT_THRESHOLD (default 90) → immediate Telegram alert.
-Score ≥ ALERT_DIGEST_THRESHOLD  (default 75) → buffered into periodic digest.
+Score >= ALERT_INSTANT_THRESHOLD (default 65) -> immediate Telegram alert.
+Score >= ALERT_DIGEST_THRESHOLD  (default 60) -> buffered into periodic digest.
+
+Rollback: set env vars SCORE_MAX_TIMING=25, SCORE_MAX_WALLET_AGE=25,
+SCORE_MAX_WIN_RATE=10, SCORE_MAX_SIZE_ANOMALY=20, SCORE_MAX_FUNDING_VELOCITY=10,
+SCORE_MAX_CONCENTRATION=10, WINRATE_HIGH_THRESHOLD=0.80, WINRATE_LOW_THRESHOLD=0.50
+and redeploy. No code change required.
 """
 
 import logging

@@ -197,16 +197,66 @@ async def _fetch_open_positions(
 async def _fetch_closed_positions(
     client: httpx.AsyncClient, address: str
 ) -> tuple[list[dict], Optional[str]]:
-    """Fetch resolved (closed) positions — source of win/loss data."""
-    url = f"{config.DATA_API_BASE}/v1/closed-positions"
-    params = {"user": address, "limit": 500}
-    data, err = await _get_with_retry(client, url, params=params, component_name="closed-pos")
-    if err or data is None:
-        return [], err
+    """
+    Fetch resolved (closed) positions — source of win/loss data.
 
-    if isinstance(data, dict):
-        data = data.get("data") or data.get("positions") or []
-    return data if isinstance(data, list) else [], None
+    The API hard-caps at 50 results per call regardless of the requested limit.
+    We use offset-based pagination to collect up to WINRATE_MAX_CLOSED_POSITIONS
+    resolved positions so that the win_rate component reflects the wallet's true
+    long-run record rather than the most recent 50 trades only.
+    If the API doesn't support offset (returns the same first 50 regardless),
+    the loop exits cleanly after the first page — no breakage.
+    """
+    url = f"{config.DATA_API_BASE}/v1/closed-positions"
+    page_size = 50  # matches the API's effective per-page cap
+    max_total = config.WINRATE_MAX_CLOSED_POSITIONS
+    all_positions: list[dict] = []
+    offset = 0
+
+    while True:
+        params = {"user": address, "limit": page_size, "offset": offset}
+        data, err = await _get_with_retry(
+            client, url, params=params, component_name="closed-pos"
+        )
+        if err or data is None:
+            if not all_positions:
+                return [], err
+            break  # return what we have from earlier pages
+
+        if isinstance(data, dict):
+            page = data.get("data") or data.get("positions") or []
+        else:
+            page = data if isinstance(data, list) else []
+
+        if not page:
+            break
+
+        all_positions.extend(page)
+
+        if len(page) < page_size:
+            break  # last page — API returned fewer than requested
+        if len(all_positions) >= max_total:
+            break
+
+        # Detect no-op pagination: if the API ignores offset and returns the
+        # same first-page records, the second page will duplicate them.
+        # We stop after one extra page in that case.
+        offset += page_size
+        if offset > page_size:
+            # Verify the new page didn't just repeat the first page.
+            # Compare a fingerprint of this page vs the first page.
+            first_id = (all_positions[0].get("id") or all_positions[0].get("conditionId") or "")
+            last_page_id = (page[0].get("id") or page[0].get("conditionId") or "")
+            if first_id and first_id == last_page_id:
+                # API is returning the same page regardless of offset — stop.
+                log.debug(
+                    "[WalletProfiler] closed-pos pagination not supported for %s, "
+                    "stopping at %d positions", address, len(all_positions) - len(page)
+                )
+                all_positions = all_positions[: len(all_positions) - len(page)]
+                break
+
+    return all_positions, None
 
 
 # ---------------------------------------------------------------------------

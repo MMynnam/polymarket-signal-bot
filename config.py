@@ -174,25 +174,36 @@ DIGEST_SEND_HOUR_UTC: int = int(os.getenv("DIGEST_SEND_HOUR_UTC", "0"))  # midni
 # file sends cause issues — the summary text is still sent either way.
 DIGEST_CSV_ENABLED: bool = os.getenv("DIGEST_CSV_ENABLED", "true").lower() in ("true", "1", "yes")
 
-# --- Component maximum points (must sum to 100 + 10 bonus) ---
+# --- Component maximum points (must sum to 100 + bonuses) ---
+# All weights are env-driven; change via Railway env vars, no code change needed.
+# Rollback: revert env vars to old values, redeploy.
+#
+# Evidence-backed defaults (May 2026 backtest, n=5229 alerts, Regime C spine):
+#   size_anomaly 33 — strongest cross-regime positive predictor (LR coef +0.32)
+#   timing       20 — positive in Regime C but non-monotonic; partial reduction from 25
+#   win_rate     15 — real signal once cap artifact is fixed; weight reduced from 20
+#                      pending first 2-week re-run to confirm threshold effect
+#   funding_vel  10 — borderline positive (MW p=0.05); held
+#   concentration 10 — noise in Regime C (MW p=0.82); held
+#   wallet_age   12 — significantly INVERTED in Regime C (MW p=0.03); cut sharply
 
-# How close to market close is the bet? (0–25 pts)
-SCORE_MAX_TIMING: int = 25
+# How close to market close is the bet? (0–20 pts default)
+SCORE_MAX_TIMING: int = int(os.getenv("SCORE_MAX_TIMING", "20"))
 
-# Funding-to-bet velocity: gap between last inbound transfer and the bet (0–20 pts)
-SCORE_MAX_FUNDING_VELOCITY: int = 10
+# Funding-to-bet velocity: gap between last inbound transfer and the bet (0–10 pts default)
+SCORE_MAX_FUNDING_VELOCITY: int = int(os.getenv("SCORE_MAX_FUNDING_VELOCITY", "10"))
 
-# Historical win rate on resolved bets (0–10 pts)
-SCORE_MAX_WIN_RATE: int = 10
+# Historical win rate on resolved bets (0–15 pts default)
+SCORE_MAX_WIN_RATE: int = int(os.getenv("SCORE_MAX_WIN_RATE", "15"))
 
-# Bet size vs wallet median (0–20 pts)
-SCORE_MAX_SIZE_ANOMALY: int = 20
+# Bet size vs wallet median (0–33 pts default)
+SCORE_MAX_SIZE_ANOMALY: int = int(os.getenv("SCORE_MAX_SIZE_ANOMALY", "33"))
 
-# Wallet age — newer wallets score higher on this axis (0–25 pts)
-SCORE_MAX_WALLET_AGE: int = 25
+# Wallet age — newer wallets score higher on this axis (0–12 pts default)
+SCORE_MAX_WALLET_AGE: int = int(os.getenv("SCORE_MAX_WALLET_AGE", "12"))
 
-# Capital concentration in a single market (0–10 pts)
-SCORE_MAX_CONCENTRATION: int = 10
+# Capital concentration in a single market (0–10 pts default)
+SCORE_MAX_CONCENTRATION: int = int(os.getenv("SCORE_MAX_CONCENTRATION", "10"))
 
 # Betting on the underdog vs. betting the favorite — DISABLED (0 pts)
 # 128-alert backtest: 14% win rate, -0.60 ROI (actively harmful signal).
@@ -230,9 +241,17 @@ TIMING_MAX_SCORE_HOURS: float = float(os.getenv("TIMING_MAX_SCORE_HOURS", "2.0")
 TIMING_ZERO_SCORE_HOURS: float = float(os.getenv("TIMING_ZERO_SCORE_HOURS", str(7 * 24)))  # 7 days
 
 # --- Win rate thresholds ---
-WINRATE_HIGH_THRESHOLD: float = 0.80  # 80%+ → near-max score
-WINRATE_LOW_THRESHOLD: float = 0.50   # 50% or below → 0 pts
-WINRATE_SIGNIFICANCE_BETS: int = 20   # >= 20 resolved bets → full statistical weight
+# High threshold raised 0.80→0.95 to restore gradation: the /v1/closed-positions API
+# caps at 50 results regardless of limit, compressing 88% of wallets to a single
+# saturated 10/10 score.  At 0.95, a wallet with 80% WR scores ~12/20 and a wallet
+# with 95%+ WR scores the full 20/20.  Also env-driven for live tuning/rollback.
+WINRATE_HIGH_THRESHOLD: float = float(os.getenv("WINRATE_HIGH_THRESHOLD", "0.95"))
+WINRATE_LOW_THRESHOLD: float = float(os.getenv("WINRATE_LOW_THRESHOLD", "0.55"))
+WINRATE_SIGNIFICANCE_BETS: int = int(os.getenv("WINRATE_SIGNIFICANCE_BETS", "20"))
+
+# Max resolved positions to fetch per wallet (pagination cap).
+# The API returns at most 50 per page; we page until we hit this total or run out.
+WINRATE_MAX_CLOSED_POSITIONS: int = int(os.getenv("WINRATE_MAX_CLOSED_POSITIONS", "500"))
 
 # --- Funding velocity thresholds ---
 # Gap between most recent inbound transfer and the bet.
