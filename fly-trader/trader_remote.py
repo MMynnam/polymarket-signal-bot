@@ -82,8 +82,8 @@ TRADING_MAX_POSITIONS_CEILING: int = int(os.getenv("TRADING_MAX_POSITIONS_CEILIN
 # Premium mode: between normal cap and TRADING_PREMIUM_POSITIONS_MAX, only alerts with
 # score >= TRADING_PREMIUM_SCORE_THRESHOLD are admitted.
 # Hard ceiling: TRADING_PREMIUM_POSITIONS_MAX is an absolute block — no trades at all.
-TRADING_NORMAL_POSITIONS_MAX: int = int(os.getenv("TRADING_NORMAL_POSITIONS_MAX", "50"))
-TRADING_PREMIUM_POSITIONS_MAX: int = int(os.getenv("TRADING_PREMIUM_POSITIONS_MAX", "60"))
+TRADING_NORMAL_POSITIONS_MAX: int = int(os.getenv("TRADING_NORMAL_POSITIONS_MAX", "70"))
+TRADING_PREMIUM_POSITIONS_MAX: int = int(os.getenv("TRADING_PREMIUM_POSITIONS_MAX", "85"))
 TRADING_PREMIUM_SCORE_THRESHOLD: int = int(os.getenv("TRADING_PREMIUM_SCORE_THRESHOLD", "85"))
 # Hysteresis band: once in premium, don't return to normal until positions drop
 # to (effective_normal - TRADING_TIER_DEADBAND). Prevents ±1 flapping at the cap boundary.
