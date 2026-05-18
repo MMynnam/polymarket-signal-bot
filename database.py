@@ -144,7 +144,7 @@ CREATE TABLE IF NOT EXISTS trade_executions (
     size_usdc           REAL NOT NULL,
     order_type          TEXT DEFAULT 'FOK',
     order_id            TEXT,
-    status              TEXT NOT NULL,   -- filled | partial | rejected | failed | error
+    status              TEXT NOT NULL,   -- filled | partial | fill-unconfirmed | rejected | failed | error
     error_message       TEXT,
     gas_cost_matic      REAL,
     created_at          INTEGER NOT NULL,
@@ -1080,11 +1080,11 @@ def insert_trade_execution(
 
 
 def get_pending_trade_executions() -> list[dict]:
-    """Return all trade_executions awaiting resolution (status=filled, resolution_status=pending)."""
+    """Return trade_executions awaiting resolution (filled or partial, pending resolution)."""
     rows = get_db().execute(
         """
         SELECT * FROM trade_executions
-        WHERE status = 'filled' AND resolution_status = 'pending'
+        WHERE status IN ('filled', 'partial') AND resolution_status = 'pending'
         ORDER BY created_at ASC
         """
     ).fetchall()
@@ -1127,9 +1127,9 @@ def get_daily_loss() -> float:
 
 
 def get_open_position_count() -> int:
-    """Count of filled trades still pending resolution."""
+    """Count of filled (or partially filled) trades still pending resolution."""
     row = get_db().execute(
-        "SELECT COUNT(*) FROM trade_executions WHERE status = 'filled' AND resolution_status = 'pending'"
+        "SELECT COUNT(*) FROM trade_executions WHERE status IN ('filled', 'partial') AND resolution_status = 'pending'"
     ).fetchone()
     return row[0] if row else 0
 
@@ -1420,7 +1420,7 @@ def get_open_positions_for_api() -> list[dict]:
                ao.score
         FROM trade_executions te
         LEFT JOIN alert_outcomes ao ON te.alert_id = ao.alert_id
-        WHERE te.status = 'filled' AND te.resolution_status = 'pending'
+        WHERE te.status IN ('filled', 'partial') AND te.resolution_status = 'pending'
         ORDER BY te.created_at ASC
         """,
     ).fetchall()
@@ -1443,7 +1443,7 @@ def get_pending_trades_with_resolution() -> list[dict]:
                ao.winning_outcome
         FROM trade_executions te
         LEFT JOIN alert_outcomes ao ON te.alert_id = ao.alert_id
-        WHERE te.status = 'filled' AND te.resolution_status = 'pending'
+        WHERE te.status IN ('filled', 'partial') AND te.resolution_status = 'pending'
         ORDER BY te.created_at ASC
         """
     ).fetchall()

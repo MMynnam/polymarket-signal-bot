@@ -131,6 +131,11 @@ TRADING_SCORE_CEILING: int = int(os.getenv("TRADING_SCORE_CEILING", "90"))
 # Hard minimum bankroll for vault sweep — effective floor = max(this, VAULT_SWEEP_FLOOR_USDC).
 VAULT_BANKROLL_FLOOR_USDC: float = float(os.getenv("VAULT_BANKROLL_FLOOR_USDC", "80.0"))
 
+# Master arm switch for the vault sweep. Default false — sweep logic runs in dry-run mode
+# (computes and logs intended amounts) but moves zero funds. Only an explicit
+# VAULT_SWEEP_ENABLED=true set by the operator can ever arm it.
+VAULT_SWEEP_ENABLED: bool = os.getenv("VAULT_SWEEP_ENABLED", "false").lower() == "true"
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -1089,6 +1094,23 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
         return
 
     # ------------------------------------------------------------------
+    # Master arm switch — abort any in-progress sweep if flag was flipped off.
+    # ------------------------------------------------------------------
+    if not VAULT_SWEEP_ENABLED and _sweep_state in ("pause_pending", "pause_ready"):
+        log.warning(
+            "[Vault] VAULT_SWEEP_ENABLED=false but state=%s — aborting sweep and unpausing",
+            _sweep_state,
+        )
+        try:
+            await asyncio.to_thread(_unpause_deposit_wallet_sync)
+            log.info("[Vault] Deposit wallet unpaused after sweep abort")
+        except Exception as _ue:
+            log.error("[Vault] Unpause after abort failed: %s", _ue)
+            await _notify_sweep_stuck(http_client)
+        _sweep_state = "idle"
+        return
+
+    # ------------------------------------------------------------------
     # Phase 2 — wait for timelock
     # ------------------------------------------------------------------
     if _sweep_state == "pause_pending":
@@ -1266,6 +1288,16 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
     if intended_amount <= 0:
         _sweep_last_date = today
         log.info("[Vault] Intended sweep amount $%.2f <= 0 — skip", intended_amount)
+        return
+
+    if not VAULT_SWEEP_ENABLED:
+        _sweep_last_date = today
+        log.info(
+            "[Vault] DRY RUN (VAULT_SWEEP_ENABLED=false): "
+            "balance $%.2f | would move $%.2f | would retain $%.2f | threshold $%.2f | floor $%.2f",
+            balance, intended_amount, balance - intended_amount,
+            VAULT_SWEEP_THRESHOLD_USDC, max(VAULT_SWEEP_FLOOR_USDC, VAULT_BANKROLL_FLOOR_USDC),
+        )
         return
 
     log.info("[Vault] Initiating daily sweep (balance $%.2f, intended $%.2f)...", balance, intended_amount)
@@ -1785,40 +1817,62 @@ async def _execute_trade(
                 )
                 # Query order detail to get the actual USDC matched (may be < bet_size for FAK).
                 # Polymarket REST returns size_matched in USDC float, not micro-units.
+                # Retry once on failure; if still unresolvable, mark fill-unconfirmed so
+                # the trade is excluded from CB/bankroll math rather than defaulting to
+                # the intended full amount.
                 if order_id:
-                    try:
-                        order_detail = await asyncio.to_thread(clob_client.get_order, order_id)
-                        if isinstance(order_detail, dict):
-                            raw_matched = (
-                                order_detail.get("size_matched")
-                                or order_detail.get("sizeMatched")
-                                or order_detail.get("matched_amount")
-                            )
-                            if raw_matched is not None:
-                                filled_size = float(raw_matched)
-                            else:
-                                log.warning(
-                                    "[Trade] FAK %s: get_order missing size_matched — "
-                                    "recording intended $%.2f. resp=%s",
-                                    alert_id[:12], bet_size, order_detail,
-                                )
-                    except Exception as _ge:
-                        log.warning(
-                            "[Trade] FAK %s: get_order failed (%s) — recording intended $%.2f",
-                            alert_id[:12], _ge, bet_size,
-                        )
+                    _get_order_result: Optional[dict] = None
+                    _get_order_err: Optional[Exception] = None
+                    for _attempt in range(2):
+                        try:
+                            _get_order_result = await asyncio.to_thread(clob_client.get_order, order_id)
+                            _get_order_err = None
+                            break
+                        except Exception as _ge:
+                            _get_order_err = _ge
+                            if _attempt == 0:
+                                await asyncio.sleep(2)
 
-                if filled_size >= bet_size * 0.99:
-                    status = "filled"
-                elif filled_size > 0:
-                    status = "partial"
-                    log.info(
-                        "[Trade] FAK partial fill %s: $%.2f / $%.2f USDC @ %.4f",
-                        alert_id[:12], filled_size, bet_size, fill_price,
-                    )
-                else:
-                    status = "rejected"
-                    error_msg = "FAK matched but size_matched=0"
+                    if _get_order_result is not None and isinstance(_get_order_result, dict):
+                        raw_matched = (
+                            _get_order_result.get("size_matched")
+                            or _get_order_result.get("sizeMatched")
+                            or _get_order_result.get("matched_amount")
+                        )
+                        if raw_matched is not None:
+                            filled_size = float(raw_matched)
+                        else:
+                            # Exchange returned an order dict but no size field — unconfirmed.
+                            log.warning(
+                                "[Trade] FAK %s: get_order missing size_matched after retry — "
+                                "marking fill-unconfirmed (order=%s). resp=%s",
+                                alert_id[:12], order_id[:12], _get_order_result,
+                            )
+                            filled_size = 0.0
+                            status = "fill-unconfirmed"
+                            error_msg = "FAK fill amount unconfirmed: size_matched absent from get_order"
+                    elif _get_order_err is not None:
+                        log.warning(
+                            "[Trade] FAK %s: get_order failed after retry (%s) — "
+                            "marking fill-unconfirmed (order=%s)",
+                            alert_id[:12], _get_order_err, order_id[:12],
+                        )
+                        filled_size = 0.0
+                        status = "fill-unconfirmed"
+                        error_msg = f"FAK fill amount unconfirmed: get_order failed: {_get_order_err}"
+
+                if status != "fill-unconfirmed":
+                    if filled_size >= bet_size * 0.99:
+                        status = "filled"
+                    elif filled_size > 0:
+                        status = "partial"
+                        log.info(
+                            "[Trade] FAK partial fill %s: $%.2f / $%.2f USDC @ %.4f",
+                            alert_id[:12], filled_size, bet_size, fill_price,
+                        )
+                    else:
+                        status = "rejected"
+                        error_msg = "FAK matched but size_matched=0"
             else:
                 status = "rejected"
                 if not error_msg:
