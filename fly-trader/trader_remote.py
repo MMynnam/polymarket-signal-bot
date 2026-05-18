@@ -1883,8 +1883,9 @@ async def _execute_trade(
             )
             return
 
-    fill_price: Optional[float] = None
-    order_id:   Optional[str]   = None
+    fill_price:  Optional[float] = None
+    order_id:    Optional[str]   = None
+    filled_size: float = 0.0   # default for error paths; overridden inside try on success
     status = "error"
     error_msg: Optional[str] = None
 
