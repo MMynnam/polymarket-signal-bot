@@ -167,10 +167,13 @@ _low_balance_warned: bool = False
 _cached_usdc_balance: float = -1.0  # -1 = not yet fetched
 _RESOLUTION_POLL_INTERVAL: int = 600
 _skip_notified: set[tuple[str, str]] = set()  # (alert_id, reason_key); one notification per alert per lifetime
+_skip_batch: dict = {}  # (market_id, bet_side, reason_key) → batch entry; flushed by background task
+_SKIP_BATCH_WINDOW_SECONDS: int = 60  # window for collapsing repeated same-market skips
 _alert_skip_cache: dict[str, float] = {}  # alert_id -> expiry timestamp; avoids re-evaluating
 # Strong references to background telemetry tasks — prevents GC before completion.
 _background_tasks: set[asyncio.Task] = set()
 _SKIP_DECISION_TTL_SECONDS: int = 300     # 5 min: re-evaluate after price may have stabilised
+_session_avg_bet: float = TRADING_BET_SIZE_USDC  # EMA of actual fill sizes; used for cap estimation
 _sweep_state: str = "idle"      # idle | pause_pending | pause_ready
 _sweep_paused_at: float = 0.0
 _sweep_intended_amount: float = 0.0  # calculated at pause time; rechecked at withdraw time
@@ -512,6 +515,41 @@ def _skip_reason_plain(reason: str) -> str:
     return reason[:80]
 
 
+def _score_bar(score: int) -> str:
+    fraction = max(0.0, min(1.0, (score - 65) / 35))
+    filled = round(fraction * 10)
+    return "▓" * filled + "░" * (10 - filled)
+
+
+def _fmt_score_breakdown(score_breakdown_json: Optional[str]) -> str:
+    import html as _html, json as _json
+    try:
+        bd = _json.loads(score_breakdown_json or "{}")
+    except Exception:
+        return ""
+    fields = [
+        ("Timing",       "timing",           "timing_note"),
+        ("Wallet age",   "wallet_age",        "wallet_age_note"),
+        ("Size anomaly", "size_anomaly",      "size_anomaly_note"),
+        ("Concentration","concentration",     "concentration_note"),
+        ("Funding vel.", "funding_velocity",  "funding_velocity_note"),
+        ("Win rate",     "win_rate",          "win_rate_note"),
+        ("Cluster",      "cluster_bonus",     "cluster_note"),
+        ("Convergence",  "convergence_bonus", "convergence_note"),
+    ]
+    lines = []
+    for label, key, note_key in fields:
+        val = bd.get(key) or 0
+        note = _html.escape((bd.get(note_key) or "")[:32])
+        sign = "+" if val >= 0 else ""
+        note_str = f"  {note}" if note else ""
+        lines.append(f"{label:<14} {sign}{val:2d}{note_str}")
+    total = bd.get("total") or 0
+    lines.append("─" * 30)
+    lines.append(f"{'Total':<14}  {total:2d}")
+    return "\n".join(lines)
+
+
 def _evaluate_dynamic_gate(
     price_intended: float,
     price_current: float,
@@ -577,27 +615,98 @@ async def _post_skip_telemetry(
                     alert.get("alert_id", "")[:12], exc)
 
 
+async def _flush_skip_batch(http_client: httpx.AsyncClient, batch_key: tuple) -> None:
+    """Sleep SKIP_BATCH_WINDOW_SECONDS then send a collapsed summary if multiple skips accumulated."""
+    import html as _html
+    await asyncio.sleep(_SKIP_BATCH_WINDOW_SECONDS)
+    batch = _skip_batch.pop(batch_key, None)
+    if batch is None or batch["count"] <= 1:
+        return
+    count = batch["count"]
+    market_q = batch.get("market_q", "")
+    bet_side = batch.get("bet_side", "")
+    p_int = batch.get("last_price_intended")
+    p_cur = batch.get("last_price_current")
+    price_str = ""
+    if p_int is not None and p_cur is not None:
+        price_str = f"\nLatest:  {p_int*100:.0f}¢ → {p_cur*100:.0f}¢"
+    text = (
+        f"— SKIP ×{count} in {_SKIP_BATCH_WINDOW_SECONDS}s —\n"
+        f"{_html.escape(market_q[:70])}  [{_html.escape(bet_side)}]\n"
+        f"Same signal, price kept moving.{price_str}"
+    )
+    await _send_telegram(http_client, text)
+
+
 async def _notify_skip(
     http_client: httpx.AsyncClient,
     alert: dict,
     reason: str,
+    *,
+    price_intended: Optional[float] = None,
+    price_current: Optional[float] = None,
+    slippage_delta: Optional[float] = None,
 ) -> None:
     import html as _html
-    global _skip_notified
+    global _skip_notified, _skip_batch
 
-    alert_id = alert.get("alert_id", "")
-    score = alert.get("score", 0)
-    market_q = alert.get("market_question") or alert.get("market_id", "")
+    alert_id   = alert.get("alert_id", "")
+    score      = int(alert.get("score") or 0)
+    market_q   = (alert.get("market_question") or alert.get("market_id", ""))
+    market_id  = alert.get("market_id", "")
+    bet_side   = alert.get("bet_side", "")
+    created_at = int(alert.get("created_at") or 0)
 
+    # Alert-level dedup: never fire twice for the same alert+reason.
     cache_key = (alert_id, _skip_reason_key(reason))
     if cache_key in _skip_notified:
         return
     _skip_notified.add(cache_key)
 
+    now = time.time()
+
+    # Market-level batch dedup: collapse rapid-fire same-market same-reason skips.
+    batch_key = (market_id, bet_side, _skip_reason_key(reason))
+    batch = _skip_batch.get(batch_key)
+    if batch is not None and now - batch["first_ts"] < _SKIP_BATCH_WINDOW_SECONDS:
+        batch["count"] += 1
+        batch["last_price_intended"] = price_intended
+        batch["last_price_current"] = price_current
+        return  # suppressed; background task will flush the summary
+
+    # Start a new batch window and fire the message immediately.
+    _skip_batch[batch_key] = {
+        "count": 1,
+        "first_ts": now,
+        "market_q": market_q,
+        "bet_side": bet_side,
+        "last_price_intended": price_intended,
+        "last_price_current": price_current,
+    }
+    _t = asyncio.create_task(_flush_skip_batch(http_client, batch_key))
+    _background_tasks.add(_t)
+    _t.add_done_callback(_background_tasks.discard)
+
+    # Build the skip message.
+    bar          = _score_bar(score)
+    detected_str = time.strftime("%H:%M:%S UTC", time.gmtime(created_at)) if created_at else "unknown"
+    attempted_str = time.strftime("%H:%M:%S UTC", time.gmtime(int(now)))
+    latency_s    = int(now - created_at) if created_at else 0
+
+    if price_intended is not None and price_current is not None and slippage_delta is not None:
+        price_line = (
+            f"\nPrice:  {price_intended*100:.0f}¢ → {price_current*100:.0f}¢"
+            f"  (moved {slippage_delta*100:.0f}¢, band {TRADING_SLIPPAGE_THRESHOLD*100:.0f}¢)"
+        )
+    else:
+        price_line = f"\nReason: {_html.escape(_skip_reason_plain(reason))}"
+
     text = (
-        "🔄 <b>Bot skipped this signal</b>\n"
-        f"{_html.escape(market_q[:60])}\n"
-        f"Score: {score}  •  Reason: {_skip_reason_plain(reason)}"
+        f"<b>— SKIP  ·  score {score}  {bar}</b>\n"
+        f"{_html.escape(market_q[:80])}\n"
+        f"\nDetected  <code>{detected_str}</code>\n"
+        f"Attempted <code>{attempted_str}</code>  (Δ {latency_s}s)"
+        f"{price_line}"
     )
     await _send_telegram(http_client, text)
 
@@ -668,9 +777,10 @@ async def _send_positions_summary(http_client: httpx.AsyncClient) -> None:
 # Risk check (state from Railway API)
 # ---------------------------------------------------------------------------
 
-def _compute_max_positions(bankroll: float, bet_size: float) -> int:
-    """Dynamic position cap = exposure budget / per-trade cost, clamped to [floor, NORMAL_MAX].
-    This is the safety floor for the normal tier; premium tier adds capacity above this."""
+def _compute_max_positions(bankroll: float, bet_size: float, open_positions: int = 0) -> int:
+    """Cap = existing open positions + how many new ones the free balance can fund.
+    Using open_positions in the formula means the cap grows as positions resolve and
+    the free balance rises — correctly reflecting real fundable capacity."""
     if bet_size <= 0:
         return TRADING_MAX_POSITIONS_FLOOR
     ceiling = (
@@ -678,7 +788,8 @@ def _compute_max_positions(bankroll: float, bet_size: float) -> int:
         if _legacy_max_positions_ceiling is not None
         else TRADING_NORMAL_POSITIONS_MAX
     )
-    raw = int((bankroll * TRADING_TARGET_EXPOSURE_PCT) / bet_size)
+    fundable_new = int((bankroll * TRADING_TARGET_EXPOSURE_PCT) / bet_size)
+    raw = open_positions + fundable_new
     return max(TRADING_MAX_POSITIONS_FLOOR, min(raw, ceiling))
 
 
@@ -1346,6 +1457,9 @@ async def _notify_trade_filled(
     score: int,
     slippage: Optional[float],
     market_url: Optional[str],
+    *,
+    alert_created_at: int = 0,
+    score_breakdown_json: Optional[str] = None,
 ) -> None:
     import html as _html
 
@@ -1354,33 +1468,40 @@ async def _notify_trade_filled(
     except Exception:
         remaining_balance = 0.0
 
-    profit_if_win = (size / fill_price) - size if fill_price and fill_price > 0 else 0.0
-    slip_str = f"{slippage * 100:.1f}%" if slippage is not None else "N/A"
-    safe_q = _html.escape(market_q[:120])
-    funder = TRADING_FUNDER_ADDRESS or _wallet_address
+    now             = int(time.time())
+    profit_if_win   = (size / fill_price) - size if fill_price and fill_price > 0 else 0.0
+    bar             = _score_bar(score)
+    safe_q          = _html.escape(market_q[:80])
+    safe_side       = _html.escape(bet_side)
+    funder          = TRADING_FUNDER_ADDRESS or _wallet_address
+    slip_str        = f"±{slippage*100:.1f}%" if slippage is not None else "N/A"
+    detected_str    = time.strftime("%H:%M:%S UTC", time.gmtime(alert_created_at)) if alert_created_at else "unknown"
+    latency_s       = now - alert_created_at if alert_created_at else 0
+    breakdown_block = _fmt_score_breakdown(score_breakdown_json)
 
-    market_line = (
-        f'🔮 <a href="{market_url}">View on Polymarket</a>\n'
-        if market_url else ""
+    links = []
+    if market_url:
+        links.append(f'<a href="{market_url}">Polymarket</a>')
+    links.append(f"<code>{funder[:14]}…</code>")
+    links.append(f'<a href="https://polygonscan.com/address/{funder}">Polygonscan</a>')
+    link_line = "  ·  ".join(links)
+
+    breakdown_section = (
+        f"\n<b>Signal breakdown</b>\n<code>{breakdown_block}</code>\n"
+        if breakdown_block else ""
     )
 
     text = (
-        "💰💰💰 <b>LIVE TRADE</b> 💰💰💰\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📋 <b>Market:</b> {safe_q}\n"
-        f"{market_line}\n"
-        f"🎯 <b>Bet:</b> {_html.escape(bet_side)} @ ${fill_price:.3f}\n"
-        f"💵 <b>Stake:</b> ${size:.2f} USDC\n"
-        f"💰 <b>Profit if win:</b> ${profit_if_win:.2f}\n"
-        f"📊 <b>Signal score:</b> {score}\n"
-        f"📉 <b>Slippage:</b> {slip_str}\n\n"
-        f"💼 <b>Bankroll remaining:</b> ${remaining_balance:.2f} USDC\n\n"
-        "🔍 <b>Verify on-chain:</b>\n"
-        f"Trading wallet: <code>{funder}</code>\n"
-        f'<a href="https://polygonscan.com/address/{funder}">View activity on Polygonscan</a>\n'
-        f'<a href="https://polymarket.com/profile/{funder}">View on Polymarket</a>\n\n'
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ <i>Automated trade. Not financial advice.</i>"
+        f"<b>TRADE  {score}  {bar}</b>\n"
+        f"{safe_q}\n"
+        f"\n<b>{safe_side}</b>  @  {fill_price*100:.0f}¢"
+        f"  ·  ${size:.2f}  →  <b>+${profit_if_win:.2f}</b> if won\n"
+        f"\nDetected  <code>{detected_str}</code>  (Δ {latency_s}s to trade)\n"
+        f"Slippage  {slip_str}\n"
+        f"Bankroll  ${remaining_balance:.2f}"
+        f"{breakdown_section}\n"
+        f"{link_line}\n"
+        "<i>Automated. Not financial advice.</i>"
     )
     await _send_telegram(http_client, text)
 
@@ -1754,7 +1875,12 @@ async def _execute_trade(
             )
         else:
             _alert_skip_cache[alert_id] = time.time() + _SKIP_DECISION_TTL_SECONDS
-            await _notify_skip(http_client, alert, "slippage")
+            await _notify_skip(
+                http_client, alert, "slippage",
+                price_intended=price_alert,
+                price_current=current_price,
+                slippage_delta=slippage,
+            )
             return
 
     fill_price: Optional[float] = None
@@ -1914,10 +2040,15 @@ async def _execute_trade(
     )
 
     if status in ("filled", "partial"):
+        if filled_size > 0:
+            global _session_avg_bet
+            _session_avg_bet = 0.9 * _session_avg_bet + 0.1 * filled_size
         await _notify_trade_filled(
             http_client, market_q, bet_side,
             fill_price or current_price or price_alert,
             filled_size, score, slippage, market_url,
+            alert_created_at=int(alert.get("created_at") or 0),
+            score_breakdown_json=alert.get("score_breakdown_json"),
         )
     else:
         await _notify_trade_error(
@@ -2087,7 +2218,7 @@ async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling, _current_tier, _cb_pnl_history, _cached_usdc_balance
+    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling, _current_tier, _cb_pnl_history, _cached_usdc_balance, _session_avg_bet
 
     if not RAILWAY_API_URL:
         log.critical("RAILWAY_API_URL is not set — exiting")
@@ -2230,27 +2361,24 @@ async def main() -> None:
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-                # Dynamic position cap — recompute every cycle from current bankroll + bet size.
-                # Use TRADING_SCORE_BASE_PCT (minimum pct) not the midpoint: overestimating
-                # bet size shrinks the cap, which can lock the bot in premium tier indefinitely.
+                # Dynamic position cap — recompute every cycle.
+                # Formula: open_positions + floor(free_balance / avg_bet).
+                # open_positions is already known (stats just fetched).
+                # _session_avg_bet is an EMA of actual fill sizes, so the cap
+                # directly reflects how many more orders the wallet can fund.
+                _open_now = stats.get("open_positions", 0)
                 _bankroll = max(_cached_usdc_balance, 0.0)
-                _est_bet = (
-                    max(TRADING_MIN_BET_USDC, min(TRADING_MAX_BET_USDC, _bankroll * TRADING_SCORE_BASE_PCT))
-                    if _bankroll > 0 else TRADING_BET_SIZE_USDC
-                )
-                new_cap = _compute_max_positions(_bankroll, _est_bet)
+                _est_bet  = max(TRADING_MIN_BET_USDC, _session_avg_bet)
+                new_cap = _compute_max_positions(_bankroll, _est_bet, open_positions=_open_now)
                 if new_cap != _current_max_positions:
                     log.info(
-                        "[Trader] Max positions: %d → %d (bankroll $%.2f, bet $%.2f, exposure %.0f%%)",
-                        _current_max_positions, new_cap, _bankroll, _est_bet,
+                        "[Trader] Max positions: %d → %d (open=%d free=$%.2f avg_bet=$%.2f exposure=%.0f%%)",
+                        _current_max_positions, new_cap, _open_now, _bankroll, _est_bet,
                         TRADING_TARGET_EXPOSURE_PCT * 100,
                     )
                     if _current_max_positions > 0 and abs(new_cap - _current_max_positions) >= 5:
                         await _notify_cap_change(http_client, _current_max_positions, new_cap, _bankroll, _est_bet)
                     _current_max_positions = new_cap
-
-                # Per-cycle tier state log + transition notification
-                _open_now = stats.get("open_positions", 0)
                 _tier_now = _get_tier(_open_now, _current_tier)
                 _eff_normal = min(_current_max_positions, TRADING_NORMAL_POSITIONS_MAX)
                 if _tier_now == "normal":
