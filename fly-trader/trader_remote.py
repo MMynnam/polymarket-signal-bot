@@ -121,6 +121,16 @@ TRADING_DYNAMIC_SLIPPAGE_ENABLED: bool = os.getenv("TRADING_DYNAMIC_SLIPPAGE_ENA
 TRADING_SLIPPAGE_MAX_EXPANSION: float = float(os.getenv("TRADING_SLIPPAGE_MAX_EXPANSION", "0.03"))
 TRADING_MAX_ENTRY_PRICE: float = float(os.getenv("TRADING_MAX_ENTRY_PRICE", "0.85"))
 
+# Confidence-weighted position sizing — bet size scales linearly with score.
+# At score=TRADING_MIN_SCORE: TRADING_SCORE_BASE_PCT of bankroll.
+# At score=TRADING_SCORE_CEILING (and above): TRADING_MAX_PCT_PER_TRADE of bankroll.
+TRADING_SCORE_BASE_PCT: float = float(os.getenv("TRADING_SCORE_BASE_PCT", "0.010"))
+TRADING_MAX_PCT_PER_TRADE: float = float(os.getenv("TRADING_MAX_PCT_PER_TRADE", "0.040"))
+TRADING_SCORE_CEILING: int = int(os.getenv("TRADING_SCORE_CEILING", "90"))
+
+# Hard minimum bankroll for vault sweep — effective floor = max(this, VAULT_SWEEP_FLOOR_USDC).
+VAULT_BANKROLL_FLOOR_USDC: float = float(os.getenv("VAULT_BANKROLL_FLOOR_USDC", "80.0"))
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -403,10 +413,14 @@ def _get_matic_balance_sync() -> float:
 # Dynamic position sizing
 # ---------------------------------------------------------------------------
 
-async def _calculate_bet_size(http_client: httpx.AsyncClient, stats: dict) -> float:
+async def _calculate_bet_size(http_client: httpx.AsyncClient, stats: dict, score: int = 0) -> float:
     """
     Three-state auto-graduating bet size using stats from the Railway API.
-    WARMUP → FIXED (circuit breaker) → DYNAMIC (balance × percentage).
+    WARMUP → FIXED → DYNAMIC (balance × score-weighted percentage).
+
+    Dynamic pct scales linearly from TRADING_SCORE_BASE_PCT at score=TRADING_MIN_SCORE
+    to TRADING_MAX_PCT_PER_TRADE at score=TRADING_SCORE_CEILING, then flat above.
+    Result is clamped to [TRADING_MIN_BET_USDC, TRADING_MAX_BET_USDC].
     """
     global _graduation_notified
 
@@ -427,19 +441,22 @@ async def _calculate_bet_size(http_client: httpx.AsyncClient, stats: dict) -> fl
         )
         return TRADING_BET_SIZE_USDC
 
-    # DYNAMIC
+    # DYNAMIC — score-weighted linear ramp
     try:
         balance = await _get_usdc_balance()
     except Exception as exc:
         log.warning("[Sizing] USDC balance fetch failed: %s — fixed $%.2f", exc, TRADING_BET_SIZE_USDC)
         return TRADING_BET_SIZE_USDC
 
-    raw_size = balance * TRADING_BET_PERCENTAGE
+    score_range = max(1, TRADING_SCORE_CEILING - TRADING_MIN_SCORE)
+    score_excess = max(0, min(score - TRADING_MIN_SCORE, score_range))
+    pct = TRADING_SCORE_BASE_PCT + score_excess * (TRADING_MAX_PCT_PER_TRADE - TRADING_SCORE_BASE_PCT) / score_range
+    raw_size = balance * pct
     clamped = max(TRADING_MIN_BET_USDC, min(TRADING_MAX_BET_USDC, raw_size))
 
     log.info(
-        "[Sizing] Dynamic: $%.2f × %.1f%% = $%.2f",
-        balance, TRADING_BET_PERCENTAGE * 100, clamped,
+        "[Sizing] Dynamic: score=%d pct=%.2f%% $%.2f × %.2f%% = $%.2f (clamp [$%.2f, $%.2f])",
+        score, pct * 100, balance, pct * 100, clamped, TRADING_MIN_BET_USDC, TRADING_MAX_BET_USDC,
     )
 
     if not _graduation_notified:
@@ -1095,11 +1112,12 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
                 actual_amount   = VAULT_SWEEP_TEST_AMOUNT_USDC
                 intended_amount = VAULT_SWEEP_TEST_AMOUNT_USDC
             else:
-                available = balance - VAULT_SWEEP_FLOOR_USDC
+                _p3_floor = max(VAULT_SWEEP_FLOOR_USDC, VAULT_BANKROLL_FLOOR_USDC)
+                available = balance - _p3_floor
                 if available <= 0:
                     log.warning(
                         "[Vault] Balance $%.2f dropped below floor $%.2f during timelock — cancelling",
-                        balance, VAULT_SWEEP_FLOOR_USDC,
+                        balance, _p3_floor,
                     )
                     try:
                         await asyncio.to_thread(_unpause_deposit_wallet_sync)
@@ -1243,7 +1261,8 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
         log.warning("[Vault] MATIC check failed: %s — skipping sweep", exc)
         return
 
-    intended_amount = VAULT_SWEEP_TEST_AMOUNT_USDC if is_test else (balance - VAULT_SWEEP_FLOOR_USDC)
+    _effective_floor = max(VAULT_SWEEP_FLOOR_USDC, VAULT_BANKROLL_FLOOR_USDC)
+    intended_amount = VAULT_SWEEP_TEST_AMOUNT_USDC if is_test else (balance - _effective_floor)
     if intended_amount <= 0:
         _sweep_last_date = today
         log.info("[Vault] Intended sweep amount $%.2f <= 0 — skip", intended_amount)
@@ -1363,8 +1382,8 @@ async def _notify_graduation(
         "The bot has graduated to dynamic position sizing.\n"
         f"✅ {resolved} trades resolved\n"
         f"✅ Cumulative P&amp;L: +${pnl:.2f}\n"
-        f"📊 Now sizing at {TRADING_BET_PERCENTAGE * 100:.1f}% of bankroll per trade\n\n"
-        "<i>Bet sizes will scale with performance.</i>"
+        f"📊 Now sizing at {TRADING_SCORE_BASE_PCT * 100:.1f}–{TRADING_MAX_PCT_PER_TRADE * 100:.1f}% of bankroll, scaled by signal score\n\n"
+        "<i>Bet sizes scale with signal confidence.</i>"
     )
     await _send_telegram(http_client, text)
 
@@ -1661,7 +1680,7 @@ async def _execute_trade(
     if _alert_skip_cache.get(alert_id, 0) > time.time():
         return
 
-    bet_size = await _calculate_bet_size(http_client, stats)
+    bet_size = await _calculate_bet_size(http_client, stats, score=score)
 
     # Current ask price for slippage measurement
     current_price: Optional[float] = price_alert
@@ -2159,8 +2178,9 @@ async def main() -> None:
 
                 # Dynamic position cap — recompute every cycle from current bankroll + bet size
                 _bankroll = max(_cached_usdc_balance, 0.0)
+                _mid_pct = (TRADING_SCORE_BASE_PCT + TRADING_MAX_PCT_PER_TRADE) / 2
                 _est_bet = (
-                    max(TRADING_MIN_BET_USDC, min(TRADING_MAX_BET_USDC, _bankroll * TRADING_BET_PERCENTAGE))
+                    max(TRADING_MIN_BET_USDC, min(TRADING_MAX_BET_USDC, _bankroll * _mid_pct))
                     if _bankroll > 0 else TRADING_BET_SIZE_USDC
                 )
                 new_cap = _compute_max_positions(_bankroll, _est_bet)
