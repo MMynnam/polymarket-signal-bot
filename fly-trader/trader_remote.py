@@ -2230,11 +2230,12 @@ async def main() -> None:
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-                # Dynamic position cap — recompute every cycle from current bankroll + bet size
+                # Dynamic position cap — recompute every cycle from current bankroll + bet size.
+                # Use TRADING_SCORE_BASE_PCT (minimum pct) not the midpoint: overestimating
+                # bet size shrinks the cap, which can lock the bot in premium tier indefinitely.
                 _bankroll = max(_cached_usdc_balance, 0.0)
-                _mid_pct = (TRADING_SCORE_BASE_PCT + TRADING_MAX_PCT_PER_TRADE) / 2
                 _est_bet = (
-                    max(TRADING_MIN_BET_USDC, min(TRADING_MAX_BET_USDC, _bankroll * _mid_pct))
+                    max(TRADING_MIN_BET_USDC, min(TRADING_MAX_BET_USDC, _bankroll * TRADING_SCORE_BASE_PCT))
                     if _bankroll > 0 else TRADING_BET_SIZE_USDC
                 )
                 new_cap = _compute_max_positions(_bankroll, _est_bet)
