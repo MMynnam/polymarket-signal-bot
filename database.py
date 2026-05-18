@@ -171,6 +171,44 @@ CREATE TABLE IF NOT EXISTS vault_sweeps (
 );
 
 -- ------------------------------------------------------------------
+-- skip_telemetry: every slippage-skip event with shadow counterfactual.
+-- Keyed by alert_id (UNIQUE) — one row per alert that was skipped for
+-- slippage. Populated by the Fly trader via POST /api/skips/telemetry.
+-- shadow_resolution_status mirrors alert_outcomes.resolution_status and
+-- is updated by resolve_shadow_position() when the market resolves.
+-- gate_outcome ∈ {would_have_traded, rejected_expansion_bound,
+--                 rejected_price_ceiling}
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS skip_telemetry (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id                 TEXT NOT NULL,
+    recorded_at              INTEGER NOT NULL,
+    market_id                TEXT NOT NULL,
+    market_question          TEXT NOT NULL DEFAULT '',
+    bet_side                 TEXT NOT NULL DEFAULT '',
+    score                    INTEGER NOT NULL DEFAULT 0,
+    market_type              TEXT DEFAULT '',
+    price_intended           REAL NOT NULL,
+    price_current            REAL NOT NULL,
+    price_delta_abs          REAL NOT NULL,
+    price_delta_frac         REAL NOT NULL,
+    static_threshold         REAL NOT NULL,
+    gate_outcome             TEXT NOT NULL,
+    shadow_entry_price       REAL,
+    shadow_size_usdc         REAL,
+    shadow_resolution_status TEXT NOT NULL DEFAULT 'pending',
+    shadow_roi               REAL,
+    shadow_resolved_at       INTEGER,
+    UNIQUE(alert_id)
+);
+CREATE INDEX IF NOT EXISTS idx_skip_telemetry_recorded
+    ON skip_telemetry(recorded_at);
+CREATE INDEX IF NOT EXISTS idx_skip_telemetry_gate
+    ON skip_telemetry(gate_outcome);
+CREATE INDEX IF NOT EXISTS idx_skip_telemetry_shadow_status
+    ON skip_telemetry(shadow_resolution_status);
+
+-- ------------------------------------------------------------------
 -- schema_version: simple migration tracking
 -- ------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -178,7 +216,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_SCHEMA_VERSION = 8
+_CURRENT_SCHEMA_VERSION = 9
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -350,6 +388,13 @@ def _apply_migrations() -> None:
         db.commit()
         log.info("Migration 8: invalidated %d stale wallet_profiles cache entries",
                  db.execute("SELECT COUNT(*) FROM wallet_profiles").fetchone()[0])
+
+    if current < 9:
+        # Version 9 — skip_telemetry table (created via _SCHEMA_SQL above).
+        # No ALTER needed; the table and its indexes are new.
+        db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(9)")
+        db.commit()
+        log.info("Applied schema migration → version 9 (skip_telemetry)")
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +761,7 @@ def update_outcome_resolution(
     """
     Update a pending outcome row once the market has resolved.
     `status` must be one of: resolved_won, resolved_lost, resolved_invalid.
+    Also resolves any matching skip_telemetry shadow row (non-fatal).
     """
     with transaction() as db:
         db.execute(
@@ -730,6 +776,102 @@ def update_outcome_resolution(
             """,
             (status, winning_outcome, roi, resolved_at,
              resolution_latency_hours, alert_id),
+        )
+    try:
+        resolve_shadow_position(alert_id, winning_outcome, status, resolved_at)
+    except Exception as exc:
+        log.debug("[shadow] resolve_shadow_position failed for %s (non-fatal): %s", alert_id, exc)
+
+
+def insert_skip_telemetry(
+    alert_id: str,
+    market_id: str,
+    market_question: str,
+    bet_side: str,
+    score: int,
+    market_type: str,
+    price_intended: float,
+    price_current: float,
+    price_delta_abs: float,
+    price_delta_frac: float,
+    static_threshold: float,
+    gate_outcome: str,
+    shadow_entry_price: Optional[float] = None,
+    shadow_size_usdc: Optional[float] = None,
+) -> None:
+    """
+    Record a slippage-skip event. INSERT OR IGNORE on alert_id — idempotent
+    if the trader retries the telemetry POST.
+    """
+    now = int(time.time())
+    with transaction() as db:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO skip_telemetry (
+                alert_id, recorded_at, market_id, market_question,
+                bet_side, score, market_type,
+                price_intended, price_current, price_delta_abs, price_delta_frac,
+                static_threshold, gate_outcome,
+                shadow_entry_price, shadow_size_usdc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                alert_id, now, market_id, market_question,
+                bet_side, score, market_type,
+                price_intended, price_current, price_delta_abs, price_delta_frac,
+                static_threshold, gate_outcome,
+                shadow_entry_price, shadow_size_usdc,
+            ),
+        )
+
+
+def resolve_shadow_position(
+    alert_id: str,
+    winning_outcome: Optional[str],
+    base_status: str,
+    resolved_at: int,
+) -> None:
+    """
+    Compute and persist the shadow ROI for a skip_telemetry row.
+
+    Called from update_outcome_resolution() after the real alert_outcomes
+    row is updated. No-ops silently if no skip_telemetry row exists for
+    this alert_id (the common case — most alerts are not slippage-skips).
+
+    Shadow ROI formula (mirrors alert_outcomes convention):
+      resolved_won  → shadow_roi = (1 - shadow_entry_price) / shadow_entry_price
+      resolved_lost → shadow_roi = -1.0
+      resolved_invalid → shadow_roi = 0.0
+    """
+    db = get_db()
+    row = db.execute(
+        "SELECT shadow_entry_price FROM skip_telemetry WHERE alert_id = ?",
+        (alert_id,),
+    ).fetchone()
+    if row is None:
+        return  # No skip_telemetry row for this alert — normal case
+
+    entry = row[0]  # may be None if shadow_entry_price was not recorded
+
+    if base_status == "resolved_won" and entry is not None and entry > 0:
+        shadow_roi: Optional[float] = (1.0 - entry) / entry
+    elif base_status == "resolved_lost":
+        shadow_roi = -1.0
+    elif base_status == "resolved_invalid":
+        shadow_roi = 0.0
+    else:
+        shadow_roi = None
+
+    with transaction() as db2:
+        db2.execute(
+            """
+            UPDATE skip_telemetry
+            SET shadow_resolution_status = ?,
+                shadow_roi               = ?,
+                shadow_resolved_at       = ?
+            WHERE alert_id = ?
+            """,
+            (base_status, shadow_roi, resolved_at, alert_id),
         )
 
 

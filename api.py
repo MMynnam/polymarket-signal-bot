@@ -11,6 +11,7 @@ Endpoints:
   GET  /api/positions/open               — currently open (filled, unresolved) positions
   GET  /api/stats/vault                  — vault sweep history (count, total, last timestamp)
   PATCH /api/trades/{alert_id}/resolution — remote trader reports a resolution
+  POST /api/skips/telemetry              — record a slippage-skip event with shadow counterfactual
 
 Authentication: every request must include X-API-Key matching API_SECRET_KEY.
 Fail-closed: if API_SECRET_KEY is empty, all requests are refused with 403.
@@ -68,6 +69,23 @@ class TradeResolutionUpdate(BaseModel):
     resolution_status: str   # won | lost | invalid
     pnl: float
     resolved_at: int
+
+
+class SkipTelemetryReport(BaseModel):
+    alert_id: str
+    market_id: str
+    market_question: str
+    bet_side: str
+    score: int
+    market_type: str
+    price_intended: float
+    price_current: float
+    price_delta_abs: float
+    price_delta_frac: float
+    static_threshold: float
+    gate_outcome: str          # would_have_traded | rejected_expansion_bound | rejected_price_ceiling
+    shadow_entry_price: Optional[float] = None
+    shadow_size_usdc: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -254,3 +272,45 @@ def update_trade_resolution(
     except Exception as exc:
         log.error("[API] update_trade_resolution failed: %s", exc, exc_info=True)
         return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/skips/telemetry")
+def post_skip_telemetry(
+    body: SkipTelemetryReport,
+    _key: None = Depends(_verify_api_key),
+):
+    """
+    Called by the Fly trader when a slippage-skip occurs (flag on or off).
+    Idempotent — duplicate POSTs for the same alert_id are silently ignored.
+    """
+    valid_outcomes = {"would_have_traded", "rejected_expansion_bound", "rejected_price_ceiling"}
+    if body.gate_outcome not in valid_outcomes:
+        raise HTTPException(
+            status_code=422,
+            detail=f"gate_outcome must be one of {valid_outcomes}",
+        )
+    try:
+        database.insert_skip_telemetry(
+            alert_id=body.alert_id,
+            market_id=body.market_id,
+            market_question=body.market_question,
+            bet_side=body.bet_side,
+            score=body.score,
+            market_type=body.market_type,
+            price_intended=body.price_intended,
+            price_current=body.price_current,
+            price_delta_abs=body.price_delta_abs,
+            price_delta_frac=body.price_delta_frac,
+            static_threshold=body.static_threshold,
+            gate_outcome=body.gate_outcome,
+            shadow_entry_price=body.shadow_entry_price,
+            shadow_size_usdc=body.shadow_size_usdc,
+        )
+        log.info(
+            "[API] Skip telemetry recorded: alert=%s gate=%s delta=%.3f",
+            body.alert_id[:12], body.gate_outcome, body.price_delta_abs,
+        )
+        return {"ok": True}
+    except Exception as exc:
+        log.error("[API] post_skip_telemetry failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Database error")
