@@ -153,6 +153,8 @@ _cached_usdc_balance: float = -1.0  # -1 = not yet fetched
 _RESOLUTION_POLL_INTERVAL: int = 600
 _skip_notified: set[tuple[str, str]] = set()  # (alert_id, reason_key); one notification per alert per lifetime
 _alert_skip_cache: dict[str, float] = {}  # alert_id -> expiry timestamp; avoids re-evaluating
+# Strong references to background telemetry tasks — prevents GC before completion.
+_background_tasks: set[asyncio.Task] = set()
 _SKIP_DECISION_TTL_SECONDS: int = 300     # 5 min: re-evaluate after price may have stabilised
 _sweep_state: str = "idle"      # idle | pause_pending | pause_ready
 _sweep_paused_at: float = 0.0
@@ -544,9 +546,13 @@ async def _post_skip_telemetry(
             "shadow_entry_price": shadow_entry,
             "shadow_size_usdc":  shadow_size_usdc if gate_outcome == "would_have_traded" else None,
         }
-        await _api_post(http_client, "/api/skips/telemetry", payload)
+        result = await _api_post(http_client, "/api/skips/telemetry", payload)
+        if result is None:
+            log.warning("[Shadow] skip telemetry POST failed for alert %s (pipeline may be broken)",
+                        payload.get("alert_id", "")[:12])
     except Exception as exc:
-        log.debug("[Shadow] _post_skip_telemetry failed (non-fatal): %s", exc)
+        log.warning("[Shadow] _post_skip_telemetry exception for alert %s: %s",
+                    alert.get("alert_id", "")[:12], exc)
 
 
 async def _notify_skip(
@@ -1678,9 +1684,11 @@ async def _execute_trade(
         _gate_outcome: Optional[str] = None
         try:
             _gate_outcome = _evaluate_dynamic_gate(price_alert, current_price, slippage)
-            asyncio.create_task(
+            _t = asyncio.create_task(
                 _post_skip_telemetry(http_client, alert, slippage, current_price, _gate_outcome, bet_size)
             )
+            _background_tasks.add(_t)
+            _t.add_done_callback(_background_tasks.discard)
         except Exception as _exc:
             log.debug("[Shadow] Gate/telemetry error (non-fatal): %s", _exc)
 
