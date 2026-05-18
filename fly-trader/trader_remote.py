@@ -114,6 +114,13 @@ TRADING_CHAIN_ID: int = 137
 TRADING_SIGNATURE_TYPE: int = int(os.getenv("TRADING_SIGNATURE_TYPE", "0"))
 TRADING_FUNDER_ADDRESS: str = os.getenv("TRADING_FUNDER_ADDRESS", "")
 
+# Dynamic slippage gate — default OFF (observation-only until May 31 decision).
+# With TRADING_DYNAMIC_SLIPPAGE_ENABLED=false, trading is byte-identical to today.
+TRADING_SLIPPAGE_THRESHOLD: float = float(os.getenv("TRADING_SLIPPAGE_THRESHOLD", "0.05"))
+TRADING_DYNAMIC_SLIPPAGE_ENABLED: bool = os.getenv("TRADING_DYNAMIC_SLIPPAGE_ENABLED", "false").lower() == "true"
+TRADING_SLIPPAGE_MAX_EXPANSION: float = float(os.getenv("TRADING_SLIPPAGE_MAX_EXPANSION", "0.03"))
+TRADING_MAX_ENTRY_PRICE: float = float(os.getenv("TRADING_MAX_ENTRY_PRICE", "0.85"))
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -479,6 +486,67 @@ def _skip_reason_plain(reason: str) -> str:
     if "already" in r:
         return "already holding a position on this market"
     return reason[:80]
+
+
+def _evaluate_dynamic_gate(
+    price_intended: float,
+    price_current: float,
+    slippage: float,
+) -> str:
+    """
+    Pure function: classify whether the dynamic gate would allow trading.
+    Returns one of:
+      would_have_traded          — within expanded tolerance AND below price ceiling
+      rejected_expansion_bound   — slippage > threshold + max_expansion
+      rejected_price_ceiling     — within expansion but entry price > max entry ceiling
+    Always called; gate_outcome is used for telemetry regardless of flag state.
+    """
+    expanded_limit = TRADING_SLIPPAGE_THRESHOLD + TRADING_SLIPPAGE_MAX_EXPANSION
+    if slippage > expanded_limit:
+        return "rejected_expansion_bound"
+    if price_current > TRADING_MAX_ENTRY_PRICE:
+        return "rejected_price_ceiling"
+    return "would_have_traded"
+
+
+async def _post_skip_telemetry(
+    http_client: httpx.AsyncClient,
+    alert: dict,
+    slippage: float,
+    price_current: float,
+    gate_outcome: str,
+    shadow_size_usdc: Optional[float],
+) -> None:
+    """
+    Fire-and-forget: POST skip telemetry to Railway. Exception-isolated.
+    Never called from the hot path in a way that blocks the trade decision.
+    """
+    try:
+        price_intended: float = alert.get("bet_price_at_alert") or price_current
+        price_delta_abs: float = slippage
+        price_delta_frac: float = (
+            slippage / price_intended if price_intended > 0 else 0.0
+        )
+        shadow_entry = price_current if gate_outcome == "would_have_traded" else None
+        payload = {
+            "alert_id":        alert.get("alert_id", ""),
+            "market_id":       alert.get("market_id", ""),
+            "market_question": (alert.get("market_question") or "")[:120],
+            "bet_side":        alert.get("bet_side", ""),
+            "score":           alert.get("score", 0),
+            "market_type":     alert.get("market_type", ""),
+            "price_intended":  price_intended,
+            "price_current":   price_current,
+            "price_delta_abs": price_delta_abs,
+            "price_delta_frac": price_delta_frac,
+            "static_threshold": TRADING_SLIPPAGE_THRESHOLD,
+            "gate_outcome":    gate_outcome,
+            "shadow_entry_price": shadow_entry,
+            "shadow_size_usdc":  shadow_size_usdc if gate_outcome == "would_have_traded" else None,
+        }
+        await _api_post(http_client, "/api/skips/telemetry", payload)
+    except Exception as exc:
+        log.debug("[Shadow] _post_skip_telemetry failed (non-fatal): %s", exc)
 
 
 async def _notify_skip(
@@ -1602,14 +1670,33 @@ async def _execute_trade(
 
     slippage = abs(current_price - price_alert) if current_price is not None else None
 
-    if slippage is not None and slippage > 0.05:
+    if slippage is not None and slippage > TRADING_SLIPPAGE_THRESHOLD:
         log.warning(
-            "[Trade] High slippage for alert %s: intended=%.3f current=%.3f — skipping",
-            alert_id[:12], price_alert, current_price,
+            "[Trade] High slippage for alert %s: intended=%.3f current=%.3f delta=%.3f",
+            alert_id[:12], price_alert, current_price, slippage,
         )
-        _alert_skip_cache[alert_id] = time.time() + _SKIP_DECISION_TTL_SECONDS
-        await _notify_skip(http_client, alert, "slippage")
-        return
+        _gate_outcome: Optional[str] = None
+        try:
+            _gate_outcome = _evaluate_dynamic_gate(price_alert, current_price, slippage)
+            asyncio.create_task(
+                _post_skip_telemetry(http_client, alert, slippage, current_price, _gate_outcome, bet_size)
+            )
+        except Exception as _exc:
+            log.debug("[Shadow] Gate/telemetry error (non-fatal): %s", _exc)
+
+        _will_trade_expanded = (
+            TRADING_DYNAMIC_SLIPPAGE_ENABLED and _gate_outcome == "would_have_traded"
+        )
+
+        if _will_trade_expanded:
+            log.info(
+                "[Trade] Dynamic gate PASS for alert %s: current=%.3f within expanded tolerance",
+                alert_id[:12], current_price,
+            )
+        else:
+            _alert_skip_cache[alert_id] = time.time() + _SKIP_DECISION_TTL_SECONDS
+            await _notify_skip(http_client, alert, "slippage")
+            return
 
     fill_price: Optional[float] = None
     order_id:   Optional[str]   = None
