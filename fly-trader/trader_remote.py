@@ -1743,12 +1743,17 @@ async def _execute_trade(
                   token_id[:16], neg_risk, TRADING_SIGNATURE_TYPE,
                   TRADING_FUNDER_ADDRESS[:10] + "..." if TRADING_FUNDER_ADDRESS else "self")
 
-        order = MarketOrderArgs(token_id=token_id, amount=bet_size, side=Side.BUY)
+        # FAK: fills available liquidity, kills remainder — eliminates FOK "no match" on thin books.
+        # order_type must be set on BOTH MarketOrderArgs (for price calculation) and the call
+        # (for what's posted to the exchange).
+        order = MarketOrderArgs(token_id=token_id, amount=bet_size, side=Side.BUY,
+                                order_type=OrderType.FAK)
         options = PartialCreateOrderOptions(neg_risk=neg_risk)
         resp = await asyncio.to_thread(
-            clob_client.create_and_post_market_order, order, options
+            clob_client.create_and_post_market_order, order, options, OrderType.FAK
         )
 
+        filled_size = bet_size  # default; overridden below for confirmed partial fills
         if isinstance(resp, dict):
             success = resp.get("success", False)
             error_msg = resp.get("errorMsg") or None
@@ -1756,10 +1761,45 @@ async def _execute_trade(
             resp_status = (resp.get("status") or "").lower()
 
             if success or resp_status == "matched":
-                status = "filled"
                 fill_price = float(
                     resp.get("price") or resp.get("avgPrice") or current_price or price_alert
                 )
+                # Query order detail to get the actual USDC matched (may be < bet_size for FAK).
+                # Polymarket REST returns size_matched in USDC float, not micro-units.
+                if order_id:
+                    try:
+                        order_detail = await asyncio.to_thread(clob_client.get_order, order_id)
+                        if isinstance(order_detail, dict):
+                            raw_matched = (
+                                order_detail.get("size_matched")
+                                or order_detail.get("sizeMatched")
+                                or order_detail.get("matched_amount")
+                            )
+                            if raw_matched is not None:
+                                filled_size = float(raw_matched)
+                            else:
+                                log.warning(
+                                    "[Trade] FAK %s: get_order missing size_matched — "
+                                    "recording intended $%.2f. resp=%s",
+                                    alert_id[:12], bet_size, order_detail,
+                                )
+                    except Exception as _ge:
+                        log.warning(
+                            "[Trade] FAK %s: get_order failed (%s) — recording intended $%.2f",
+                            alert_id[:12], _ge, bet_size,
+                        )
+
+                if filled_size >= bet_size * 0.99:
+                    status = "filled"
+                elif filled_size > 0:
+                    status = "partial"
+                    log.info(
+                        "[Trade] FAK partial fill %s: $%.2f / $%.2f USDC @ %.4f",
+                        alert_id[:12], filled_size, bet_size, fill_price,
+                    )
+                else:
+                    status = "rejected"
+                    error_msg = "FAK matched but size_matched=0"
             else:
                 status = "rejected"
                 if not error_msg:
@@ -1777,7 +1817,8 @@ async def _execute_trade(
         error_msg = str(exc)
         log.error("[Trade] Unexpected error for alert %s: %s", alert_id[:12], exc, exc_info=True)
 
-    # Report to Railway
+    # Report to Railway — size_usdc is the actual filled amount, not the intended size.
+    # _check_pending_resolutions reads size_usdc for P&L; recording it correctly keeps CB accurate.
     await _api_post(http_client, "/api/trades", {
         "alert_id":           alert_id,
         "market_id":          market_id,
@@ -1787,7 +1828,7 @@ async def _execute_trade(
         "bet_price_intended": price_alert,
         "bet_price_filled":   fill_price,
         "slippage":           slippage,
-        "size_usdc":          bet_size,
+        "size_usdc":          filled_size,
         "order_id":           order_id,
         "status":             status,
         "error_message":      error_msg,
@@ -1795,15 +1836,15 @@ async def _execute_trade(
 
     log.info(
         "[Trade] %s | %s | side=%s | $%.2f | %s | fill=%s",
-        alert_id[:12], market_q[:40], bet_side, bet_size, status,
+        alert_id[:12], market_q[:40], bet_side, filled_size, status,
         f"{fill_price:.4f}" if fill_price else "N/A",
     )
 
-    if status == "filled":
+    if status in ("filled", "partial"):
         await _notify_trade_filled(
             http_client, market_q, bet_side,
             fill_price or current_price or price_alert,
-            bet_size, score, slippage, market_url,
+            filled_size, score, slippage, market_url,
         )
     else:
         await _notify_trade_error(
@@ -1893,10 +1934,11 @@ async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
     if not isinstance(data, list):
         return
 
-    # Positions that are filled and won, not yet redeemed this session
+    # Positions that are filled (or partially filled) and won, not yet redeemed this session.
+    # "partial" included so FAK partial-fill wins reach the safety-net CTF redemption.
     redeemable = [
         t for t in data
-        if t.get("status") == "filled"
+        if t.get("status") in ("filled", "partial")
         and t.get("alert_resolution_status") == "resolved_won"
         and t.get("alert_id") not in _redeemed_positions
         and t.get("market_id")
