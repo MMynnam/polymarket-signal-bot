@@ -274,6 +274,46 @@ def update_trade_resolution(
         return {"ok": False, "error": str(exc)}
 
 
+@app.get("/api/diag/surface-gate")
+def diag_surface_gate(_key: None = Depends(_verify_api_key)):
+    """Temporary diagnostic: surface-gate data for cursor-init + dedup sizing. Remove after use."""
+    REGIME_C_START = 1778728669
+    db = database.get_db()
+    # Q1: latency — alert signal_ts vs execution attempt_ts
+    latency_rows = db.execute("""
+        SELECT ao.alert_id, ao.created_at AS signal_ts, te.created_at AS attempt_ts,
+               te.created_at - ao.created_at AS latency_s,
+               te.market_id, te.bet_side, te.status, te.resolution_status
+        FROM alert_outcomes ao
+        JOIN trade_executions te ON te.alert_id = ao.alert_id
+        WHERE ao.created_at >= ?
+        ORDER BY latency_s DESC
+    """, (REGIME_C_START,)).fetchall()
+    # Q2: all resolved filled trades for dup analysis
+    dup_rows = db.execute("""
+        SELECT te.alert_id, te.market_id, te.bet_side, te.size_usdc, te.pnl,
+               te.resolution_status, te.created_at AS attempt_ts,
+               ao.created_at AS signal_ts, ao.score
+        FROM trade_executions te
+        JOIN alert_outcomes ao ON ao.alert_id = te.alert_id
+        WHERE ao.created_at >= ?
+          AND te.status = 'filled'
+          AND te.resolution_status IN ('won', 'lost')
+        ORDER BY te.market_id, te.bet_side, te.created_at ASC
+    """, (REGIME_C_START,)).fetchall()
+    # Q3: alert timestamp gaps for deploy-downtime sizing
+    gap_rows = db.execute("""
+        SELECT created_at FROM alert_outcomes
+        WHERE created_at >= ?
+        ORDER BY created_at ASC
+    """, (REGIME_C_START,)).fetchall()
+    return {
+        "latency": [dict(r) for r in latency_rows],
+        "dup_trades": [dict(r) for r in dup_rows],
+        "alert_timestamps": [r[0] for r in gap_rows],
+    }
+
+
 @app.post("/api/skips/telemetry")
 def post_skip_telemetry(
     body: SkipTelemetryReport,
