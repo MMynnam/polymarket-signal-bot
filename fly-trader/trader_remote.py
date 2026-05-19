@@ -181,6 +181,8 @@ _sweep_last_date: str = ""          # "YYYY-MM-DD" UTC; prevents double-firing o
 _current_max_positions: int = TRADING_MAX_CONCURRENT_POSITIONS  # updated each cycle by _compute_max_positions
 _legacy_max_positions_ceiling: Optional[int] = None  # set at startup if old env var is detected
 _current_tier: str = "normal"  # "normal" | "premium" | "hardcap"; drives transition notifications
+_held_positions: set[tuple[str, str]] = set()  # (market_id, bet_side); per-market dedup
+_held_positions_seeded: bool = False  # False until startup seed succeeds
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -2044,6 +2046,10 @@ async def _execute_trade(
         if filled_size > 0:
             global _session_avg_bet
             _session_avg_bet = 0.9 * _session_avg_bet + 0.1 * filled_size
+        # Track held position for per-market/side dedup.
+        if market_id and bet_side:
+            _held_positions.add((market_id, bet_side))
+            log.debug("[Dedup] Added (%s, %s) to _held_positions", market_id[:16], bet_side)
         await _notify_trade_filled(
             http_client, market_q, bet_side,
             fill_price or current_price or price_alert,
@@ -2055,6 +2061,42 @@ async def _execute_trade(
         await _notify_trade_error(
             http_client, market_q, bet_side, price_alert, score, status, error_msg,
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-market/side dedup — startup seed
+# ---------------------------------------------------------------------------
+
+async def _seed_held_positions(http_client: httpx.AsyncClient) -> None:
+    """
+    Seed _held_positions from /api/positions/open with retry + backoff.
+    Must complete before the poll loop processes any alert.
+    On persistent failure, dedup stays inactive (_held_positions_seeded=False)
+    and a recurring WARNING is emitted each cycle until a restart recovers it.
+    """
+    global _held_positions, _held_positions_seeded
+    for attempt in range(5):
+        try:
+            positions = await _api_get(http_client, "/api/positions/open")
+            if isinstance(positions, list):
+                _held_positions = {
+                    (p["market_id"], p["bet_side"])
+                    for p in positions
+                    if p.get("market_id") and p.get("bet_side")
+                }
+                _held_positions_seeded = True
+                log.info(
+                    "[Dedup] Seeded _held_positions: %d open positions",
+                    len(_held_positions),
+                )
+                return
+        except Exception as exc:
+            log.warning("[Dedup] Seed attempt %d/5 failed: %s", attempt + 1, exc)
+        await asyncio.sleep(2 ** attempt)   # 1, 2, 4, 8, 16 s
+    log.warning(
+        "[Dedup] _seed_held_positions failed after 5 attempts — "
+        "per-market dedup INACTIVE until next restart"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2108,6 +2150,14 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
             _cb_pnl_history.pop(0)
 
         _notified_resolutions.add(alert_id)
+
+        # Remove from dedup set so a re-signal on the same market+side can trade again.
+        _mid = trade.get("market_id", "")
+        _bside = trade.get("bet_side", "")
+        if _mid and _bside:
+            _held_positions.discard((_mid, _bside))
+            log.debug("[Dedup] Cleared (%s, %s) after resolution", _mid[:16], _bside)
+
         await _notify_trade_resolution(http_client, trade, resolution_status, pnl)
 
         log.info(
@@ -2219,7 +2269,7 @@ async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling, _current_tier, _cb_pnl_history, _cached_usdc_balance, _session_avg_bet
+    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling, _current_tier, _cb_pnl_history, _cached_usdc_balance, _session_avg_bet, _held_positions, _held_positions_seeded
 
     if not RAILWAY_API_URL:
         log.critical("RAILWAY_API_URL is not set — exiting")
@@ -2284,9 +2334,10 @@ async def main() -> None:
         except Exception as exc:
             log.warning("[Vault] Could not check pause state on startup: %s", exc)
 
-    # Look back 2h on startup — long enough to catch alerts from a brief restart,
-    # short enough to avoid re-trading pre-filter stale alerts from before a deploy.
-    last_processed_ts = int(time.time()) - 7200
+    # 3-min lookback on startup: covers measured ~70s restart window (Railway deploy
+    # trigger → container start) plus one POLL_INTERVAL, with safety margin.
+    # 7200s prior caused replay of up to 2h of stale alerts on every restart.
+    last_processed_ts = int(time.time()) - 180
 
     async with httpx.AsyncClient(timeout=30.0) as http_client:
         # If a sweep was already recorded today (e.g. bot restarted after sweeping),
@@ -2317,6 +2368,10 @@ async def main() -> None:
                 log.warning("[CB] Post-seed evaluation triggered on boot: %s", block)
         except Exception as exc:
             log.warning("[CB] Backfill/post-seed evaluation error (non-fatal): %s", exc)
+
+        # Seed per-market/side dedup set BEFORE processing any alerts.
+        # If this fails, dedup stays inactive and a warning fires each cycle.
+        await _seed_held_positions(http_client)
 
         while True:
             try:
@@ -2438,6 +2493,23 @@ async def main() -> None:
                     if tier_reason:
                         log.info("[Trader] Tier skip: %s", tier_reason)
                         continue
+
+                    # Per-market/side dedup: skip if already holding this market+side.
+                    if not _held_positions_seeded:
+                        log.warning(
+                            "[Dedup] Dedup inactive (seed failed on startup) — "
+                            "duplicate trades possible until next restart"
+                        )
+                    else:
+                        _dmid  = alert.get("market_id", "")
+                        _dside = alert.get("bet_side", "")
+                        if _dmid and _dside and (_dmid, _dside) in _held_positions:
+                            log.info(
+                                "[Dedup] Skipping %s — already holding %s/%s",
+                                (alert.get("alert_id") or "")[:12], _dmid[:16], _dside,
+                            )
+                            await _notify_skip(http_client, alert, "already holding position")
+                            continue
 
                     await _execute_trade(clob_client, http_client, alert, stats)
 
