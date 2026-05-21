@@ -274,6 +274,37 @@ def update_trade_resolution(
         return {"ok": False, "error": str(exc)}
 
 
+@app.get("/api/diag/categories")
+def get_category_stats(_key: None = Depends(_verify_api_key)):
+    """Temporary: category breakdown for analysis. Remove after mission."""
+    try:
+        db = database.get_db()
+        rows = db.execute("""
+            SELECT ao.market_category,
+                   COUNT(*) as n_trades,
+                   SUM(CASE WHEN te.resolution_status='won' THEN 1 ELSE 0 END) as won,
+                   SUM(CASE WHEN te.resolution_status IN ('won','lost') THEN 1 ELSE 0 END) as resolved,
+                   ROUND(SUM(IFNULL(te.pnl,0)),2) as total_pnl,
+                   ROUND(SUM(te.size_usdc),2) as total_deployed
+            FROM trade_executions te
+            JOIN alert_outcomes ao ON te.alert_id = ao.alert_id
+            WHERE te.status = 'filled'
+            GROUP BY ao.market_category
+            ORDER BY total_deployed DESC
+        """).fetchall()
+        cats_row = db.execute("SELECT DISTINCT market_category FROM alert_outcomes ORDER BY market_category").fetchall()
+        signal_cats = db.execute("""
+            SELECT market_category, COUNT(*) as n FROM alert_outcomes GROUP BY market_category ORDER BY n DESC
+        """).fetchall()
+        return {
+            "trade_by_category": [dict(r) for r in rows],
+            "signal_by_category": [dict(r) for r in signal_cats],
+        }
+    except Exception as exc:
+        log.error("[API] get_category_stats failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/api/skips/telemetry")
 def post_skip_telemetry(
     body: SkipTelemetryReport,
@@ -283,7 +314,7 @@ def post_skip_telemetry(
     Called by the Fly trader when a slippage-skip occurs (flag on or off).
     Idempotent — duplicate POSTs for the same alert_id are silently ignored.
     """
-    valid_outcomes = {"would_have_traded", "rejected_expansion_bound", "rejected_price_ceiling"}
+    valid_outcomes = {"would_have_traded", "rejected_expansion_bound", "rejected_price_ceiling", "rejected_stale_signal"}
     if body.gate_outcome not in valid_outcomes:
         raise HTTPException(
             status_code=422,
