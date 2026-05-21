@@ -66,9 +66,15 @@ class TradeReport(BaseModel):
 
 
 class TradeResolutionUpdate(BaseModel):
-    resolution_status: str   # won | lost | invalid
+    resolution_status: str              # won | lost | invalid
     pnl: float
     resolved_at: int
+    resolution_source: Optional[str] = None  # prospective | backfill | reconcile | None
+
+
+class BulkResolutionCorrection(BaseModel):
+    corrections: list[dict]  # [{alert_id, resolution_status, pnl, resolved_at}]
+    source: str = "reconcile"
 
 
 class SkipTelemetryReport(BaseModel):
@@ -235,7 +241,7 @@ def get_resolved_recent(
     if since is None:
         since = int(time.time()) - 86400
     try:
-        return database.get_resolved_executions_since(since_ts=since)
+        return database.get_resolved_executions_since(since_ts=since, prospective_only=True)
     except Exception as exc:
         log.error("[API] get_resolved_recent failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Database error")
@@ -263,15 +269,73 @@ def update_trade_resolution(
             resolution_status=body.resolution_status,
             pnl=body.pnl,
             resolved_at=body.resolved_at,
+            resolution_source=body.resolution_source,
         )
         log.info(
-            "[API] Resolution recorded: alert=%s status=%s pnl=$%+.2f",
-            alert_id[:12], body.resolution_status, body.pnl,
+            "[API] Resolution recorded: alert=%s status=%s pnl=$%+.2f source=%s",
+            alert_id[:12], body.resolution_status, body.pnl, body.resolution_source or "none",
         )
         return {"ok": True}
     except Exception as exc:
         log.error("[API] update_trade_resolution failed: %s", exc, exc_info=True)
         return {"ok": False, "error": str(exc)}
+
+
+@app.post("/api/trades/bulk-correction")
+def bulk_correct_trades(
+    body: BulkResolutionCorrection,
+    _key: None = Depends(_verify_api_key),
+):
+    """
+    Batch-correct resolution_status/pnl for multiple trades.
+    Used by the DB reconciliation script to fix backfill artifacts.
+    Each correction: {alert_id, resolution_status, pnl, resolved_at}.
+    """
+    valid_statuses = {"won", "lost", "invalid"}
+    updated = 0
+    errors = []
+    now_ts = int(time.time())
+    for c in body.corrections:
+        aid = c.get("alert_id", "")
+        status = c.get("resolution_status", "")
+        if not aid or status not in valid_statuses:
+            errors.append({"alert_id": aid, "error": "bad input"})
+            continue
+        try:
+            database.update_trade_resolution_by_alert_id(
+                alert_id=aid,
+                resolution_status=status,
+                pnl=c.get("pnl", 0.0),
+                resolved_at=c.get("resolved_at", now_ts),
+                resolution_source=body.source,
+            )
+            updated += 1
+        except Exception as exc:
+            errors.append({"alert_id": aid, "error": str(exc)})
+    log.info("[API] Bulk correction: %d updated, %d errors", updated, len(errors))
+    return {"updated": updated, "errors": errors}
+
+
+@app.get("/api/trades/all-filled")
+def get_all_filled_trades(_key: None = Depends(_verify_api_key)):
+    """
+    Return all filled trade_executions for DB reconciliation.
+    Temporary diagnostic — remove after Task 2 is closed.
+    """
+    try:
+        db = database.get_db()
+        rows = db.execute("""
+            SELECT alert_id, market_id, market_question, bet_side,
+                   bet_price_filled, bet_price_intended, size_usdc,
+                   resolution_status, pnl, resolved_at, created_at
+            FROM trade_executions
+            WHERE status = 'filled'
+            ORDER BY created_at ASC
+        """).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        log.error("[API] get_all_filled_trades failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/api/diag/pnl-window")

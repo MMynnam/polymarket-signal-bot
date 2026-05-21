@@ -216,7 +216,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_SCHEMA_VERSION = 9
+_CURRENT_SCHEMA_VERSION = 10
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -395,6 +395,22 @@ def _apply_migrations() -> None:
         db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(9)")
         db.commit()
         log.info("Applied schema migration → version 9 (skip_telemetry)")
+
+    if current < 10:
+        # Version 10 — resolution_source column on trade_executions.
+        # Distinguishes prospective resolutions (from _check_pending_resolutions)
+        # from backfill resolutions (from _resolve_from_clob_positions).
+        # Existing rows get NULL = unknown (pre-dates this tracking).
+        try:
+            db.execute(
+                "ALTER TABLE trade_executions ADD COLUMN resolution_source TEXT"
+            )
+            log.info("Migration 10: added resolution_source column to trade_executions")
+        except Exception:
+            pass  # Column already exists (idempotent re-run)
+        db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(10)")
+        db.commit()
+        log.info("Applied schema migration → version 10 (resolution_source)")
 
 
 # ---------------------------------------------------------------------------
@@ -1168,15 +1184,24 @@ def get_recent_resolved_losses(limit: int = 6) -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def get_resolved_executions_since(since_ts: int) -> list[dict]:
-    """Return won/lost trade_executions since since_ts, for CB history backfill on restart."""
+def get_resolved_executions_since(
+    since_ts: int,
+    prospective_only: bool = False,
+) -> list[dict]:
+    """Return won/lost trade_executions since since_ts, for CB history backfill on restart.
+
+    prospective_only=True skips backfill-sourced entries (resolution_source='backfill')
+    so the CB rolling window isn't seeded with historical artifacts.
+    """
+    source_filter = "AND (resolution_source = 'prospective' OR resolution_source IS NULL)" if prospective_only else ""
     rows = get_db().execute(
-        """
-        SELECT alert_id, pnl, resolved_at
+        f"""
+        SELECT alert_id, pnl, resolved_at, resolution_source
         FROM trade_executions
         WHERE resolution_status IN ('won', 'lost')
           AND resolved_at IS NOT NULL
           AND resolved_at >= ?
+          {source_filter}
         ORDER BY resolved_at ASC
         """,
         (since_ts,),
@@ -1455,16 +1480,18 @@ def update_trade_resolution_by_alert_id(
     resolution_status: str,
     pnl: Optional[float],
     resolved_at: int,
+    resolution_source: Optional[str] = None,
 ) -> None:
     """Update trade_executions resolution from the remote trader's report."""
     with transaction() as db:
         db.execute(
             """
             UPDATE trade_executions
-            SET resolution_status = ?, pnl = ?, resolved_at = ?
+            SET resolution_status = ?, pnl = ?, resolved_at = ?,
+                resolution_source = COALESCE(?, resolution_source)
             WHERE alert_id = ?
             """,
-            (resolution_status, pnl, resolved_at, alert_id),
+            (resolution_status, pnl, resolved_at, resolution_source, alert_id),
         )
 
 
