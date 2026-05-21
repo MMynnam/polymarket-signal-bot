@@ -441,11 +441,15 @@ async def _calculate_bet_size(http_client: httpx.AsyncClient, stats: dict, score
     Dynamic pct scales linearly from TRADING_SCORE_BASE_PCT at score=TRADING_MIN_SCORE
     to TRADING_MAX_PCT_PER_TRADE at score=TRADING_SCORE_CEILING, then flat above.
     Result is clamped to [TRADING_MIN_BET_USDC, TRADING_MAX_BET_USDC].
+
+    Graduation requires BOTH:
+      1. resolved >= TRADING_DYNAMIC_MIN_RESOLVED (DB count)
+      2. prospective_pnl > 0 (from _cb_pnl_history, seeded prospective-only on restart)
+    This prevents historical backfill artifacts from triggering dynamic sizing.
     """
     global _graduation_notified
 
     resolved = stats.get("resolved", 0)
-    pnl = stats.get("cumulative_pnl") or 0.0
 
     if resolved < TRADING_DYNAMIC_MIN_RESOLVED:
         log.info(
@@ -454,10 +458,13 @@ async def _calculate_bet_size(http_client: httpx.AsyncClient, stats: dict, score
         )
         return TRADING_BET_SIZE_USDC
 
-    if pnl <= 0:
+    # Gate on prospective P&L from _cb_pnl_history (never populated by backfill).
+    # Use a 7-day lookback to accumulate enough signal across sessions.
+    prospective_pnl = _get_rolling_pnl(window_hours=168.0)
+    if prospective_pnl <= 0:
         log.info(
-            "[Sizing] %d resolved, P&L $%.2f. Fixed $%.2f until profitable.",
-            resolved, pnl, TRADING_BET_SIZE_USDC,
+            "[Sizing] %d resolved, prospective P&L $%.2f ≤ 0. Fixed $%.2f.",
+            resolved, prospective_pnl, TRADING_BET_SIZE_USDC,
         )
         return TRADING_BET_SIZE_USDC
 
@@ -481,7 +488,7 @@ async def _calculate_bet_size(http_client: httpx.AsyncClient, stats: dict, score
 
     if not _graduation_notified:
         _graduation_notified = True
-        await _notify_graduation(http_client, resolved, pnl, clamped)
+        await _notify_graduation(http_client, resolved, prospective_pnl, clamped)
 
     return clamped
 
@@ -2270,10 +2277,12 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
                 "resolution_status": resolution_status,
                 "pnl": pnl,
                 "resolved_at": now_ts,
+                "resolution_source": "backfill",
             })
 
-            # Do NOT update _cb_pnl_history: historical backfill skews the rolling
-            # circuit-breaker window. CB rebuilds prospectively from _check_pending_resolutions.
+            # Do NOT update _cb_pnl_history: backfill skews the rolling CB window.
+            # CB rebuilds prospectively from _check_pending_resolutions.
+            # resolution_source='backfill' also excludes these from CB seeding on restart.
             _notified_resolutions.add(alert_id)
             bside = trade.get("bet_side", "")
             if market_id and bside:
@@ -2337,12 +2346,15 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
             resolution_status = "invalid"
             pnl = 0.0
 
-        # Write resolution back to Railway so stats stay accurate
+        # Write resolution back to Railway so stats stay accurate.
+        # Mark as 'prospective' so the CB backfill and sizing graduation
+        # can distinguish these from historical backfill artifacts.
         resolved_ts = int(time.time())
         await _api_patch(http_client, f"/api/trades/{alert_id}/resolution", {
             "resolution_status": resolution_status,
             "pnl": pnl,
             "resolved_at": resolved_ts,
+            "resolution_source": "prospective",
         })
 
         # Accumulate for magnitude-based circuit breaker; prune entries outside 2× window
@@ -2492,7 +2504,10 @@ async def main() -> None:
     log.info("Funder (USDC balance):   %s",
              TRADING_FUNDER_ADDRESS if TRADING_FUNDER_ADDRESS else f"{_wallet_address} (EOA)")
     log.info("Poll:        every %ds | Min score: %d", POLL_INTERVAL, TRADING_MIN_SCORE)
-    log.info("Vault:       %s", VAULT_WALLET_ADDRESS or "disabled")
+    log.info("Vault:       %s  sweep=%s  threshold=$%.0f  floor=$%.0f",
+             VAULT_WALLET_ADDRESS or "disabled",
+             "ARMED" if VAULT_SWEEP_ENABLED else "dry-run",
+             VAULT_SWEEP_THRESHOLD_USDC, VAULT_SWEEP_FLOOR_USDC)
     log.info("Scaling:     capital=$%.0f  headroom=$%.0f  exposure=%.0f%%  floor=%d  normal=%d  premium=%d  score_floor=%d",
              TRADING_WORKING_CAPITAL_USDC, TRADING_SWEEP_HEADROOM_USDC,
              TRADING_TARGET_EXPOSURE_PCT * 100,
