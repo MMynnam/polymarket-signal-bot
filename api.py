@@ -314,7 +314,7 @@ def post_skip_telemetry(
     Called by the Fly trader when a slippage-skip occurs (flag on or off).
     Idempotent — duplicate POSTs for the same alert_id are silently ignored.
     """
-    valid_outcomes = {"would_have_traded", "rejected_expansion_bound", "rejected_price_ceiling", "rejected_stale_signal"}
+    valid_outcomes = {"would_have_traded", "rejected_expansion_bound", "rejected_price_ceiling", "rejected_stale_signal", "rejected_soccer_favorite"}
     if body.gate_outcome not in valid_outcomes:
         raise HTTPException(
             status_code=422,

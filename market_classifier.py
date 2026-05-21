@@ -15,8 +15,16 @@ _CATEGORIES: list[tuple[str, list[str]]] = [
         "ufc", "nba", "nfl", "nhl", "mlb", "mls", "epl", "ncaa", "pga",
         # Generic terms
         "esports", "lol:", "championship", "match", "fight",
-        # "X vs. Y" with period (already worked) and "X vs Y" without period
+        # "X vs. Y" with period and "X vs Y" without period (covers all head-to-head)
         "vs.", " vs ",
+        # Point-spread markets (sports books)
+        "spread:",
+        # European soccer: team suffix patterns common in market titles
+        " fc", " cf", " sc ", " united", " city fc", " villa",
+        # European soccer: major leagues and tournaments
+        "premier league", "la liga", "bundesliga", "serie a", "ligue 1",
+        "champions league", "europa league", "fa cup", "copa del rey",
+        "eredivisie", "primeira liga",
         # NBA teams (titles often omit "nba")
         "lakers", "celtics", "warriors", "bucks", "heat", "nets", "knicks",
         "sixers", "suns", "nuggets", "clippers", "mavericks", "mavs",
@@ -32,6 +40,7 @@ _CATEGORIES: list[tuple[str, list[str]]] = [
         # MLB teams
         "yankees", "dodgers", "red sox", "cubs", "astros", "braves",
         "mets", "phillies", "padres", "brewers", "orioles", "tigers",
+        "guardians", "pirates", "union",
         # NHL teams
         "bruins", "penguins", "capitals", "lightning", "rangers", "oilers",
         # CS:GO / Valorant esports orgs that slip past "esports" keyword

@@ -125,6 +125,12 @@ TRADING_DYNAMIC_SLIPPAGE_ENABLED: bool = os.getenv("TRADING_DYNAMIC_SLIPPAGE_ENA
 TRADING_SLIPPAGE_MAX_EXPANSION: float = float(os.getenv("TRADING_SLIPPAGE_MAX_EXPANSION", "0.03"))
 TRADING_MAX_ENTRY_PRICE: float = float(os.getenv("TRADING_MAX_ENTRY_PRICE", "0.85"))
 
+# Soccer-favorites filter: skip sports-category alerts where price > this threshold.
+# Evidence: n=12 soccer favorites in CSV, WR=50%, ROI=-39.9%, avg_excess=-0.275.
+# Pre-committed bar (n≥10, avg_excess<-0.15) passed. Default ON.
+FILTER_SOCCER_FAVORITES_ENABLED: bool = os.getenv("FILTER_SOCCER_FAVORITES_ENABLED", "true").lower() == "true"
+FILTER_SOCCER_FAVORITES_MAX_PRICE: float = float(os.getenv("FILTER_SOCCER_FAVORITES_MAX_PRICE", "0.50"))
+
 # Confidence-weighted position sizing — bet size scales linearly with score.
 # At score=TRADING_MIN_SCORE: TRADING_SCORE_BASE_PCT of bankroll.
 # At score=TRADING_SCORE_CEILING (and above): TRADING_MAX_PCT_PER_TRADE of bankroll.
@@ -1867,6 +1873,38 @@ async def _execute_trade(
             "size_usdc": TRADING_BET_SIZE_USDC,
             "status": "failed", "error_message": "no clob_token_id",
         })
+        return
+
+    # Soccer-favorites filter: sports-category alerts at price > 0.50 have demonstrated
+    # negative edge (n=12, ROI=-39.9%, avg_excess=-0.275 in CSV ground truth).
+    market_category = alert.get("market_category") or ""
+    if (FILTER_SOCCER_FAVORITES_ENABLED
+            and market_category == "sports"
+            and price_alert > FILTER_SOCCER_FAVORITES_MAX_PRICE):
+        _alert_skip_cache[alert_id] = time.time() + _SKIP_DECISION_TTL_SECONDS
+        log.info(
+            "[Filter] Soccer favorite skipped: alert=%s cat=%s price=%.3f",
+            alert_id[:12], market_category, price_alert,
+        )
+        await _notify_skip(http_client, alert, "soccer_favorite",
+                           price_intended=price_alert, price_current=price_alert)
+        try:
+            await _api_post(http_client, "/api/skips/telemetry", {
+                "alert_id":         alert_id,
+                "market_id":        market_id,
+                "market_question":  market_q,
+                "bet_side":         bet_side,
+                "score":            score,
+                "market_type":      market_category,
+                "price_intended":   price_alert,
+                "price_current":    price_alert,
+                "price_delta_abs":  0.0,
+                "price_delta_frac": 0.0,
+                "static_threshold": FILTER_SOCCER_FAVORITES_MAX_PRICE,
+                "gate_outcome":     "rejected_soccer_favorite",
+            })
+        except Exception as _exc:
+            log.debug("[Filter] Soccer skip telemetry error (non-fatal): %s", _exc)
         return
 
     # Skip-decision cache: if we already rejected this alert for a price-based reason
