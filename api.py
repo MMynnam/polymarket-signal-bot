@@ -274,6 +274,57 @@ def update_trade_resolution(
         return {"ok": False, "error": str(exc)}
 
 
+@app.get("/api/diag/pnl-window")
+def get_pnl_window(
+    from_ts: int,
+    until_ts: int,
+    _key: None = Depends(_verify_api_key),
+):
+    """
+    Temporary diagnostic: resolved P&L for a specific created_at window.
+    Used for DB-vs-chain accounting reconciliation.
+    Remove after Task 2 is closed.
+    """
+    try:
+        db = database.get_db()
+        row = db.execute("""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN resolution_status IN ('won','lost','invalid') THEN 1 ELSE 0 END) as resolved,
+                SUM(CASE WHEN resolution_status='won' THEN 1 ELSE 0 END) as won,
+                SUM(CASE WHEN resolution_status='lost' THEN 1 ELSE 0 END) as lost,
+                SUM(CASE WHEN resolution_status='pending' THEN 1 ELSE 0 END) as still_pending,
+                ROUND(SUM(IFNULL(pnl,0)),2) as db_pnl,
+                ROUND(SUM(size_usdc),2) as total_deployed,
+                ROUND(AVG(CASE WHEN bet_price_filled IS NOT NULL THEN bet_price_filled
+                               ELSE bet_price_intended END),4) as avg_fill_price
+            FROM trade_executions
+            WHERE status = 'filled'
+              AND created_at >= ?
+              AND created_at < ?
+        """, (from_ts, until_ts)).fetchone()
+        by_resolution = db.execute("""
+            SELECT resolution_status, COUNT(*) as n,
+                   ROUND(SUM(IFNULL(pnl,0)),2) as pnl,
+                   ROUND(SUM(size_usdc),2) as deployed,
+                   ROUND(AVG(CASE WHEN bet_price_filled IS NOT NULL THEN bet_price_filled
+                                  ELSE bet_price_intended END),4) as avg_price
+            FROM trade_executions
+            WHERE status = 'filled'
+              AND created_at >= ?
+              AND created_at < ?
+            GROUP BY resolution_status
+        """, (from_ts, until_ts)).fetchall()
+        return {
+            "window": {"from_ts": from_ts, "until_ts": until_ts},
+            "summary": dict(row) if row else {},
+            "by_resolution_status": [dict(r) for r in by_resolution],
+        }
+    except Exception as exc:
+        log.error("[API] get_pnl_window failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.get("/api/diag/categories")
 def get_category_stats(_key: None = Depends(_verify_api_key)):
     """Temporary: category breakdown for analysis. Remove after mission."""
