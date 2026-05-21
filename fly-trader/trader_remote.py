@@ -2147,19 +2147,23 @@ _POLYMARKET_DATA_API = "https://data-api.polymarket.com"
 
 async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
     """
-    Bypass the broken Railway resolution_checker chain by directly querying
-    Polymarket's /v1/closed-positions API.
+    Reconcile Railway's pending trade_executions against on-chain reality using
+    Polymarket's /v1/positions endpoint (complete wallet state, not winners-only).
 
-    Background: Railway's get_pending_outcomes(limit=500) processes untraded
-    alert_outcomes first (FIFO by created_at), so the 85 traded positions are
-    never reached. This function short-circuits that by fetching the wallet's
-    settled positions from Polymarket and patching Railway directly.
+    Resolution semantics:
+      - In /v1/positions with redeemable=True  → won (awaiting claim)
+      - NOT in /v1/positions at all            → lost (no tokens held = market expired worthless)
+      - In /v1/positions with redeemable=False → genuinely still open, skip
+
+    Fail-closed: if /v1/positions fetch fails, nothing is patched.
+    CB history is cleared after each run to prevent historical backfill from
+    injecting one-sided wins into the rolling circuit-breaker window.
     """
     open_positions = await _api_get(http_client, "/api/positions/open")
     if not isinstance(open_positions, list) or not open_positions:
         return
 
-    # Index by market_id (conditionId in Polymarket's data API)
+    # Index Railway's pending trades by market_id
     pending_by_market: dict[str, list[dict]] = {}
     for trade in open_positions:
         mid = trade.get("market_id")
@@ -2169,102 +2173,98 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
     if not pending_by_market:
         return
 
-    # The data API uses the funder (proxy wallet) address
     query_address = TRADING_FUNDER_ADDRESS or _wallet_address
     if not query_address or query_address == "<unknown>":
         log.warning("[CLOBResolve] No wallet address — skipping")
         return
 
+    # /v1/positions returns ALL currently held conditional tokens (open + redeemable wins).
+    # Positions absent from this response have no tokens → closed as losses.
+    on_chain: dict[str, dict] = {}
+    try:
+        resp = await http_client.get(
+            f"{_POLYMARKET_DATA_API}/v1/positions",
+            params={"user": query_address, "limit": 500},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log.warning("[CLOBResolve] /v1/positions returned %d — skipping (fail-closed)", resp.status_code)
+            return
+        for pos in resp.json():
+            cid = pos.get("conditionId", "")
+            if cid:
+                on_chain[cid] = pos
+    except Exception as exc:
+        log.warning("[CLOBResolve] /v1/positions fetch failed: %s — skipping (fail-closed)", exc)
+        return
+
+    log.info("[CLOBResolve] /v1/positions: %d on-chain entries, %d pending in Railway",
+             len(on_chain), len(pending_by_market))
+
     resolved_count = 0
     total_pnl = 0.0
     now_ts = int(time.time())
-    limit = 50
-    offset = 0
-    seen_condition_ids: set[str] = set()
 
-    while True:
-        try:
-            resp = await http_client.get(
-                f"{_POLYMARKET_DATA_API}/v1/closed-positions",
-                params={"user": query_address, "limit": limit, "offset": offset},
-                timeout=15,
+    for market_id, trades in pending_by_market.items():
+        pos = on_chain.get(market_id)
+
+        if pos is None:
+            # No tokens held for this market → expired worthless → lost
+            resolution_status = "lost"
+        elif pos.get("redeemable"):
+            # Tokens held, market resolved, redemption pending → won
+            resolution_status = "won"
+        else:
+            # Tokens held, market still live → genuinely open, leave pending
+            continue
+
+        for trade in trades:
+            alert_id = trade["alert_id"]
+            if alert_id in _notified_resolutions:
+                continue
+
+            fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.5
+            size_usdc = trade.get("size_usdc") or TRADING_BET_SIZE_USDC
+
+            pnl = size_usdc * (1.0 / fill_price - 1.0) if resolution_status == "won" else -size_usdc
+
+            await _api_patch(http_client, f"/api/trades/{alert_id}/resolution", {
+                "resolution_status": resolution_status,
+                "pnl": pnl,
+                "resolved_at": now_ts,
+            })
+
+            # Do NOT update _cb_pnl_history: historical backfill skews the rolling
+            # circuit-breaker window. CB rebuilds prospectively from _check_pending_resolutions.
+            _notified_resolutions.add(alert_id)
+            bside = trade.get("bet_side", "")
+            if market_id and bside:
+                _held_positions.discard((market_id, bside))
+
+            resolved_count += 1
+            total_pnl += pnl
+            log.info(
+                "[CLOBResolve] %s → %s | P&L: $%+.2f | market=%s",
+                alert_id[:12], resolution_status, pnl, market_id[:16],
             )
-            if resp.status_code != 200:
-                log.warning("[CLOBResolve] Data API %d — stopping", resp.status_code)
-                break
-            page = resp.json()
-        except Exception as exc:
-            log.warning("[CLOBResolve] Fetch failed: %s", exc)
-            break
 
-        if not isinstance(page, list) or not page:
-            break
-
-        for pos in page:
-            condition_id = pos.get("conditionId", "")
-            if not condition_id or condition_id in seen_condition_ids:
-                continue
-            seen_condition_ids.add(condition_id)
-
-            trades_for_market = pending_by_market.get(condition_id)
-            if not trades_for_market:
-                continue
-
-            realized_pnl = pos.get("realizedPnl", 0.0)
-            won = realized_pnl > 0
-
-            for trade in trades_for_market:
-                alert_id = trade["alert_id"]
-                if alert_id in _notified_resolutions:
-                    continue
-
-                fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.5
-                size_usdc  = trade.get("size_usdc") or TRADING_BET_SIZE_USDC
-
-                if won:
-                    resolution_status = "won"
-                    pnl = size_usdc * (1.0 / fill_price - 1.0)
-                else:
-                    resolution_status = "lost"
-                    pnl = -size_usdc
-
-                await _api_patch(http_client, f"/api/trades/{alert_id}/resolution", {
-                    "resolution_status": resolution_status,
-                    "pnl": pnl,
-                    "resolved_at": now_ts,
-                })
-
-                _cb_pnl_history.append((float(now_ts), pnl))
-                cutoff = now_ts - TRADING_CB_WINDOW_HOURS * 3600 * 2
-                while _cb_pnl_history and _cb_pnl_history[0][0] < cutoff:
-                    _cb_pnl_history.pop(0)
-
-                _notified_resolutions.add(alert_id)
-                mid = trade.get("market_id", "")
-                bside = trade.get("bet_side", "")
-                if mid and bside:
-                    _held_positions.discard((mid, bside))
-
-                resolved_count += 1
-                total_pnl += pnl
-                log.info(
-                    "[CLOBResolve] %s → %s | P&L: $%+.2f | market=%s",
-                    alert_id[:12], resolution_status, pnl, condition_id[:16],
-                )
-
-        if len(page) < limit:
-            break
-        offset += limit
+    # Clear CB history: patching historical trades with resolved_at=now means
+    # _backfill_cb_pnl_history would re-ingest them on restart as if recent.
+    # Prospective resolutions from _check_pending_resolutions populate CB correctly.
+    _cb_pnl_history.clear()
 
     if resolved_count > 0:
+        wins = sum(1 for t in pending_by_market.values() for tr in t
+                   if tr["alert_id"] in _notified_resolutions
+                   and on_chain.get(t[0].get("market_id") if t else "") is not None)
         sign = "+" if total_pnl >= 0 else ""
         text = (
             f"📦 <b>CLOB BACKFILL: {resolved_count} position(s) resolved</b>\n"
             f"💰 <b>Net P&amp;L:</b> ${sign}{total_pnl:.2f} USDC\n"
-            f"<i>(Previously stuck pending — resolved via /v1/closed-positions)</i>"
+            f"<i>Source: /v1/positions (complete state, wins + losses)</i>"
         )
         await _send_telegram(http_client, text)
-        log.info("[CLOBResolve] Backfill complete: %d resolved, net P&L $%+.2f", resolved_count, total_pnl)
+        log.info("[CLOBResolve] Backfill complete: %d resolved, net P&L $%+.2f | CB cleared", resolved_count, total_pnl)
 
 
 async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
