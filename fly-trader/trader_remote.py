@@ -117,6 +117,10 @@ TRADING_FUNDER_ADDRESS: str = os.getenv("TRADING_FUNDER_ADDRESS", "")
 # Dynamic slippage gate — default OFF (observation-only until May 31 decision).
 # With TRADING_DYNAMIC_SLIPPAGE_ENABLED=false, trading is byte-identical to today.
 TRADING_SLIPPAGE_THRESHOLD: float = float(os.getenv("TRADING_SLIPPAGE_THRESHOLD", "0.05"))
+# Source-2 fix: discard signals older than this many seconds at trade time.
+# Provisional first cut (600s) — expected to tighten after forward data accumulates.
+MAX_SIGNAL_AGE_S: int = int(os.getenv("MAX_SIGNAL_AGE_S", "600"))
+
 TRADING_DYNAMIC_SLIPPAGE_ENABLED: bool = os.getenv("TRADING_DYNAMIC_SLIPPAGE_ENABLED", "false").lower() == "true"
 TRADING_SLIPPAGE_MAX_EXPANSION: float = float(os.getenv("TRADING_SLIPPAGE_MAX_EXPANSION", "0.03"))
 TRADING_MAX_ENTRY_PRICE: float = float(os.getenv("TRADING_MAX_ENTRY_PRICE", "0.85"))
@@ -494,6 +498,8 @@ def _skip_reason_key(reason: str) -> str:
         return "balance"
     if "already" in r:
         return "already_traded"
+    if "too old" in r:
+        return "stale_signal"
     return reason[:40]
 
 
@@ -514,6 +520,8 @@ def _skip_reason_plain(reason: str) -> str:
         return "bankroll below minimum bet"
     if "already" in r:
         return "already holding a position on this market"
+    if "too old" in r:
+        return reason
     return reason[:80]
 
 
@@ -614,6 +622,37 @@ async def _post_skip_telemetry(
                         payload.get("alert_id", "")[:12])
     except Exception as exc:
         log.warning("[Shadow] _post_skip_telemetry exception for alert %s: %s",
+                    alert.get("alert_id", "")[:12], exc)
+
+
+async def _post_stale_telemetry(
+    http_client: httpx.AsyncClient,
+    alert: dict,
+) -> None:
+    """Fire-and-forget telemetry for age-discarded signals. INSERT OR IGNORE on alert_id."""
+    try:
+        price_at_alert: float = float(alert.get("bet_price_at_alert") or 0.0)
+        payload = {
+            "alert_id":         alert.get("alert_id", ""),
+            "market_id":        alert.get("market_id", ""),
+            "market_question":  (alert.get("market_question") or "")[:120],
+            "bet_side":         alert.get("bet_side", ""),
+            "score":            alert.get("score", 0),
+            "market_type":      alert.get("market_type", ""),
+            "price_intended":   price_at_alert,
+            "price_current":    price_at_alert,
+            "price_delta_abs":  0.0,
+            "price_delta_frac": 0.0,
+            "static_threshold": TRADING_SLIPPAGE_THRESHOLD,
+            "gate_outcome":     "rejected_stale_signal",
+            "shadow_entry_price": None,
+            "shadow_size_usdc":   None,
+        }
+        result = await _api_post(http_client, "/api/skips/telemetry", payload)
+        if result is None:
+            log.warning("[Stale] telemetry POST failed for alert %s", payload["alert_id"][:12])
+    except Exception as exc:
+        log.warning("[Stale] telemetry exception for alert %s: %s",
                     alert.get("alert_id", "")[:12], exc)
 
 
@@ -2103,6 +2142,131 @@ async def _seed_held_positions(http_client: httpx.AsyncClient) -> None:
 # Resolution polling
 # ---------------------------------------------------------------------------
 
+_POLYMARKET_DATA_API = "https://data-api.polymarket.com"
+
+
+async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
+    """
+    Bypass the broken Railway resolution_checker chain by directly querying
+    Polymarket's /v1/closed-positions API.
+
+    Background: Railway's get_pending_outcomes(limit=500) processes untraded
+    alert_outcomes first (FIFO by created_at), so the 85 traded positions are
+    never reached. This function short-circuits that by fetching the wallet's
+    settled positions from Polymarket and patching Railway directly.
+    """
+    open_positions = await _api_get(http_client, "/api/positions/open")
+    if not isinstance(open_positions, list) or not open_positions:
+        return
+
+    # Index by market_id (conditionId in Polymarket's data API)
+    pending_by_market: dict[str, list[dict]] = {}
+    for trade in open_positions:
+        mid = trade.get("market_id")
+        if mid and trade.get("alert_id") not in _notified_resolutions:
+            pending_by_market.setdefault(mid, []).append(trade)
+
+    if not pending_by_market:
+        return
+
+    # The data API uses the funder (proxy wallet) address
+    query_address = TRADING_FUNDER_ADDRESS or _wallet_address
+    if not query_address or query_address == "<unknown>":
+        log.warning("[CLOBResolve] No wallet address — skipping")
+        return
+
+    resolved_count = 0
+    total_pnl = 0.0
+    now_ts = int(time.time())
+    limit = 50
+    offset = 0
+    seen_condition_ids: set[str] = set()
+
+    while True:
+        try:
+            resp = await http_client.get(
+                f"{_POLYMARKET_DATA_API}/v1/closed-positions",
+                params={"user": query_address, "limit": limit, "offset": offset},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                log.warning("[CLOBResolve] Data API %d — stopping", resp.status_code)
+                break
+            page = resp.json()
+        except Exception as exc:
+            log.warning("[CLOBResolve] Fetch failed: %s", exc)
+            break
+
+        if not isinstance(page, list) or not page:
+            break
+
+        for pos in page:
+            condition_id = pos.get("conditionId", "")
+            if not condition_id or condition_id in seen_condition_ids:
+                continue
+            seen_condition_ids.add(condition_id)
+
+            trades_for_market = pending_by_market.get(condition_id)
+            if not trades_for_market:
+                continue
+
+            realized_pnl = pos.get("realizedPnl", 0.0)
+            won = realized_pnl > 0
+
+            for trade in trades_for_market:
+                alert_id = trade["alert_id"]
+                if alert_id in _notified_resolutions:
+                    continue
+
+                fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.5
+                size_usdc  = trade.get("size_usdc") or TRADING_BET_SIZE_USDC
+
+                if won:
+                    resolution_status = "won"
+                    pnl = size_usdc * (1.0 / fill_price - 1.0)
+                else:
+                    resolution_status = "lost"
+                    pnl = -size_usdc
+
+                await _api_patch(http_client, f"/api/trades/{alert_id}/resolution", {
+                    "resolution_status": resolution_status,
+                    "pnl": pnl,
+                    "resolved_at": now_ts,
+                })
+
+                _cb_pnl_history.append((float(now_ts), pnl))
+                cutoff = now_ts - TRADING_CB_WINDOW_HOURS * 3600 * 2
+                while _cb_pnl_history and _cb_pnl_history[0][0] < cutoff:
+                    _cb_pnl_history.pop(0)
+
+                _notified_resolutions.add(alert_id)
+                mid = trade.get("market_id", "")
+                bside = trade.get("bet_side", "")
+                if mid and bside:
+                    _held_positions.discard((mid, bside))
+
+                resolved_count += 1
+                total_pnl += pnl
+                log.info(
+                    "[CLOBResolve] %s → %s | P&L: $%+.2f | market=%s",
+                    alert_id[:12], resolution_status, pnl, condition_id[:16],
+                )
+
+        if len(page) < limit:
+            break
+        offset += limit
+
+    if resolved_count > 0:
+        sign = "+" if total_pnl >= 0 else ""
+        text = (
+            f"📦 <b>CLOB BACKFILL: {resolved_count} position(s) resolved</b>\n"
+            f"💰 <b>Net P&amp;L:</b> ${sign}{total_pnl:.2f} USDC\n"
+            f"<i>(Previously stuck pending — resolved via /v1/closed-positions)</i>"
+        )
+        await _send_telegram(http_client, text)
+        log.info("[CLOBResolve] Backfill complete: %d resolved, net P&L $%+.2f", resolved_count, total_pnl)
+
+
 async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
     """
     Poll /api/trades/pending, detect alert_outcomes resolutions, send
@@ -2373,12 +2537,20 @@ async def main() -> None:
         # If this fails, dedup stays inactive and a warning fires each cycle.
         await _seed_held_positions(http_client)
 
+        # Immediately backfill any resolutions that the Railway resolution_checker
+        # missed (FIFO-500 queue starvation). This unblocks the position cap on restart.
+        try:
+            await _resolve_from_clob_positions(http_client)
+        except Exception as exc:
+            log.warning("[CLOBResolve] Startup backfill failed (non-fatal): %s", exc)
+
         while True:
             try:
                 now = time.time()
 
                 # Resolution poll (every 10 min)
                 if now - _last_resolution_check >= _RESOLUTION_POLL_INTERVAL:
+                    await _resolve_from_clob_positions(http_client)
                     await _check_pending_resolutions(http_client)
                     _last_resolution_check = now
 
@@ -2510,6 +2682,24 @@ async def main() -> None:
                             )
                             await _notify_skip(http_client, alert, "already holding position")
                             continue
+
+                    # Max-age discard (source-2 fix): reject CB/daily-limit-trapped signals
+                    # that survived until the gate cleared but are now stale.
+                    # Telemetry is idempotent (INSERT OR IGNORE); spinning cycles are benign.
+                    _alert_age_s = int(time.time()) - int(alert.get("created_at") or 0)
+                    if _alert_age_s > MAX_SIGNAL_AGE_S:
+                        _age_min = _alert_age_s // 60
+                        _max_min = MAX_SIGNAL_AGE_S // 60
+                        _stale_reason = f"signal too old — {_age_min} min since detection, max {_max_min} min"
+                        log.info(
+                            "[Stale] Discarding alert %s: age=%ds > MAX_SIGNAL_AGE_S=%ds",
+                            (alert.get("alert_id") or "")[:12], _alert_age_s, MAX_SIGNAL_AGE_S,
+                        )
+                        _t = asyncio.create_task(_post_stale_telemetry(http_client, alert))
+                        _background_tasks.add(_t)
+                        _t.add_done_callback(_background_tasks.discard)
+                        await _notify_skip(http_client, alert, _stale_reason)
+                        continue
 
                     await _execute_trade(clob_client, http_client, alert, stats)
 
