@@ -292,13 +292,33 @@ def get_category_stats(_key: None = Depends(_verify_api_key)):
             GROUP BY ao.market_category
             ORDER BY total_deployed DESC
         """).fetchall()
-        cats_row = db.execute("SELECT DISTINCT market_category FROM alert_outcomes ORDER BY market_category").fetchall()
         signal_cats = db.execute("""
             SELECT market_category, COUNT(*) as n FROM alert_outcomes GROUP BY market_category ORDER BY n DESC
+        """).fetchall()
+        pnl_row = db.execute("""
+            SELECT COUNT(*) as total,
+                   SUM(CASE WHEN resolution_status IN ('won','lost','invalid') THEN 1 ELSE 0 END) as resolved,
+                   SUM(CASE WHEN resolution_status='won' THEN 1 ELSE 0 END) as won,
+                   SUM(CASE WHEN resolution_status='lost' THEN 1 ELSE 0 END) as lost,
+                   ROUND(SUM(IFNULL(pnl,0)),2) as cumulative_pnl,
+                   SUM(CASE WHEN resolution_status='pending' THEN 1 ELSE 0 END) as still_pending
+            FROM trade_executions WHERE status='filled'
+        """).fetchone()
+        skips = db.execute("""
+            SELECT gate_outcome,
+                   COUNT(*) as n,
+                   ROUND(AVG(price_delta_abs),3) as avg_delta,
+                   MIN(recorded_at) as first_ts,
+                   MAX(recorded_at) as last_ts
+            FROM skip_telemetry
+            GROUP BY gate_outcome
+            ORDER BY n DESC
         """).fetchall()
         return {
             "trade_by_category": [dict(r) for r in rows],
             "signal_by_category": [dict(r) for r in signal_cats],
+            "realized_pnl": dict(pnl_row) if pnl_row else {},
+            "skip_telemetry": [dict(r) for r in skips],
         }
     except Exception as exc:
         log.error("[API] get_category_stats failed: %s", exc, exc_info=True)
