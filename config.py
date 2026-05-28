@@ -145,10 +145,12 @@ FILTER_MIN_BET_SIZE_USD: float = float(os.getenv("FILTER_MIN_BET_SIZE_USD", "50"
 # cannot be acted on — filter it before scoring.
 FILTER_MIN_ACTIONABLE_MINUTES: int = int(os.getenv("FILTER_MIN_ACTIONABLE_MINUTES", "10"))
 # Market duration window: skip markets closing too soon (sub-24h bucket was unprofitable)
-# or too far from close (> 7 days — insufficient urgency signal, likely noise).
+# or too far from close. Cut to 72h for data velocity: faster outcome feedback on the
+# short-duration sports/esports universe where edge has appeared; drops unproven multi-week
+# markets (Elon tweet counts, macro) that failed concentration testing.
 # When end_date is unavailable, the trade passes through unchanged.
 FILTER_MIN_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MIN_HOURS_TO_CLOSE", "6"))
-FILTER_MAX_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MAX_HOURS_TO_CLOSE", "336"))
+FILTER_MAX_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MAX_HOURS_TO_CLOSE", "72"))
 
 # Profitable price band: only alert on bets within this range.
 # Distinct from FILTER_MIN/MAX_PRICE (which reject glitch prices at 1-2¢).
