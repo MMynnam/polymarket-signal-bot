@@ -22,6 +22,7 @@ import time
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
@@ -31,6 +32,7 @@ import database
 log = logging.getLogger("api")
 
 app = FastAPI(title="Polymarket Signal Bot API", docs_url=None, redoc_url=None)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -314,130 +316,6 @@ def bulk_correct_trades(
             errors.append({"alert_id": aid, "error": str(exc)})
     log.info("[API] Bulk correction: %d updated, %d errors", updated, len(errors))
     return {"updated": updated, "errors": errors}
-
-
-@app.get("/api/trades/all-filled")
-def get_all_filled_trades(_key: None = Depends(_verify_api_key)):
-    """
-    Return all filled trade_executions for DB reconciliation.
-    Temporary diagnostic — remove after Task 2 is closed.
-    """
-    try:
-        db = database.get_db()
-        rows = db.execute("""
-            SELECT alert_id, market_id, market_question, bet_side,
-                   bet_price_filled, bet_price_intended, size_usdc,
-                   resolution_status, pnl, resolved_at, created_at
-            FROM trade_executions
-            WHERE status = 'filled'
-            ORDER BY created_at ASC
-        """).fetchall()
-        return [dict(r) for r in rows]
-    except Exception as exc:
-        log.error("[API] get_all_filled_trades failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/api/diag/pnl-window")
-def get_pnl_window(
-    from_ts: int,
-    until_ts: int,
-    _key: None = Depends(_verify_api_key),
-):
-    """
-    Temporary diagnostic: resolved P&L for a specific created_at window.
-    Used for DB-vs-chain accounting reconciliation.
-    Remove after Task 2 is closed.
-    """
-    try:
-        db = database.get_db()
-        row = db.execute("""
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN resolution_status IN ('won','lost','invalid') THEN 1 ELSE 0 END) as resolved,
-                SUM(CASE WHEN resolution_status='won' THEN 1 ELSE 0 END) as won,
-                SUM(CASE WHEN resolution_status='lost' THEN 1 ELSE 0 END) as lost,
-                SUM(CASE WHEN resolution_status='pending' THEN 1 ELSE 0 END) as still_pending,
-                ROUND(SUM(IFNULL(pnl,0)),2) as db_pnl,
-                ROUND(SUM(size_usdc),2) as total_deployed,
-                ROUND(AVG(CASE WHEN bet_price_filled IS NOT NULL THEN bet_price_filled
-                               ELSE bet_price_intended END),4) as avg_fill_price
-            FROM trade_executions
-            WHERE status = 'filled'
-              AND created_at >= ?
-              AND created_at < ?
-        """, (from_ts, until_ts)).fetchone()
-        by_resolution = db.execute("""
-            SELECT resolution_status, COUNT(*) as n,
-                   ROUND(SUM(IFNULL(pnl,0)),2) as pnl,
-                   ROUND(SUM(size_usdc),2) as deployed,
-                   ROUND(AVG(CASE WHEN bet_price_filled IS NOT NULL THEN bet_price_filled
-                                  ELSE bet_price_intended END),4) as avg_price
-            FROM trade_executions
-            WHERE status = 'filled'
-              AND created_at >= ?
-              AND created_at < ?
-            GROUP BY resolution_status
-        """, (from_ts, until_ts)).fetchall()
-        return {
-            "window": {"from_ts": from_ts, "until_ts": until_ts},
-            "summary": dict(row) if row else {},
-            "by_resolution_status": [dict(r) for r in by_resolution],
-        }
-    except Exception as exc:
-        log.error("[API] get_pnl_window failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.get("/api/diag/categories")
-def get_category_stats(_key: None = Depends(_verify_api_key)):
-    """Temporary: category breakdown for analysis. Remove after mission."""
-    try:
-        db = database.get_db()
-        rows = db.execute("""
-            SELECT ao.market_category,
-                   COUNT(*) as n_trades,
-                   SUM(CASE WHEN te.resolution_status='won' THEN 1 ELSE 0 END) as won,
-                   SUM(CASE WHEN te.resolution_status IN ('won','lost') THEN 1 ELSE 0 END) as resolved,
-                   ROUND(SUM(IFNULL(te.pnl,0)),2) as total_pnl,
-                   ROUND(SUM(te.size_usdc),2) as total_deployed
-            FROM trade_executions te
-            JOIN alert_outcomes ao ON te.alert_id = ao.alert_id
-            WHERE te.status = 'filled'
-            GROUP BY ao.market_category
-            ORDER BY total_deployed DESC
-        """).fetchall()
-        signal_cats = db.execute("""
-            SELECT market_category, COUNT(*) as n FROM alert_outcomes GROUP BY market_category ORDER BY n DESC
-        """).fetchall()
-        pnl_row = db.execute("""
-            SELECT COUNT(*) as total,
-                   SUM(CASE WHEN resolution_status IN ('won','lost','invalid') THEN 1 ELSE 0 END) as resolved,
-                   SUM(CASE WHEN resolution_status='won' THEN 1 ELSE 0 END) as won,
-                   SUM(CASE WHEN resolution_status='lost' THEN 1 ELSE 0 END) as lost,
-                   ROUND(SUM(IFNULL(pnl,0)),2) as cumulative_pnl,
-                   SUM(CASE WHEN resolution_status='pending' THEN 1 ELSE 0 END) as still_pending
-            FROM trade_executions WHERE status='filled'
-        """).fetchone()
-        skips = db.execute("""
-            SELECT gate_outcome,
-                   COUNT(*) as n,
-                   ROUND(AVG(price_delta_abs),3) as avg_delta,
-                   MIN(recorded_at) as first_ts,
-                   MAX(recorded_at) as last_ts
-            FROM skip_telemetry
-            GROUP BY gate_outcome
-            ORDER BY n DESC
-        """).fetchall()
-        return {
-            "trade_by_category": [dict(r) for r in rows],
-            "signal_by_category": [dict(r) for r in signal_cats],
-            "realized_pnl": dict(pnl_row) if pnl_row else {},
-            "skip_telemetry": [dict(r) for r in skips],
-        }
-    except Exception as exc:
-        log.error("[API] get_category_stats failed: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/api/skips/telemetry")

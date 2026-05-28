@@ -22,6 +22,7 @@ Usage:
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 import time
@@ -344,24 +345,47 @@ async def trade_processor_loop(
 # Heartbeat — periodic health log
 # ---------------------------------------------------------------------------
 
+_MEMORY_CEILING_MB: int = int(os.getenv("MEMORY_CEILING_MB", "900"))
+
+
 async def heartbeat_loop(interval_seconds: int = 300) -> None:
     """
     Log a stats summary every `interval_seconds` to confirm the bot is alive.
+    Also checks RSS memory; if above MEMORY_CEILING_MB, exits to trigger Railway restart.
     Railway captures stdout; this makes it easy to see at-a-glance health.
     """
     while True:
         await asyncio.sleep(interval_seconds)
         try:
             stats = database.get_stats()
+
+            # RSS memory check — kill and let Railway restart if we've leaked above ceiling.
+            rss_mb = 0
+            try:
+                import resource as _resource
+                rss_kb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+                rss_mb = rss_kb // 1024  # Linux reports in KB
+            except Exception:
+                pass
+
             log.info(
                 "[Heartbeat] active_markets=%d cached_wallets=%d "
-                "alerts_sent=%d alerts_dry=%d cluster_wallets=%d",
+                "alerts_sent=%d alerts_dry=%d cluster_wallets=%d rss=%dMB",
                 stats["active_markets"],
                 stats["cached_wallets"],
                 stats["alerts_sent"],
                 stats["alerts_dry_run"],
                 stats["flagged_cluster_wallets"],
+                rss_mb,
             )
+
+            if rss_mb > _MEMORY_CEILING_MB:
+                log.critical(
+                    "[Heartbeat] RSS %dMB exceeds ceiling %dMB — exiting for Railway restart",
+                    rss_mb, _MEMORY_CEILING_MB,
+                )
+                os.kill(os.getpid(), signal.SIGTERM)
+
         except Exception as exc:
             log.error("[Heartbeat] Stats error: %s", exc)
 
@@ -488,7 +512,7 @@ async def amain(dry_run: bool) -> None:
         trade_queue=trade_queue,
         get_active_market_ids=lambda: [
             token_id
-            for m in database.get_all_active_markets()
+            for m in database.get_active_markets_in_window(config.FILTER_MAX_HOURS_TO_CLOSE)
             for token_id in m["clob_token_ids"]
         ],
         hot_queue=hot_queue,

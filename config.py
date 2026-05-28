@@ -80,7 +80,8 @@ TRADE_FILTER_AMOUNT: float = TRADE_MIN_SIZE_USD
 GAMMA_API_BASE: str = "https://gamma-api.polymarket.com"
 
 # How often to poll Gamma for new/updated markets.
-MARKET_DISCOVERY_INTERVAL_SECONDS: int = int(os.getenv("MARKET_DISCOVERY_INTERVAL_SECONDS", "300"))  # 5 minutes
+# 1800s (30 min) — markets change slowly; 5 min was downloading ~30 MB/cycle × 288 cycles/day = 8+ GB/day.
+MARKET_DISCOVERY_INTERVAL_SECONDS: int = int(os.getenv("MARKET_DISCOVERY_INTERVAL_SECONDS", "1800"))  # 30 minutes
 
 # How often the resolution-checker polls Gamma for outcome updates.
 RESOLUTION_CHECK_INTERVAL_SECONDS: int = int(os.getenv("RESOLUTION_CHECK_INTERVAL_SECONDS", "3600"))  # 1 hour

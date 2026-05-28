@@ -203,7 +203,7 @@ async def fetch_and_store_markets(client: httpx.AsyncClient) -> int:
     log.info(
         "Market discovery: %d markets upserted (total active in DB: %d)",
         count,
-        len(database.get_all_active_markets()),
+        database.get_active_market_count(),
     )
     return count
 

@@ -469,15 +469,53 @@ def get_market(condition_id: str) -> Optional[dict]:
 
 
 def get_all_active_markets() -> list[dict]:
-    """Return all active markets."""
+    """Return all active markets without raw_json (use get_market() for individual blobs)."""
     rows = get_db().execute(
-        "SELECT * FROM markets WHERE active = 1 ORDER BY updated_at DESC"
+        "SELECT condition_id, title, clob_token_ids, end_date, active, first_seen_at, updated_at "
+        "FROM markets WHERE active = 1 ORDER BY updated_at DESC"
     ).fetchall()
     results = []
     for row in rows:
         d = dict(row)
         d["clob_token_ids"] = json.loads(d["clob_token_ids"] or "[]")
-        d["raw_json"] = json.loads(d["raw_json"] or "{}")
+        results.append(d)
+    return results
+
+
+def get_active_market_count() -> int:
+    """Return count of active markets (cheap, no JSON parsing)."""
+    return get_db().execute(
+        "SELECT COUNT(*) FROM markets WHERE active = 1"
+    ).fetchone()[0]
+
+
+def get_active_markets_in_window(max_hours: float) -> list[dict]:
+    """
+    Return active markets whose end_date falls within the next max_hours hours.
+    Markets with NULL end_date are always included (can't filter what we don't know).
+    Markets already past their end_date are excluded.
+    No raw_json — callers only need condition_id + clob_token_ids for monitoring.
+    """
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc)
+    future = now + _dt.timedelta(hours=max_hours)
+    now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
+    future_str = future.strftime("%Y-%m-%dT%H:%M:%S")
+    rows = get_db().execute(
+        """
+        SELECT condition_id, title, clob_token_ids, end_date
+        FROM markets
+        WHERE active = 1
+          AND (end_date IS NULL
+               OR (end_date > ? AND end_date < ?))
+        ORDER BY end_date ASC
+        """,
+        (now_str, future_str),
+    ).fetchall()
+    results = []
+    for row in rows:
+        d = dict(row)
+        d["clob_token_ids"] = json.loads(d["clob_token_ids"] or "[]")
         results.append(d)
     return results
 

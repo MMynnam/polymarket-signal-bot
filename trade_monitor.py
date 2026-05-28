@@ -488,19 +488,20 @@ class RestTradePoller:
 
     async def _background_scan_loop(self, client: httpx.AsyncClient) -> None:
         """
-        Walk all active markets sequentially as a fallback safety net.
-        Pauses between each market to honour the shared rate limit.
+        Walk actionable markets sequentially as a fallback safety net.
+        Only sweeps markets within the trading window to avoid polling 50k+ markets
+        that the pre-scorer would reject anyway.
         Yields to the hot path naturally since both share _rate_lock.
         """
         while True:
-            markets = database.get_all_active_markets()
+            markets = database.get_active_markets_in_window(config.FILTER_MAX_HOURS_TO_CLOSE)
 
             if not markets:
-                log.debug("[REST/bg] No active markets — waiting 30s")
+                log.debug("[REST/bg] No actionable markets — waiting 30s")
                 await asyncio.sleep(30)
                 continue
 
-            log.info("[REST/bg] Starting background sweep of %d markets", len(markets))
+            log.info("[REST/bg] Starting background sweep of %d actionable markets", len(markets))
             cycle_start = time.monotonic()
 
             for m in markets:
