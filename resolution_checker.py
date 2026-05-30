@@ -199,31 +199,66 @@ async def _refresh_market_from_gamma(
     market_id: str,
 ) -> Optional[dict]:
     """
-    Fetch one specific market from Gamma by conditionId and update the local DB.
-    Returns the updated local market dict, or None if:
-      - The Gamma API call failed
-      - Gamma returned a market with a different conditionId (known lookup bug)
+    Fetch one specific market from Gamma and update the local DB.
+    Returns the updated local market dict, or None if the fetch failed or Gamma
+    returned a market with a different conditionId.
 
-    NOTE: Gamma conditionIds lookup returns incorrect markets for some IDs.
-    We verify the returned conditionId matches before trusting the response.
+    Strategy: prefer the reliable by-id endpoint (/markets/{gamma_id}) using the
+    numeric Gamma id stored in the local snapshot's raw_json. The legacy
+    ?conditionIds= query returns the WRONG market for many ids (known Gamma bug:
+    it ignores the filter and returns an unrelated, still-open market), which is
+    why stale resolved markets never refreshed. The conditionIds query is kept
+    only as a last-resort fallback, and every response is conditionId-verified.
     """
-    url = f"{config.GAMMA_API_BASE}/markets"
-    try:
-        data = await _get_with_retry(client, url, params={"conditionIds": market_id})
-    except RuntimeError as exc:
-        log.warning(
-            "[ResolutionChecker] Gamma refresh failed for %s: %s", market_id, exc
-        )
-        return None
+    # Pull the numeric Gamma id from the local snapshot (set by market_discovery).
+    gamma_id = None
+    local = database.get_market(market_id)
+    if local:
+        rj = local.get("raw_json") or {}
+        if isinstance(rj, str):
+            try:
+                rj = json.loads(rj)
+            except (ValueError, TypeError):
+                rj = {}
+        if isinstance(rj, dict):
+            gamma_id = rj.get("id")
 
-    if isinstance(data, list):
-        if not data:
+    market_data = None
+
+    # Primary: reliable by-id lookup.
+    if gamma_id:
+        try:
+            data = await _get_with_retry(
+                client, f"{config.GAMMA_API_BASE}/markets/{gamma_id}"
+            )
+            if isinstance(data, list):
+                market_data = data[0] if data else None
+            elif isinstance(data, dict):
+                market_data = data
+        except RuntimeError as exc:
+            log.warning(
+                "[ResolutionChecker] Gamma by-id refresh failed for %s (id=%s): %s",
+                market_id, gamma_id, exc,
+            )
+
+    # Fallback: legacy conditionIds query (unreliable; verified below).
+    if market_data is None:
+        try:
+            data = await _get_with_retry(
+                client, f"{config.GAMMA_API_BASE}/markets",
+                params={"conditionIds": market_id},
+            )
+        except RuntimeError as exc:
+            log.warning(
+                "[ResolutionChecker] Gamma refresh failed for %s: %s", market_id, exc
+            )
             return None
-        market_data = data[0]
-    elif isinstance(data, dict):
-        market_data = data
-    else:
-        return None
+        if isinstance(data, list):
+            market_data = data[0] if data else None
+        elif isinstance(data, dict):
+            market_data = data
+        if market_data is None:
+            return None
 
     # Verify Gamma returned the market we asked for.
     returned_id = (
