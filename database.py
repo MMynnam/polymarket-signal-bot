@@ -787,10 +787,16 @@ def insert_alert_outcome(
         )
 
 
-def get_pending_outcomes(limit: int = 500) -> list[dict]:
+def get_pending_outcomes(limit: int = 5000) -> list[dict]:
     """
     Return all alert_outcome rows with resolution_status='pending'.
     Called by the resolution-checker each cycle.
+
+    The limit is high (was 500) to avoid FIFO starvation: with hundreds of
+    alerts/day, a 500/cycle cap left thousands of old alerts permanently
+    ungraded. This is safe — resolution_checker only hits Gamma for markets it
+    can't grade from local data (past-end + non-decisive), so per-cycle network
+    cost is bounded by genuinely-unresolved markets, not by this limit.
     """
     rows = get_db().execute(
         """
