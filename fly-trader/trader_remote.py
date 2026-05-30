@@ -2197,8 +2197,8 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
 
     Resolution semantics (win/loss decided by curPrice, NOT the redeemable flag):
       - In /v1/closed-positions               → settled & already redeemed; won if
-        curPrice≈1 else lost, P&L from realizedPnl (actual cash recovered).
-        Auto-redeemed WINS leave /v1/positions and land here — they are NOT losses.
+        curPrice≈1 else lost. Auto-redeemed WINS leave /v1/positions and land
+        here — being absent from /v1/positions does NOT make them losses.
       - In /v1/positions, redeemable=True      → market resolved, tokens still held;
         won if curPrice≈1, LOST if curPrice≈0. The redeemable flag alone does NOT
         mean "won": losing tokens are equally "redeemable" (they burn for $0).
@@ -2283,21 +2283,19 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
     # settle price as the decider — the redeemable flag does NOT distinguish them.
     _RESOLVED_WIN_PRICE = 0.5  # decisive midpoint; resolved outcomes are 0 or 1
 
-    def _classify(mid: str) -> tuple[Optional[str], Optional[float]]:
-        """Return (status, realized_pnl) for a market; (None, None) if unresolved/unknown."""
+    def _classify(mid: str) -> Optional[str]:
+        """Return 'won'/'lost' for a resolved market; None if unresolved/unknown."""
         cp = closed_positions.get(mid)
         if cp is not None:
             cur = float(cp.get("curPrice") or 0.0)
-            rp = cp.get("realizedPnl")
-            status = "won" if cur >= _RESOLVED_WIN_PRICE else "lost"
-            return status, (float(rp) if rp is not None else None)
+            return "won" if cur >= _RESOLVED_WIN_PRICE else "lost"
         pos = on_chain.get(mid)
         if pos is None:
-            return None, None  # auto-redeemed win or never-held → do NOT assume lost
+            return None  # auto-redeemed win or never-held → do NOT assume lost
         if pos.get("redeemable"):
             cur = float(pos.get("curPrice") or 0.0)
-            return ("won" if cur >= _RESOLVED_WIN_PRICE else "lost"), None
-        return None, None  # held, market still live → genuinely open
+            return "won" if cur >= _RESOLVED_WIN_PRICE else "lost"
+        return None  # held, market still live → genuinely open
 
     resolved_count = 0
     wins = 0
@@ -2306,7 +2304,7 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
     now_ts = int(time.time())
 
     for market_id, trades in pending_by_market.items():
-        resolution_status, realized_pnl = _classify(market_id)
+        resolution_status = _classify(market_id)
         if resolution_status is None:
             continue
 
@@ -2318,12 +2316,10 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
             fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.5
             size_usdc = trade.get("size_usdc") or TRADING_BET_SIZE_USDC
 
-            if resolution_status == "won":
-                # Prefer actual realized cash from closed-positions; fall back to
-                # notional payout for resolved-but-unredeemed wins.
-                pnl = realized_pnl if realized_pnl is not None else size_usdc * (1.0 / fill_price - 1.0)
-            else:
-                pnl = realized_pnl if realized_pnl is not None else -size_usdc
+            # Per-ROW P&L, consistent with _check_pending_resolutions. NOT the
+            # closed-positions realizedPnl, which is the AGGREGATE for a conditionId
+            # and would multi-count when several pending trades share a market.
+            pnl = size_usdc * (1.0 / fill_price - 1.0) if resolution_status == "won" else -size_usdc
 
             await _api_patch(http_client, f"/api/trades/{alert_id}/resolution", {
                 "resolution_status": resolution_status,
