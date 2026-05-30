@@ -154,8 +154,13 @@ FILTER_MAX_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MAX_HOURS_TO_CLOSE", 
 
 # Profitable price band: only alert on bets within this range.
 # Distinct from FILTER_MIN/MAX_PRICE (which reject glitch prices at 1-2¢).
-# Data: lean (35-72%) is the only band with positive ROI; longshots and favorites lose.
-FILTER_MIN_BET_PRICE: float = float(os.getenv("FILTER_MIN_BET_PRICE", "0.15"))
+# Floor raised 0.15→0.50 (favorites-only) on post-grade re-analysis: the p<=0.50
+# longshot band bleeds ~-8pp excess return above implied (robust through
+# drop-top-2, n=480 distinct); favorites are ~breakeven on the line and retain
+# the crypto-favorites edge (p>0.5). 14-day holdout validated: retained excess
+# +5.4pp vs +0.6pp baseline; excluded band -10.4pp. (Prior "lean 35-72%"
+# rationale was derived from inverted accounting — superseded.)
+FILTER_MIN_BET_PRICE: float = float(os.getenv("FILTER_MIN_BET_PRICE", "0.50"))
 FILTER_MAX_BET_PRICE: float = float(os.getenv("FILTER_MAX_BET_PRICE", "0.90"))
 
 # Market categories to exclude entirely. Parsed as comma-separated string from env.
