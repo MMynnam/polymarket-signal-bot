@@ -2187,183 +2187,6 @@ async def _seed_held_positions(http_client: httpx.AsyncClient) -> None:
 # Resolution polling
 # ---------------------------------------------------------------------------
 
-_POLYMARKET_DATA_API = "https://data-api.polymarket.com"
-
-
-async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
-    """
-    Reconcile Railway's pending trade_executions against on-chain reality using
-    Polymarket's /v1/positions endpoint (complete wallet state, not winners-only).
-
-    Resolution semantics (win/loss decided by curPrice, NOT the redeemable flag):
-      - In /v1/closed-positions               → settled & already redeemed; won if
-        curPrice≈1 else lost. Auto-redeemed WINS leave /v1/positions and land
-        here — being absent from /v1/positions does NOT make them losses.
-      - In /v1/positions, redeemable=True      → market resolved, tokens still held;
-        won if curPrice≈1, LOST if curPrice≈0. The redeemable flag alone does NOT
-        mean "won": losing tokens are equally "redeemable" (they burn for $0).
-      - In /v1/positions, redeemable=False, 0<curPrice<1 → genuinely open, skip.
-      - Not present in EITHER endpoint         → unknown → skip (do NOT assume lost).
-
-    Prior bug: this mapped redeemable→won and absent→lost, which is inverted —
-    held worthless losers (redeemable, curPrice 0) were booked as wins and
-    auto-redeemed winners (absent from /v1/positions) were booked as losses,
-    firing false "+ROI" alerts with no matching pUSD inflow.
-
-    Fail-closed on /v1/positions: if it fails, nothing is patched. /v1/closed-
-    positions is fail-OPEN (proceed without it; absent markets stay pending).
-    CB history is cleared after each run to prevent historical backfill from
-    injecting one-sided wins into the rolling circuit-breaker window.
-    """
-    open_positions = await _api_get(http_client, "/api/positions/open")
-    if not isinstance(open_positions, list) or not open_positions:
-        return
-
-    # Index Railway's pending trades by market_id
-    pending_by_market: dict[str, list[dict]] = {}
-    for trade in open_positions:
-        mid = trade.get("market_id")
-        if mid and trade.get("alert_id") not in _notified_resolutions:
-            pending_by_market.setdefault(mid, []).append(trade)
-
-    if not pending_by_market:
-        return
-
-    query_address = TRADING_FUNDER_ADDRESS or _wallet_address
-    if not query_address or query_address == "<unknown>":
-        log.warning("[CLOBResolve] No wallet address — skipping")
-        return
-
-    # /v1/positions = currently-held conditional tokens (open markets +
-    # resolved-but-unredeemed). Auto-redeemed WINS are burnt and disappear from
-    # here — they live in /v1/closed-positions. So absence ≠ loss.
-    on_chain: dict[str, dict] = {}
-    try:
-        resp = await http_client.get(
-            f"{_POLYMARKET_DATA_API}/v1/positions",
-            params={"user": query_address, "limit": 500},
-            timeout=15,
-        )
-        if resp.status_code != 200:
-            log.warning("[CLOBResolve] /v1/positions returned %d — skipping (fail-closed)", resp.status_code)
-            return
-        for pos in resp.json():
-            cid = pos.get("conditionId", "")
-            if cid:
-                on_chain[cid] = pos
-    except Exception as exc:
-        log.warning("[CLOBResolve] /v1/positions fetch failed: %s — skipping (fail-closed)", exc)
-        return
-
-    # /v1/closed-positions = settled positions whose tokens were already redeemed
-    # (Polymarket auto-redemption burns winning tokens). realizedPnl is the actual
-    # cash recovered. Fail-OPEN: if this call fails we still process /v1/positions,
-    # but markets absent from both endpoints stay pending rather than being guessed.
-    closed_positions: dict[str, dict] = {}
-    try:
-        cresp = await http_client.get(
-            f"{_POLYMARKET_DATA_API}/v1/closed-positions",
-            params={"user": query_address, "limit": 500},
-            timeout=15,
-        )
-        if cresp.status_code == 200:
-            for pos in cresp.json():
-                cid = pos.get("conditionId", "")
-                if cid:
-                    closed_positions[cid] = pos
-        else:
-            log.warning("[CLOBResolve] /v1/closed-positions returned %d — proceeding without it", cresp.status_code)
-    except Exception as exc:
-        log.warning("[CLOBResolve] /v1/closed-positions fetch failed: %s — proceeding without it", exc)
-
-    log.info("[CLOBResolve] %d held, %d closed/redeemed on-chain entries, %d pending in Railway",
-             len(on_chain), len(closed_positions), len(pending_by_market))
-
-    # A resolved market's held outcome settles to ≈1 (won) or ≈0 (lost). Use the
-    # settle price as the decider — the redeemable flag does NOT distinguish them.
-    _RESOLVED_WIN_PRICE = 0.5  # decisive midpoint; resolved outcomes are 0 or 1
-
-    def _classify(mid: str) -> Optional[str]:
-        """Return 'won'/'lost' for a resolved market; None if unresolved/unknown."""
-        cp = closed_positions.get(mid)
-        if cp is not None:
-            cur = float(cp.get("curPrice") or 0.0)
-            return "won" if cur >= _RESOLVED_WIN_PRICE else "lost"
-        pos = on_chain.get(mid)
-        if pos is None:
-            return None  # auto-redeemed win or never-held → do NOT assume lost
-        if pos.get("redeemable"):
-            cur = float(pos.get("curPrice") or 0.0)
-            return "won" if cur >= _RESOLVED_WIN_PRICE else "lost"
-        return None  # held, market still live → genuinely open
-
-    resolved_count = 0
-    wins = 0
-    losses = 0
-    total_pnl = 0.0
-    now_ts = int(time.time())
-
-    for market_id, trades in pending_by_market.items():
-        resolution_status = _classify(market_id)
-        if resolution_status is None:
-            continue
-
-        for trade in trades:
-            alert_id = trade["alert_id"]
-            if alert_id in _notified_resolutions:
-                continue
-
-            fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.5
-            size_usdc = trade.get("size_usdc") or TRADING_BET_SIZE_USDC
-
-            # Per-ROW P&L, consistent with _check_pending_resolutions. NOT the
-            # closed-positions realizedPnl, which is the AGGREGATE for a conditionId
-            # and would multi-count when several pending trades share a market.
-            pnl = size_usdc * (1.0 / fill_price - 1.0) if resolution_status == "won" else -size_usdc
-
-            await _api_patch(http_client, f"/api/trades/{alert_id}/resolution", {
-                "resolution_status": resolution_status,
-                "pnl": pnl,
-                "resolved_at": now_ts,
-                "resolution_source": "backfill",
-            })
-
-            # Do NOT update _cb_pnl_history: backfill skews the rolling CB window.
-            # CB rebuilds prospectively from _check_pending_resolutions.
-            # resolution_source='backfill' also excludes these from CB seeding on restart.
-            _notified_resolutions.add(alert_id)
-            bside = trade.get("bet_side", "")
-            if market_id and bside:
-                _held_positions.discard((market_id, bside))
-
-            resolved_count += 1
-            if resolution_status == "won":
-                wins += 1
-            else:
-                losses += 1
-            total_pnl += pnl
-            log.info(
-                "[CLOBResolve] %s → %s | P&L: $%+.2f | market=%s",
-                alert_id[:12], resolution_status, pnl, market_id[:16],
-            )
-
-    # Clear CB history: patching historical trades with resolved_at=now means
-    # _backfill_cb_pnl_history would re-ingest them on restart as if recent.
-    # Prospective resolutions from _check_pending_resolutions populate CB correctly.
-    _cb_pnl_history.clear()
-
-    if resolved_count > 0:
-        sign = "+" if total_pnl >= 0 else ""
-        text = (
-            f"📦 <b>CLOB BACKFILL: {resolved_count} position(s) resolved</b>\n"
-            f"✅ {wins} won · ❌ {losses} lost\n"
-            f"💰 <b>Net P&amp;L:</b> ${sign}{total_pnl:.2f} USDC\n"
-            f"<i>Source: /v1/positions + /v1/closed-positions (win/loss by settle price)</i>"
-        )
-        await _send_telegram(http_client, text)
-        log.info("[CLOBResolve] Backfill complete: %d resolved (%d W / %d L), net P&L $%+.2f | CB cleared",
-                 resolved_count, wins, losses, total_pnl)
-
 
 async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
     """
@@ -2641,20 +2464,22 @@ async def main() -> None:
         # If this fails, dedup stays inactive and a warning fires each cycle.
         await _seed_held_positions(http_client)
 
-        # Immediately backfill any resolutions that the Railway resolution_checker
-        # missed (FIFO-500 queue starvation). This unblocks the position cap on restart.
+        # Immediately grade any alerts the Railway resolution_checker has already
+        # resolved (alert_outcomes), so the position cap unblocks on restart.
+        # NOTE: on-chain backfill (_resolve_from_clob_positions) was removed — its
+        # curPrice grading was unreliable for negative-risk / "No"-side markets.
+        # Resolution is now sourced solely from alert_outcomes (Gamma, side-matched).
         try:
-            await _resolve_from_clob_positions(http_client)
+            await _check_pending_resolutions(http_client)
         except Exception as exc:
-            log.warning("[CLOBResolve] Startup backfill failed (non-fatal): %s", exc)
+            log.warning("[Resolution] Startup resolution sync failed (non-fatal): %s", exc)
 
         while True:
             try:
                 now = time.time()
 
-                # Resolution poll (every 10 min)
+                # Resolution poll (every 10 min) — sourced from alert_outcomes only.
                 if now - _last_resolution_check >= _RESOLUTION_POLL_INTERVAL:
-                    await _resolve_from_clob_positions(http_client)
                     await _check_pending_resolutions(http_client)
                     _last_resolution_check = now
 
