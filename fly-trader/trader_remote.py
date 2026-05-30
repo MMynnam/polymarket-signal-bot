@@ -2195,12 +2195,23 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
     Reconcile Railway's pending trade_executions against on-chain reality using
     Polymarket's /v1/positions endpoint (complete wallet state, not winners-only).
 
-    Resolution semantics:
-      - In /v1/positions with redeemable=True  → won (awaiting claim)
-      - NOT in /v1/positions at all            → lost (no tokens held = market expired worthless)
-      - In /v1/positions with redeemable=False → genuinely still open, skip
+    Resolution semantics (win/loss decided by curPrice, NOT the redeemable flag):
+      - In /v1/closed-positions               → settled & already redeemed; won if
+        curPrice≈1 else lost. Auto-redeemed WINS leave /v1/positions and land
+        here — being absent from /v1/positions does NOT make them losses.
+      - In /v1/positions, redeemable=True      → market resolved, tokens still held;
+        won if curPrice≈1, LOST if curPrice≈0. The redeemable flag alone does NOT
+        mean "won": losing tokens are equally "redeemable" (they burn for $0).
+      - In /v1/positions, redeemable=False, 0<curPrice<1 → genuinely open, skip.
+      - Not present in EITHER endpoint         → unknown → skip (do NOT assume lost).
 
-    Fail-closed: if /v1/positions fetch fails, nothing is patched.
+    Prior bug: this mapped redeemable→won and absent→lost, which is inverted —
+    held worthless losers (redeemable, curPrice 0) were booked as wins and
+    auto-redeemed winners (absent from /v1/positions) were booked as losses,
+    firing false "+ROI" alerts with no matching pUSD inflow.
+
+    Fail-closed on /v1/positions: if it fails, nothing is patched. /v1/closed-
+    positions is fail-OPEN (proceed without it; absent markets stay pending).
     CB history is cleared after each run to prevent historical backfill from
     injecting one-sided wins into the rolling circuit-breaker window.
     """
@@ -2223,8 +2234,9 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
         log.warning("[CLOBResolve] No wallet address — skipping")
         return
 
-    # /v1/positions returns ALL currently held conditional tokens (open + redeemable wins).
-    # Positions absent from this response have no tokens → closed as losses.
+    # /v1/positions = currently-held conditional tokens (open markets +
+    # resolved-but-unredeemed). Auto-redeemed WINS are burnt and disappear from
+    # here — they live in /v1/closed-positions. So absence ≠ loss.
     on_chain: dict[str, dict] = {}
     try:
         resp = await http_client.get(
@@ -2243,24 +2255,57 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
         log.warning("[CLOBResolve] /v1/positions fetch failed: %s — skipping (fail-closed)", exc)
         return
 
-    log.info("[CLOBResolve] /v1/positions: %d on-chain entries, %d pending in Railway",
-             len(on_chain), len(pending_by_market))
+    # /v1/closed-positions = settled positions whose tokens were already redeemed
+    # (Polymarket auto-redemption burns winning tokens). realizedPnl is the actual
+    # cash recovered. Fail-OPEN: if this call fails we still process /v1/positions,
+    # but markets absent from both endpoints stay pending rather than being guessed.
+    closed_positions: dict[str, dict] = {}
+    try:
+        cresp = await http_client.get(
+            f"{_POLYMARKET_DATA_API}/v1/closed-positions",
+            params={"user": query_address, "limit": 500},
+            timeout=15,
+        )
+        if cresp.status_code == 200:
+            for pos in cresp.json():
+                cid = pos.get("conditionId", "")
+                if cid:
+                    closed_positions[cid] = pos
+        else:
+            log.warning("[CLOBResolve] /v1/closed-positions returned %d — proceeding without it", cresp.status_code)
+    except Exception as exc:
+        log.warning("[CLOBResolve] /v1/closed-positions fetch failed: %s — proceeding without it", exc)
+
+    log.info("[CLOBResolve] %d held, %d closed/redeemed on-chain entries, %d pending in Railway",
+             len(on_chain), len(closed_positions), len(pending_by_market))
+
+    # A resolved market's held outcome settles to ≈1 (won) or ≈0 (lost). Use the
+    # settle price as the decider — the redeemable flag does NOT distinguish them.
+    _RESOLVED_WIN_PRICE = 0.5  # decisive midpoint; resolved outcomes are 0 or 1
+
+    def _classify(mid: str) -> Optional[str]:
+        """Return 'won'/'lost' for a resolved market; None if unresolved/unknown."""
+        cp = closed_positions.get(mid)
+        if cp is not None:
+            cur = float(cp.get("curPrice") or 0.0)
+            return "won" if cur >= _RESOLVED_WIN_PRICE else "lost"
+        pos = on_chain.get(mid)
+        if pos is None:
+            return None  # auto-redeemed win or never-held → do NOT assume lost
+        if pos.get("redeemable"):
+            cur = float(pos.get("curPrice") or 0.0)
+            return "won" if cur >= _RESOLVED_WIN_PRICE else "lost"
+        return None  # held, market still live → genuinely open
 
     resolved_count = 0
+    wins = 0
+    losses = 0
     total_pnl = 0.0
     now_ts = int(time.time())
 
     for market_id, trades in pending_by_market.items():
-        pos = on_chain.get(market_id)
-
-        if pos is None:
-            # No tokens held for this market → expired worthless → lost
-            resolution_status = "lost"
-        elif pos.get("redeemable"):
-            # Tokens held, market resolved, redemption pending → won
-            resolution_status = "won"
-        else:
-            # Tokens held, market still live → genuinely open, leave pending
+        resolution_status = _classify(market_id)
+        if resolution_status is None:
             continue
 
         for trade in trades:
@@ -2271,6 +2316,9 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
             fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.5
             size_usdc = trade.get("size_usdc") or TRADING_BET_SIZE_USDC
 
+            # Per-ROW P&L, consistent with _check_pending_resolutions. NOT the
+            # closed-positions realizedPnl, which is the AGGREGATE for a conditionId
+            # and would multi-count when several pending trades share a market.
             pnl = size_usdc * (1.0 / fill_price - 1.0) if resolution_status == "won" else -size_usdc
 
             await _api_patch(http_client, f"/api/trades/{alert_id}/resolution", {
@@ -2289,6 +2337,10 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
                 _held_positions.discard((market_id, bside))
 
             resolved_count += 1
+            if resolution_status == "won":
+                wins += 1
+            else:
+                losses += 1
             total_pnl += pnl
             log.info(
                 "[CLOBResolve] %s → %s | P&L: $%+.2f | market=%s",
@@ -2301,17 +2353,16 @@ async def _resolve_from_clob_positions(http_client: httpx.AsyncClient) -> None:
     _cb_pnl_history.clear()
 
     if resolved_count > 0:
-        wins = sum(1 for t in pending_by_market.values() for tr in t
-                   if tr["alert_id"] in _notified_resolutions
-                   and on_chain.get(t[0].get("market_id") if t else "") is not None)
         sign = "+" if total_pnl >= 0 else ""
         text = (
             f"📦 <b>CLOB BACKFILL: {resolved_count} position(s) resolved</b>\n"
+            f"✅ {wins} won · ❌ {losses} lost\n"
             f"💰 <b>Net P&amp;L:</b> ${sign}{total_pnl:.2f} USDC\n"
-            f"<i>Source: /v1/positions (complete state, wins + losses)</i>"
+            f"<i>Source: /v1/positions + /v1/closed-positions (win/loss by settle price)</i>"
         )
         await _send_telegram(http_client, text)
-        log.info("[CLOBResolve] Backfill complete: %d resolved, net P&L $%+.2f | CB cleared", resolved_count, total_pnl)
+        log.info("[CLOBResolve] Backfill complete: %d resolved (%d W / %d L), net P&L $%+.2f | CB cleared",
+                 resolved_count, wins, losses, total_pnl)
 
 
 async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
