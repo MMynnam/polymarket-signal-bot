@@ -150,24 +150,32 @@ FILTER_MIN_ACTIONABLE_MINUTES: int = int(os.getenv("FILTER_MIN_ACTIONABLE_MINUTE
 # markets (Elon tweet counts, macro) that failed concentration testing.
 # When end_date is unavailable, the trade passes through unchanged.
 FILTER_MIN_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MIN_HOURS_TO_CLOSE", "6"))
-FILTER_MAX_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MAX_HOURS_TO_CLOSE", "72"))
+# Entertainment-mode (2026-05-31): tightened 72h→48h for faster "did it hit?" cycles
+# and better capital turnover on the thin balance — resolutions land sooner, the bot
+# redeploys sooner, more outcome moments per day on the spectator feed.
+FILTER_MAX_HOURS_TO_CLOSE: float = float(os.getenv("FILTER_MAX_HOURS_TO_CLOSE", "48"))
 
-# Profitable price band: only alert on bets within this range.
+# Tradeable price band: only alert on bets within this range.
 # Distinct from FILTER_MIN/MAX_PRICE (which reject glitch prices at 1-2¢).
-# Floor raised 0.15→0.50 (favorites-only) on post-grade re-analysis: the p<=0.50
-# longshot band bleeds ~-8pp excess return above implied (robust through
-# drop-top-2, n=480 distinct); favorites are ~breakeven on the line and retain
-# the crypto-favorites edge (p>0.5). 14-day holdout validated: retained excess
-# +5.4pp vs +0.6pp baseline; excluded band -10.4pp. (Prior "lean 35-72%"
-# rationale was derived from inverted accounting — superseded.)
-FILTER_MIN_BET_PRICE: float = float(os.getenv("FILTER_MIN_BET_PRICE", "0.50"))
+# Entertainment-mode (2026-05-31): floor relaxed 0.50→0.30 to restore ~30% of alert
+# volume the 0.50 favorites-only cut. KNOWN BLEED COST: the (0.30,0.50) band runs
+# ~-8pp excess above implied (the loss-reduction rationale for 0.50 still holds AS
+# MATH) — we're trading that bleed for activity/drama on a $20 spectator wallet,
+# bounded by ≤$2/trade + the $10 daily-loss cap + the magnitude circuit breaker.
+# (Deep <0.30 longshots still excluded — drop further or add a capped drama path if
+# more lottery-ticket drama is wanted.)
+FILTER_MIN_BET_PRICE: float = float(os.getenv("FILTER_MIN_BET_PRICE", "0.30"))
 FILTER_MAX_BET_PRICE: float = float(os.getenv("FILTER_MAX_BET_PRICE", "0.90"))
 
 # Market categories to exclude entirely. Parsed as comma-separated string from env.
-# Data: sports showed 51% win rate, -0.17 ROI across 79 resolved alerts.
+# Entertainment-mode (2026-05-31): sports REINSTATED (default ""). Sports were
+# excluded wholesale; clean-data ROI is only ~-3.5% on favorites (the old -39.9%
+# read was inversion-era), and sports are entertainment-dense — daily matches,
+# "did they win?!" moments. The small bleed is bounded by the sizing/daily-loss
+# rails. (Soccer-favorites trader filter also disabled, see fly-trader config.)
 FILTER_EXCLUDED_CATEGORIES: list[str] = [
     c.strip().lower()
-    for c in os.getenv("FILTER_EXCLUDED_CATEGORIES", "sports").split(",")
+    for c in os.getenv("FILTER_EXCLUDED_CATEGORIES", "").split(",")
     if c.strip()
 ]
 
