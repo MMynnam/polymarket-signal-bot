@@ -293,10 +293,85 @@ def format_weekly_highlights(resolved, balance):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Monthly highlights (last Sunday of the month)
+# ---------------------------------------------------------------------------
+
+def _active_days(resolved):
+    """Distinct UTC calendar days with at least one resolution."""
+    days = set()
+    for t in resolved:
+        ts = t.get("resolved_at")
+        if ts:
+            days.add(datetime.utcfromtimestamp(ts).date())
+    return len(days)
+
+
+def _monthly_commentary(net, best_streak, wins, losses):
+    total = wins + losses
+    if total == 0:
+        return "a quiet month on the tape. building. 🧱"
+    if net > 5.0:
+        return "green month. the syndicate eats well. 🍾"
+    if net < -5.0:
+        return "red month — tuition paid to the market. we learn. 🎓"
+    if best_streak >= 5:
+        return f"a {best_streak}-win heater headlined the month. 🔥"
+    if wins / total >= 0.55:
+        return "more right than wrong. quietly stacking. 🧊"
+    return "a grind of a month — still standing. 🫡"
+
+
+def format_monthly_highlights(resolved, balance, prev_net=None):
+    """Last-Sunday-of-month review over the prior 30 days, or a quiet-month line.
+    prev_net (net of the 30 days before this window) adds optional MoM framing;
+    pass None to omit it (e.g. first run, before two full windows of data)."""
+    now = datetime.utcnow()
+    start = now - timedelta(days=30)
+    rng = f"{start.strftime('%b')} {start.day} – {now.strftime('%b')} {now.day}"
+    lines = [f"📅 <b>MONTH IN REVIEW</b> — <i>{rng}</i>", ""]
+
+    if not resolved:
+        lines.append("🦗 <b>Quiet month</b> — nothing resolved. The grind continues. 🫡")
+        if balance is not None:
+            lines.append(f"🏦 <b>Wallet:</b> ${balance:.2f} free")
+        return "\n".join(lines)
+
+    wins = [t for t in resolved if t["resolution_status"] == "won"]
+    losses = [t for t in resolved if t["resolution_status"] == "lost"]
+    net = sum((t.get("pnl") or 0.0) for t in resolved)
+    best = _best_win_streak(resolved)
+
+    streak_bit = f"  ·  best run: 🔥 {best}W" if best >= 2 else ""
+    lines.append(f"🏁 <b>{len(wins)}W–{len(losses)}L</b> on the month{streak_bit}")
+    net_line = f"{'📈' if net >= 0 else '📉'} <b>Net:</b> ${net:+.2f} <i>(notional)</i>"
+    if prev_net is not None:
+        delta = net - prev_net
+        net_line += f"  ·  prev 30d ${prev_net:+.2f} ({'▲' if delta >= 0 else '▼'}${abs(delta):.2f})"
+    lines.append(net_line)
+    lines.append(f"🗓️ <b>{_active_days(resolved)}</b> active days  ·  {len(resolved)} resolved")
+    lines.append("")
+    if wins:
+        bw = max(wins, key=lambda t: t.get("pnl") or 0.0)
+        lines.append(f"🏆 <b>Win of the month:</b> {html.escape(str(bw['bet_side']))} — {_mkt(bw)}  <b>${(bw.get('pnl') or 0.0):+.2f}</b>")
+        w = min(wins, key=_price)
+        lines.append(f"🎲 <b>Wildest call:</b> {html.escape(str(w['bet_side']))} on {_mkt(w)} hit at <b>{_price(w)*100:.0f}¢</b> 🤯")
+    if losses:
+        bl = min(losses, key=lambda t: t.get("pnl") or 0.0)
+        lines.append(f"💸 <b>Loss of the month:</b> {html.escape(str(bl['bet_side']))} — {_mkt(bl)}  <b>${(bl.get('pnl') or 0.0):+.2f}</b>")
+    lines.append("")
+    if balance is not None:
+        lines.append(f"🏦 <b>Wallet:</b> ${balance:.2f} free")
+    lines.append("")
+    lines.append(f"<i>{_monthly_commentary(net, best, len(wins), len(losses))}</i>")
+    return "\n".join(lines)
+
+
 async def results_recap_loop(dry_run: bool = False) -> None:
     """Daily loop at RECAP_SEND_HOUR_UTC:00 — posts the daily recap (with any
-    milestone), and on Sundays also the weekly highlights, in the same slot."""
-    log.info("[Recap] Started (daily recap + Sunday weekly at %02d:00 UTC, dry_run=%s)",
+    milestone); on the last Sunday of the month posts the monthly review, on
+    other Sundays the weekly highlights — all in the same slot."""
+    log.info("[Recap] Started (daily + Sunday weekly + last-Sunday monthly at %02d:00 UTC, dry_run=%s)",
              RECAP_SEND_HOUR_UTC, dry_run)
     sender = TelegramSender(token=config.TELEGRAM_BOT_TOKEN, chat_id=config.TELEGRAM_CHAT_ID)
     async with httpx.AsyncClient() as client:
@@ -319,9 +394,23 @@ async def results_recap_loop(dry_run: bool = False) -> None:
                 daily = format_results_recap(resolved, open_count, streak, balance, milestone)
                 if daily:
                     posts.append(("daily", daily))
-                if datetime.utcnow().weekday() == 6:  # Sunday → also the week-in-review
-                    weekly_resolved, _, _ = _fetch_recap_data(24 * 7)
-                    posts.append(("weekly", format_weekly_highlights(weekly_resolved, balance)))
+                nowd = datetime.utcnow()
+                if nowd.weekday() == 6:  # Sunday
+                    # Last Sunday of the month ⇔ the next Sunday falls in a different
+                    # month. Holds across the year boundary too (late-Dec → Jan changes
+                    # the month), so no explicit year check is needed.
+                    if (nowd + timedelta(days=7)).month != nowd.month:
+                        # Last Sunday of the month → monthly review (takes the slot;
+                        # weekly is skipped this week to avoid two near-identical posts).
+                        all60, _, _ = _fetch_recap_data(24 * 60)
+                        cut = int((nowd - timedelta(days=30)).timestamp())
+                        last30 = [t for t in all60 if (t.get("resolved_at") or 0) >= cut]
+                        prev30 = [t for t in all60 if (t.get("resolved_at") or 0) < cut]
+                        prev_net = sum((t.get("pnl") or 0.0) for t in prev30) if prev30 else None
+                        posts.append(("monthly", format_monthly_highlights(last30, balance, prev_net)))
+                    else:
+                        weekly_resolved, _, _ = _fetch_recap_data(24 * 7)
+                        posts.append(("weekly", format_weekly_highlights(weekly_resolved, balance)))
 
                 if not posts:
                     log.info("[Recap] Nothing to recap — skipping")
