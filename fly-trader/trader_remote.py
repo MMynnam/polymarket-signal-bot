@@ -42,10 +42,15 @@ TRADING_PRIVATE_KEY: str = os.getenv("TRADING_PRIVATE_KEY", "")
 TRADING_BET_SIZE_USDC: float = float(os.getenv("TRADING_BET_SIZE_USDC", "2.0"))
 TRADING_BET_PERCENTAGE: float = float(os.getenv("TRADING_BET_PERCENTAGE", "0.02"))
 TRADING_MIN_BET_USDC: float = float(os.getenv("TRADING_MIN_BET_USDC", "1.0"))
-# Safety rail (fun-bot, ~$20 wallet): absolute per-trade cap $2 ≈ ≤10% of free balance.
-# Lowered 10→2 so dynamic sizing can never stake a meaningful fraction of the wallet.
-TRADING_MAX_BET_USDC: float = float(os.getenv("TRADING_MAX_BET_USDC", "2.0"))
-TRADING_MAX_DAILY_LOSS_USDC: float = float(os.getenv("TRADING_MAX_DAILY_LOSS_USDC", "10.0"))
+# Safety rail (fun-bot): absolute per-trade hard cap. Raised 2→5 for the ~$145 wallet
+# (2026-05-31 top-up). At $145 the 10% balance cap in _calculate_bet_size binds at
+# $14.50, so this $5 hard cap sits well below it and is the binding per-trade limit;
+# if the wallet shrinks the % cap auto-scales below $5 (e.g. $30 → $3) and takes over.
+TRADING_MAX_BET_USDC: float = float(os.getenv("TRADING_MAX_BET_USDC", "5.0"))
+# Daily realized-loss pause. Raised 10→15 (= ~10.3% of the $145 wallet, matching the
+# prior rail's spirit when it was 14% of a $70 wallet) so normal variance at the higher
+# capital doesn't trip it; a genuinely bad day still pauses new entries.
+TRADING_MAX_DAILY_LOSS_USDC: float = float(os.getenv("TRADING_MAX_DAILY_LOSS_USDC", "15.0"))
 TRADING_MAX_CONCURRENT_POSITIONS: int = int(os.getenv("TRADING_MAX_CONCURRENT_POSITIONS", "10"))
 TRADING_CONSECUTIVE_LOSS_PAUSE: int = int(os.getenv("TRADING_CONSECUTIVE_LOSS_PAUSE", "6"))
 TRADING_PAUSE_DURATION_SECONDS: int = int(os.getenv("TRADING_PAUSE_DURATION_SECONDS", "1800"))
