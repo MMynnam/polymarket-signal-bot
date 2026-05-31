@@ -42,7 +42,9 @@ TRADING_PRIVATE_KEY: str = os.getenv("TRADING_PRIVATE_KEY", "")
 TRADING_BET_SIZE_USDC: float = float(os.getenv("TRADING_BET_SIZE_USDC", "2.0"))
 TRADING_BET_PERCENTAGE: float = float(os.getenv("TRADING_BET_PERCENTAGE", "0.02"))
 TRADING_MIN_BET_USDC: float = float(os.getenv("TRADING_MIN_BET_USDC", "1.0"))
-TRADING_MAX_BET_USDC: float = float(os.getenv("TRADING_MAX_BET_USDC", "10.0"))
+# Safety rail (fun-bot, ~$20 wallet): absolute per-trade cap $2 ≈ ≤10% of free balance.
+# Lowered 10→2 so dynamic sizing can never stake a meaningful fraction of the wallet.
+TRADING_MAX_BET_USDC: float = float(os.getenv("TRADING_MAX_BET_USDC", "2.0"))
 TRADING_MAX_DAILY_LOSS_USDC: float = float(os.getenv("TRADING_MAX_DAILY_LOSS_USDC", "10.0"))
 TRADING_MAX_CONCURRENT_POSITIONS: int = int(os.getenv("TRADING_MAX_CONCURRENT_POSITIONS", "10"))
 TRADING_CONSECUTIVE_LOSS_PAUSE: int = int(os.getenv("TRADING_CONSECUTIVE_LOSS_PAUSE", "6"))
@@ -126,9 +128,11 @@ TRADING_SLIPPAGE_MAX_EXPANSION: float = float(os.getenv("TRADING_SLIPPAGE_MAX_EX
 TRADING_MAX_ENTRY_PRICE: float = float(os.getenv("TRADING_MAX_ENTRY_PRICE", "0.85"))
 
 # Soccer-favorites filter: skip sports-category alerts where price > this threshold.
-# Evidence: n=12 soccer favorites in CSV, WR=50%, ROI=-39.9%, avg_excess=-0.275.
-# Pre-committed bar (n≥10, avg_excess<-0.15) passed. Default ON.
-FILTER_SOCCER_FAVORITES_ENABLED: bool = os.getenv("FILTER_SOCCER_FAVORITES_ENABLED", "true").lower() == "true"
+# Entertainment-mode (2026-05-31): DISABLED (default OFF). The -39.9% evidence was
+# inversion-era; clean data shows sports favorites only ~-3.5%, and sports are the
+# most entertainment-dense markets (daily matches). Letting them trade for the
+# spectator feed; bleed bounded by ≤$2/trade + $10 daily-loss cap + circuit breaker.
+FILTER_SOCCER_FAVORITES_ENABLED: bool = os.getenv("FILTER_SOCCER_FAVORITES_ENABLED", "false").lower() == "true"
 FILTER_SOCCER_FAVORITES_MAX_PRICE: float = float(os.getenv("FILTER_SOCCER_FAVORITES_MAX_PRICE", "0.50"))
 
 # Confidence-weighted position sizing — bet size scales linearly with score.
@@ -480,6 +484,8 @@ async def _calculate_bet_size(http_client: httpx.AsyncClient, stats: dict, score
     pct = TRADING_SCORE_BASE_PCT + score_excess * (TRADING_MAX_PCT_PER_TRADE - TRADING_SCORE_BASE_PCT) / score_range
     raw_size = balance * pct
     clamped = max(TRADING_MIN_BET_USDC, min(TRADING_MAX_BET_USDC, raw_size))
+    # Safety rail (fun-bot, thin wallet): never stake >10% of free balance on one trade.
+    clamped = min(clamped, max(TRADING_MIN_BET_USDC, 0.10 * balance))
 
     log.info(
         "[Sizing] Dynamic: score=%d pct=%.2f%% $%.2f × %.2f%% = $%.2f (clamp [$%.2f, $%.2f])",
@@ -1816,6 +1822,37 @@ async def _notify_cb_drawdown_pause(
     await _send_telegram(http_client, text)
 
 
+# Running win/loss streak for spectator-feed flavor (in-memory; resets on restart,
+# like the CB rolling state). Positive = win run, negative = loss run.
+_result_streak: int = 0
+
+
+def _streak_flair(status: str) -> tuple[str, str]:
+    """Update the running streak for a resolution and return (headline, one-liner)."""
+    global _result_streak
+    if status == "won":
+        _result_streak = _result_streak + 1 if _result_streak > 0 else 1
+        n = _result_streak
+        if n >= 5:
+            return f"🔥🔥🔥 <b>WIN — {n} STRAIGHT</b> 🚀", "absolute heater. someone check on him."
+        if n >= 3:
+            return f"🔥🔥 <b>WIN — {n} in a row</b>", "cooking now."
+        if n == 2:
+            return "✅🔥 <b>WIN — back to back</b>", "two on the bounce."
+        return "✅ <b>WIN</b>", "on the board."
+    if status == "lost":
+        _result_streak = _result_streak - 1 if _result_streak < 0 else -1
+        n = -_result_streak
+        if n >= 5:
+            return f"💀💀 <b>LOSS — {n} straight</b>", "this is fine. everything is fine. 🔥🐶☕"
+        if n >= 3:
+            return f"💀 <b>LOSS — {n} in a row</b>", "rough patch. we ride at dawn."
+        if n == 2:
+            return "❌😬 <b>LOSS — that's two</b>", "shake it off."
+        return "❌ <b>LOSS</b>", "onto the next."
+    return "↩️ <b>VOID</b>", "refunded — no harm, no foul."
+
+
 async def _notify_trade_resolution(
     http_client: httpx.AsyncClient,
     trade: dict,
@@ -1827,22 +1864,16 @@ async def _notify_trade_resolution(
     fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.0
     winning_outcome = trade.get("winning_outcome")
 
-    if resolution_status == "won":
-        result_emoji = "✅"
-    elif resolution_status == "lost":
-        result_emoji = "❌"
-    else:
-        result_emoji = "↩️"
-
+    headline, banter = _streak_flair(resolution_status)
     outcome_line = f"🏆 <b>Outcome:</b> {winning_outcome}\n" if winning_outcome else ""
 
     text = (
-        "🏁 <b>TRADE RESOLVED</b>\n\n"
-        f"📋 <b>Market:</b> {market_q[:120]}\n"
-        f"🎯 <b>Position:</b> {bet_side} @ {fill_price:.3f}\n"
+        f"{headline}\n\n"
+        f"📋 {market_q[:120]}\n"
+        f"🎯 {bet_side} @ {fill_price:.3f}\n"
         f"{outcome_line}"
-        f"{result_emoji} <b>Result:</b> {resolution_status.upper()}\n"
-        f"💰 <b>P&amp;L:</b> ${pnl:+.2f} USDC"
+        f"💰 <b>P&amp;L:</b> ${pnl:+.2f} USDC\n"
+        f"<i>{banter}</i>"
     )
     await _send_telegram(http_client, text)
 
