@@ -1853,24 +1853,75 @@ def _streak_flair(status: str) -> tuple[str, str]:
     return "↩️ <b>VOID</b>", "refunded — no harm, no foul."
 
 
+# Live "ticker" thresholds — when a resolution clears one of these, the routine
+# win/loss callout gets a loud banner so the genuinely big moments pop out of the
+# feed. Deliberately SELECTIVE: measured against history, the bot's modal bet is a
+# ~0.50-0.55 favorite (it sits on the 0.50 floor), so "narrow favorite won" is the
+# default, not a highlight — celebrating it would dilute the banner. Frequent
+# momentum energy is already carried by the streak headlines (_streak_flair). These
+# tiers fire only on the rare, high-entertainment outcomes. Pure presentation,
+# env-tunable, all default sensibly (no env change needed).
+_TICKER_LONGSHOT_MAX: float = float(os.getenv("TICKER_LONGSHOT_MAX_PRICE", "0.20"))
+_TICKER_BIG_WIN_USDC: float = float(os.getenv("TICKER_BIG_WIN_USDC", "25"))
+_TICKER_UPSET_FAV_PRICE: float = float(os.getenv("TICKER_UPSET_FAV_PRICE", "0.80"))
+_TICKER_BRUTAL_LOSS_USDC: float = float(os.getenv("TICKER_BRUTAL_LOSS_USDC", "10"))
+
+
+def _big_moment(status: str, fill_price: float, pnl: float):
+    """Return (banner, banter) for a threshold-clearing resolution, else None.
+    Pure presentation over the already-computed entry price + P&L — touches no
+    trading/sizing/accounting state. One banner per resolution; within a status the
+    rarer/bigger story wins (longshot before big-$, upset before brutal-$). Returns
+    None for 'invalid'/void status and for any missing (None) inputs."""
+    if fill_price is None or pnl is None:
+        return None
+    if status == "won":
+        if 0.0 < fill_price <= _TICKER_LONGSHOT_MAX:
+            odds = round(1.0 / fill_price)
+            if fill_price <= 0.10:
+                return (f"🦄 <b>UNICORN — {odds}:1 LONGSHOT CASHES</b>",
+                        "called it when nobody else would. 🤯")
+            return (f"🎰 <b>LONGSHOT HITS — {odds}:1</b>", "big odds, ice veins. cash. 🧊")
+        if pnl >= _TICKER_BIG_WIN_USDC:
+            tier = "💎 <b>HUGE WIN</b>" if pnl >= 2 * _TICKER_BIG_WIN_USDC else "🚀 <b>BIG WIN</b>"
+            return (f"{tier} — ${pnl:+.2f}", "that's the dinner bill. 🦞")
+    elif status == "lost":
+        if fill_price >= _TICKER_UPSET_FAV_PRICE:
+            return (f"💀 <b>UPSET — backed the {fill_price * 100:.0f}% fav, got cooked</b>",
+                    "that's the one that keeps you humble. 😮‍💨")
+        if pnl <= -_TICKER_BRUTAL_LOSS_USDC:
+            return (f"💸 <b>BRUTAL BEAT — ${pnl:+.2f}</b>", "oof. pour one out. 🫗")
+    return None
+
+
 async def _notify_trade_resolution(
     http_client: httpx.AsyncClient,
     trade: dict,
     resolution_status: str,
     pnl: float,
 ) -> None:
+    import html as _html
+
     market_q = trade.get("market_question") or trade.get("market_id", "")
     bet_side = trade.get("bet_side", "")
     fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.0
     winning_outcome = trade.get("winning_outcome")
 
     headline, banter = _streak_flair(resolution_status)
-    outcome_line = f"🏆 <b>Outcome:</b> {winning_outcome}\n" if winning_outcome else ""
+    moment = _big_moment(resolution_status, fill_price, pnl)
+    if moment:
+        # Loud banner above the streak headline; override banter with the hype line.
+        headline = f"{moment[0]}\n{headline}"
+        banter = moment[1]
+    # Escape only user/market-derived strings; headline/banter carry intentional <b> tags.
+    outcome_line = (
+        f"🏆 <b>Outcome:</b> {_html.escape(str(winning_outcome))}\n" if winning_outcome else ""
+    )
 
     text = (
         f"{headline}\n\n"
-        f"📋 {market_q[:120]}\n"
-        f"🎯 {bet_side} @ {fill_price:.3f}\n"
+        f"📋 {_html.escape(market_q[:120])}\n"
+        f"🎯 {_html.escape(str(bet_side))} @ {fill_price:.3f}\n"
         f"{outcome_line}"
         f"💰 <b>P&amp;L:</b> ${pnl:+.2f} USDC\n"
         f"<i>{banter}</i>"
