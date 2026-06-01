@@ -1829,31 +1829,59 @@ async def _notify_cb_drawdown_pause(
 
 # Running win/loss streak for spectator-feed flavor (in-memory; resets on restart,
 # like the CB rolling state). Positive = win run, negative = loss run.
+# Running win/loss streak in ROUNDS — one poll-cycle grading batch = one round, so a
+# big catch-up batch can't read as "32 STRAIGHT". Positive = win rounds, negative =
+# loss rounds, 0 = neutral/just-snapped. In-memory; resets on restart like CB state.
 _result_streak: int = 0
 
 
-def _streak_flair(status: str) -> tuple[str, str]:
-    """Update the running streak for a resolution and return (headline, one-liner)."""
+def _apply_round_streak(won: int, lost: int) -> None:
+    """Fold one poll-cycle's grading batch into the streak as a single round: a clean
+    all-win batch extends the win run, a clean all-loss batch extends the loss run, a
+    mixed batch (a loss snuck in) breaks it, a voids-only batch is a no-op."""
     global _result_streak
-    if status == "won":
+    if won > 0 and lost == 0:
         _result_streak = _result_streak + 1 if _result_streak > 0 else 1
-        n = _result_streak
+    elif lost > 0 and won == 0:
+        _result_streak = _result_streak - 1 if _result_streak < 0 else -1
+    elif won > 0 and lost > 0:
+        _result_streak = 0
+
+
+def _streak_snap(prev: int, now: int) -> str:
+    """Loud one-off banner when a notable (>=3 round) run just ended, else ''."""
+    if prev >= 3 and now < prev:
+        return f"💔 <b>HEATER OVER</b> — the {prev}-round win run ends"
+    if prev <= -3 and now > prev:
+        return f"🎉 <b>SKID SNAPPED</b> — {abs(prev)}-round slide is over"
+    return ""
+
+
+def _streak_headline(status: str, streak: int) -> tuple[str, str]:
+    """Pure (headline, banter) for one resolution, given the cycle's round streak."""
+    if status == "won":
+        n = streak if streak > 0 else 1
+        if n >= 10:
+            return f"👑 <b>WIN — {n} STRAIGHT</b>", "this is illegal. we're reporting it to the Polymarket Commission."
+        if n >= 7:
+            return f"⚡ <b>WIN — {n} DEEP</b> 🚀", "at this point the bot is just disrespecting the markets."
         if n >= 5:
-            return f"🔥🔥🔥 <b>WIN — {n} STRAIGHT</b> 🚀", "absolute heater. someone check on him."
+            return f"🌋 <b>WIN — {n} STRAIGHT</b> 🔥", "the model is cooked but somehow hitting. we don't ask questions."
         if n >= 3:
-            return f"🔥🔥 <b>WIN — {n} in a row</b>", "cooking now."
+            return f"🔥🔥 <b>WIN — {n} in a row</b>", "hat trick+. the bot has opinions now. we're a bit worried."
         if n == 2:
-            return "✅🔥 <b>WIN — back to back</b>", "two on the bounce."
+            return "✅🔥 <b>WIN — back to back</b>", "statistically meaningless. emotionally enormous."
         return "✅ <b>WIN</b>", "on the board."
     if status == "lost":
-        _result_streak = _result_streak - 1 if _result_streak < 0 else -1
-        n = -_result_streak
+        n = -streak if streak < 0 else 1
+        if n >= 7:
+            return f"🫠 <b>LOSS — {n} straight</b>", "the bot has taken a vow of silence. we respect it."
         if n >= 5:
-            return f"💀💀 <b>LOSS — {n} straight</b>", "this is fine. everything is fine. 🔥🐶☕"
+            return f"💀💀 <b>LOSS — {n} straight</b>", "we've dispatched a sports psychologist. the bot declined the session."
         if n >= 3:
-            return f"💀 <b>LOSS — {n} in a row</b>", "rough patch. we ride at dawn."
+            return f"💀 <b>LOSS — {n} in a row</b>", "the bot is doing its best. its best is, admittedly, not great."
         if n == 2:
-            return "❌😬 <b>LOSS — that's two</b>", "shake it off."
+            return "❌😬 <b>LOSS — that's two</b>", "a wobble. perfectly normal. nothing to see here."
         return "❌ <b>LOSS</b>", "onto the next."
     return "↩️ <b>VOID</b>", "refunded — no harm, no foul."
 
@@ -1904,6 +1932,8 @@ async def _notify_trade_resolution(
     trade: dict,
     resolution_status: str,
     pnl: float,
+    streak: int = 0,
+    snap: str = "",
 ) -> None:
     import html as _html
 
@@ -1912,12 +1942,15 @@ async def _notify_trade_resolution(
     fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.0
     winning_outcome = trade.get("winning_outcome")
 
-    headline, banter = _streak_flair(resolution_status)
+    headline, banter = _streak_headline(resolution_status, streak)
     moment = _big_moment(resolution_status, fill_price, pnl)
     if moment:
         # Loud banner above the streak headline; override banter with the hype line.
         headline = f"{moment[0]}\n{headline}"
         banter = moment[1]
+    if snap:
+        # Streak-snapped banner rides above everything (once per cycle).
+        headline = f"{snap}\n{headline}"
     # Escape only user/market-derived strings; headline/banter carry intentional <b> tags.
     outcome_line = (
         f"🏆 <b>Outcome:</b> {_html.escape(str(winning_outcome))}\n" if winning_outcome else ""
@@ -2285,14 +2318,26 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
     if not isinstance(data, list):
         return
 
-    for trade in data:
-        alert_id = trade.get("alert_id")
-        if not alert_id:
-            continue
+    # Newly-resolved trades this cycle — effectively one grading batch from our POV.
+    new = [t for t in data
+           if t.get("alert_id")
+           and t.get("alert_resolution_status", "pending") != "pending"
+           and t["alert_id"] not in _notified_resolutions]
+    if not new:
+        return
 
+    # Tie-aware streak: fold this whole batch into ONE round before posting anything,
+    # so a grading catch-up of many trades can't inflate the headline to "32 STRAIGHT".
+    cyc_won = sum(1 for t in new if t.get("alert_resolution_status") == "resolved_won")
+    cyc_lost = sum(1 for t in new if t.get("alert_resolution_status") == "resolved_lost")
+    prev_streak = _result_streak
+    _apply_round_streak(cyc_won, cyc_lost)
+    snap = _streak_snap(prev_streak, _result_streak)
+
+    first = True
+    for trade in new:
+        alert_id = trade["alert_id"]
         alert_status = trade.get("alert_resolution_status", "pending")
-        if alert_status == "pending" or alert_id in _notified_resolutions:
-            continue
 
         fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.5
         size_usdc  = trade.get("size_usdc") or TRADING_BET_SIZE_USDC
@@ -2333,7 +2378,10 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
             _held_positions.discard((_mid, _bside))
             log.debug("[Dedup] Cleared (%s, %s) after resolution", _mid[:16], _bside)
 
-        await _notify_trade_resolution(http_client, trade, resolution_status, pnl)
+        # Streak is the cycle's round value; the snap banner rides only the first post.
+        await _notify_trade_resolution(http_client, trade, resolution_status, pnl,
+                                       streak=_result_streak, snap=snap if first else "")
+        first = False
 
         log.info(
             "[Resolution] %s → %s | P&L: $%+.2f",
