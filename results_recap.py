@@ -54,6 +54,41 @@ async def _free_balance(client: httpx.AsyncClient):
     return None
 
 
+def _collapse_ties(seq):
+    """Collapse consecutive same-resolved_at trades (one grading batch) into a single
+    outcome — 'won' if all won, 'lost' if all lost, else 'mixed'. seq is a list of
+    (status, resolved_at) in time order (ASC or DESC). Returns [(outcome, ts), ...].
+
+    The resolver grades markets in hourly batches, so dozens of unrelated trades can
+    share one resolved_at; without this, a single batch reads as a huge "streak"
+    (the infamous 32W). Collapsing to one outcome per batch keeps streaks believable —
+    a batch counts once, and a batch containing both wins and losses ('mixed') breaks
+    any run."""
+    out = []
+    i, n = 0, len(seq)
+    while i < n:
+        ts = seq[i][1]
+        statuses = set()
+        j = i
+        while j < n and seq[j][1] == ts:
+            statuses.add(seq[j][0])
+            j += 1
+        out.append(("won" if statuses == {"won"} else "lost" if statuses == {"lost"} else "mixed", ts))
+        i = j
+    return out
+
+
+def _streak_emoji(n: int) -> str:
+    """Escalating heat for a win streak of length n (rounds)."""
+    if n >= 9:
+        return "🌋👑"
+    if n >= 6:
+        return "🌋"
+    if n >= 4:
+        return "🔥🔥"
+    return "🔥"
+
+
 def _fetch_recap_data(window_hours: int):
     """Resolved trades in window (list of dicts) + open count + trailing streak."""
     db = database.get_db()
@@ -69,14 +104,15 @@ def _fetch_recap_data(window_hours: int):
         "SELECT COUNT(*) FROM trade_executions WHERE status='filled' AND resolution_status='pending'"
     ).fetchone()[0]
     streak_rows = db.execute(
-        "SELECT resolution_status FROM trade_executions WHERE resolution_status IN ('won','lost') "
-        "ORDER BY resolved_at DESC LIMIT 50"
+        "SELECT resolution_status, resolved_at FROM trade_executions WHERE resolution_status IN ('won','lost') "
+        "ORDER BY resolved_at DESC LIMIT 200"
     ).fetchall()
     streak_kind, streak_n = "none", 0
-    if streak_rows:
-        streak_kind = streak_rows[0][0]
-        for row in streak_rows:
-            if row[0] == streak_kind:
+    rounds = _collapse_ties(streak_rows)  # DESC: rounds[0] is the most recent batch; ties merged so a grading run can't inflate the trailing streak
+    if rounds and rounds[0][0] != "mixed":
+        streak_kind = rounds[0][0]
+        for outcome, _ts in rounds:
+            if outcome == streak_kind:
                 streak_n += 1
             else:
                 break
@@ -92,25 +128,58 @@ def _mkt(t, n: int = 48) -> str:
     return html.escape(q[:n] + ("…" if len(q) > n else ""))
 
 
+# Rotating banter pools — varied so the feed doesn't read the same line every day.
+# Picked deterministically by a per-post seed (no randomness → reproducible).
+_HOT = [
+    "the bot is HOT rn. do not breathe on it.",
+    "everything it touches resolves YES. cursed or blessed, unclear.",
+    "the bot is cooking and we are NOT asking questions.",
+    "on a heater. the favorites are being very cooperative today.",
+]
+_COLD = [
+    "the bot is ice cold. like, concerningly cold.",
+    "the markets are bullying a small bot that bets a dollar. flagged. 🚩",
+    "rough patch. the bot is journaling about it. we ride at dawn. 🫡",
+    "favorites losing. this is not how probability works and yet.",
+]
+_GREEN = [
+    "up on the day. small stakes, big feelings.",
+    "green on the day. chef's kiss. 📈",
+    "profit unlocked. the bot bought a metaphorical coffee. ☕",
+    "day closes green. quietly chuffed.",
+]
+_RED = [
+    "red day. one dollar at a time, it bleeds.",
+    "the market said no. the bot said ok and went to lie down.",
+    "down on the day. shake it off — tomorrow's a fresh slate.",
+    "not the day we wanted. the bot has logged off emotionally.",
+]
+
+
+def _pick(pool, seed: int) -> str:
+    return pool[seed % len(pool)]
+
+
 def _streak_tag(kind: str, n: int) -> str:
     if n < 2:
         return ""
     if kind == "won":
-        return f"  ·  🔥 on a {n}-win streak" + (" 🚀" if n >= 5 else "")
-    return f"  ·  💀 on a {n}-loss skid"
+        return f"  ·  {_streak_emoji(n)} {n}-win heater" + (" 👑" if n >= 7 else "")
+    return f"  ·  💀 {n}-loss skid" + (" 🪦" if n >= 5 else "")
 
 
 def _commentary(net: float, wins: int, losses: int, streak_kind: str, streak_n: int) -> str:
+    seed = wins + losses
     if wins + losses == 0:
-        return "crickets. the books are quiet."
+        return "crickets. the books are quiet. 🦗"
     if streak_kind == "won" and streak_n >= 3:
-        return "absolute heater — nobody tell him to stop."
+        return _pick(_HOT, seed)
     if streak_kind == "lost" and streak_n >= 3:
-        return "rough patch. we ride at dawn. 🫡"
+        return _pick(_COLD, seed)
     if net > 1.0:
-        return "green on the day. chef's kiss. 📈"
+        return _pick(_GREEN, seed)
     if net < -1.0:
-        return "red day. shake it off — tomorrow's a fresh slate."
+        return _pick(_RED, seed)
     return "chop. lived to fight another day."
 
 
@@ -167,17 +236,24 @@ def format_results_recap(resolved, open_count, streak, balance, milestone=None):
 # ---------------------------------------------------------------------------
 
 def _runs(rows):
-    """Collapse ASC-ordered ('won'/'lost', resolved_at) into runs: (kind, length, end_ts)."""
+    """Collapse ASC ('won'/'lost', resolved_at) into runs of consecutive same-outcome
+    ROUNDS — same-resolved_at batches are merged first and a 'mixed' batch breaks the
+    run: list of (kind, length, end_ts). Keeps the longest-streak milestone believable."""
     runs = []
     kind, length, end_ts = None, 0, None
-    for st, ts in rows:
-        if st == kind:
+    for outcome, ts in _collapse_ties(rows):
+        if outcome == "mixed":
+            if kind is not None:
+                runs.append((kind, length, end_ts))
+            kind, length, end_ts = None, 0, None
+            continue
+        if outcome == kind:
             length += 1
             end_ts = ts
         else:
             if kind is not None:
                 runs.append((kind, length, end_ts))
-            kind, length, end_ts = st, 1, ts
+            kind, length, end_ts = outcome, 1, ts
     if kind is not None:
         runs.append((kind, length, end_ts))
     return runs
@@ -234,10 +310,11 @@ def _compute_milestone(db, since_ts):
 # ---------------------------------------------------------------------------
 
 def _best_win_streak(resolved):
-    """Longest consecutive-win run within an ASC-ordered resolved list."""
+    """Longest run of consecutive winning rounds (same-resolved_at batches collapsed
+    first, so one grading batch can't inflate it). resolved is ASC by resolved_at."""
     best = run = 0
-    for t in resolved:
-        if t["resolution_status"] == "won":
+    for outcome, _ts in _collapse_ties([(t["resolution_status"], t.get("resolved_at")) for t in resolved]):
+        if outcome == "won":
             run += 1
             best = max(best, run)
         else:
@@ -246,12 +323,14 @@ def _best_win_streak(resolved):
 
 
 def _weekly_commentary(net, best_streak):
+    if best_streak >= 5:
+        return f"a {best_streak}-round heater in there — the bot briefly became a genius."
     if net > 2.0:
         return "green week — the boys eat. 🍽️"
     if net < -2.0:
         return "red week, but we're building character. 📚"
-    if best_streak >= 4:
-        return f"a {best_streak}-win run in there somewhere. we'll take it."
+    if best_streak >= 3:
+        return f"a {best_streak}-round win run headlined the week. we'll take it."
     return "breakeven-ish week — lived to bet another one."
 
 
@@ -273,7 +352,7 @@ def format_weekly_highlights(resolved, balance):
     net = sum((t.get("pnl") or 0.0) for t in resolved)
     best = _best_win_streak(resolved)
 
-    streak_bit = f"  ·  best run: 🔥 {best}W" if best >= 2 else ""
+    streak_bit = f"  ·  best run: {_streak_emoji(best)} {best} straight" if best >= 2 else ""
     lines.append(f"🏁 <b>{len(wins)}W–{len(losses)}L</b> on the week{streak_bit}")
     lines.append(f"{'📈' if net >= 0 else '📉'} <b>Net:</b> ${net:+.2f} <i>(notional)</i>")
     lines.append("")
@@ -311,14 +390,16 @@ def _monthly_commentary(net, best_streak, wins, losses):
     total = wins + losses
     if total == 0:
         return "a quiet month on the tape. building. 🧱"
+    if best_streak >= 6:
+        return f"a {best_streak}-round heater this month — peak bot, no notes."
     if net > 5.0:
         return "green month. the syndicate eats well. 🍾"
     if net < -5.0:
         return "red month — tuition paid to the market. we learn. 🎓"
-    if best_streak >= 5:
-        return f"a {best_streak}-win heater headlined the month. 🔥"
+    if best_streak >= 4:
+        return f"a {best_streak}-round win run in the books. quietly stacking. 🧊"
     if wins / total >= 0.55:
-        return "more right than wrong. quietly stacking. 🧊"
+        return "more right than wrong. the bot is pleased with itself."
     return "a grind of a month — still standing. 🫡"
 
 
@@ -342,7 +423,7 @@ def format_monthly_highlights(resolved, balance, prev_net=None):
     net = sum((t.get("pnl") or 0.0) for t in resolved)
     best = _best_win_streak(resolved)
 
-    streak_bit = f"  ·  best run: 🔥 {best}W" if best >= 2 else ""
+    streak_bit = f"  ·  best run: {_streak_emoji(best)} {best} straight" if best >= 2 else ""
     lines.append(f"🏁 <b>{len(wins)}W–{len(losses)}L</b> on the month{streak_bit}")
     net_line = f"{'📈' if net >= 0 else '📉'} <b>Net:</b> ${net:+.2f} <i>(notional)</i>"
     if prev_net is not None:
