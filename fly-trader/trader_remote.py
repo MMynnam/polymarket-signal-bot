@@ -803,8 +803,13 @@ async def _send_positions_summary(http_client: httpx.AsyncClient) -> None:
         for p in positions
     )
 
+    # Telegram caps a message at 4096 chars; the full list overflows once there are
+    # ~25+ open positions (400 "message is too long"). List only the largest N by
+    # stake and summarise the rest; the totals below still cover ALL positions.
+    _MAX_LISTED = 20
+    shown = sorted(positions, key=lambda p: p.get("size_usdc") or 0.0, reverse=True)[:_MAX_LISTED]
     lines = []
-    for p in positions:
+    for p in shown:
         market_q = (p.get("market_question") or p.get("market_id", ""))[:50]
         side = p.get("bet_side", "")
         fill = p.get("bet_price_filled") or p.get("bet_price_intended") or 0.0
@@ -816,6 +821,9 @@ async def _send_positions_summary(http_client: httpx.AsyncClient) -> None:
             f"  {_html.escape(side)} @ ${fill:.3f}  •  ${size:.2f}\n"
             f"  Score: {score}  •  Opened: {hours_ago:.1f}h ago"
         )
+    _more = len(positions) - len(shown)
+    if _more > 0:
+        lines.append(f"  …and <b>{_more}</b> more (top {_MAX_LISTED} by stake shown)")
 
     vault_footer = ""
     try:
