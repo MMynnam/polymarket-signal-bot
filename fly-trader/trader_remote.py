@@ -55,6 +55,12 @@ TRADING_MAX_CONCURRENT_POSITIONS: int = int(os.getenv("TRADING_MAX_CONCURRENT_PO
 TRADING_CONSECUTIVE_LOSS_PAUSE: int = int(os.getenv("TRADING_CONSECUTIVE_LOSS_PAUSE", "6"))
 TRADING_PAUSE_DURATION_SECONDS: int = int(os.getenv("TRADING_PAUSE_DURATION_SECONDS", "1800"))
 TRADING_LOSS_STREAK_WARNING: int = int(os.getenv("TRADING_LOSS_STREAK_WARNING", "4"))
+# Geoblock circuit-breaker: when Polymarket returns 403 "Trading restricted in your
+# region" on POST /order (datacenter-IP block, not a country block), pause new trade
+# attempts for this long and alert ONCE — instead of hammering every signal with a
+# 403 and spamming a TRADE ERROR per attempt. The fix for the underlying block is to
+# rotate the fly egress IP (region move); this just stops the bleeding gracefully.
+GEOBLOCK_PAUSE_SECONDS: int = int(os.getenv("GEOBLOCK_PAUSE_SECONDS", "1800"))
 # Magnitude-based circuit breaker: pause when rolling realized loss over the last
 # TRADING_CB_WINDOW_HOURS exceeds TRADING_CB_DRAWDOWN_PCT of current bankroll.
 # Replaces the consecutive-count auto-pause; TRADING_CONSECUTIVE_LOSS_PAUSE is now
@@ -171,6 +177,7 @@ log = logging.getLogger("trader_remote")
 # ---------------------------------------------------------------------------
 
 _pause_until: float = 0.0
+_geoblock_pause_until: float = 0.0  # set when a 403 region-restricted order is seen
 _cb_triggered_at_loss: float = 0.0   # USD loss that last triggered magnitude CB; re-trigger guard
 _warning_sent: bool = False           # True once the mid-streak warning fires; resets after a win
 _heavy_warning_sent: bool = False     # True once the level-CONSECUTIVE_LOSS_PAUSE warning fires
@@ -932,6 +939,8 @@ async def _check_risk_limits(
     global _pause_until, _cb_triggered_at_loss, _warning_sent, _heavy_warning_sent
 
     now = time.time()
+    if _geoblock_pause_until > now:
+        return f"geoblocked — order endpoint region-restricted ({int((_geoblock_pause_until - now) / 60)}m cooldown)"
     if _pause_until > 0:
         if now < _pause_until:
             return f"CB cooling down ({int(_pause_until - now)}s remaining)"
@@ -1567,6 +1576,27 @@ async def _notify_trade_filled(
         f"{breakdown_section}\n"
         f"{link_line}\n"
         "<i>Automated. Not financial advice.</i>"
+    )
+    await _send_telegram(http_client, text)
+
+
+def _is_geoblock(error_msg: Optional[str]) -> bool:
+    """True if a CLOB error is the region/geoblock 403 (datacenter-IP block)."""
+    if not error_msg:
+        return False
+    m = error_msg.lower()
+    return "restricted in your region" in m or "geoblock" in m
+
+
+async def _notify_geoblock_pause(http_client: httpx.AsyncClient, resume_ts: int) -> None:
+    resume_str = time.strftime("%H:%M UTC", time.gmtime(resume_ts))
+    text = (
+        "🚫 <b>GEOBLOCKED — trading paused</b>\n\n"
+        "Polymarket rejected order placement with <code>403 Trading restricted in "
+        "your region</code> — the trading host's IP is being geoblocked.\n\n"
+        f"⏸ Pausing new trades until <b>{resume_str}</b>, then retrying automatically.\n"
+        "🛠 If this persists, rotate the trader's egress IP (move fly region).\n"
+        "<i>Open positions are unaffected; reads/resolutions continue.</i>"
     )
     await _send_telegram(http_client, text)
 
@@ -2261,6 +2291,18 @@ async def _execute_trade(
             alert_created_at=int(alert.get("created_at") or 0),
             score_breakdown_json=alert.get("score_breakdown_json"),
         )
+    elif status == "error" and _is_geoblock(error_msg):
+        # Geoblock: trip a circuit-breaker so we stop hammering POST /order, and alert
+        # ONCE (not a TRADE ERROR per signal). _check_risk_limits skips cycles during
+        # the cooldown; new attempts auto-resume after it. The real fix is rotating the
+        # egress IP (move fly region) — this just keeps the feed clean meanwhile.
+        global _geoblock_pause_until
+        _now = time.time()
+        _newly = _geoblock_pause_until <= _now
+        _geoblock_pause_until = _now + GEOBLOCK_PAUSE_SECONDS
+        if _newly:
+            log.error("[Geoblock] Order region-restricted — pausing new trades %ds", GEOBLOCK_PAUSE_SECONDS)
+            await _notify_geoblock_pause(http_client, int(_geoblock_pause_until))
     else:
         await _notify_trade_error(
             http_client, market_q, bet_side, price_alert, score, status, error_msg,
