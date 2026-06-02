@@ -4,7 +4,12 @@
 #
 
 app = 'polymarket-trader-vivid-mountain-9871'
-primary_region = 'arn'
+# Moved arn (Stockholm) -> ams (Amsterdam) on 2026-06-02: Polymarket began
+# geoblocking the arn egress IP on POST /order (403 "Trading restricted in your
+# region") despite Sweden being allowed — i.e. datacenter-IP reputation blocking,
+# not country geo. ams gave a fresh, unblocked egress IP. If ams is later blocked,
+# rotate to another EU region (cdg/fra/lhr) or route /order via a clean proxy.
+primary_region = 'ams'
 
 [build]
 
