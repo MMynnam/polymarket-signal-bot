@@ -265,6 +265,16 @@ WINRATE_HIGH_THRESHOLD: float = float(os.getenv("WINRATE_HIGH_THRESHOLD", "0.95"
 WINRATE_LOW_THRESHOLD: float = float(os.getenv("WINRATE_LOW_THRESHOLD", "0.55"))
 WINRATE_SIGNIFICANCE_BETS: int = int(os.getenv("WINRATE_SIGNIFICANCE_BETS", "20"))
 
+# 2026-06-03 — win-rate component switched to a BINARY "has a winning track record" flag.
+# The edge study (6,848 alerts vs on-chain outcomes) found the GRADED win-rate points are
+# noise: among wallets that HAVE a track record the point gradient correlates -0.02 with
+# winning. Only the EXISTENCE of a track record moved edge (-4.1% -> -0.4%). So award a flat
+# flag when the wallet has >= WINRATE_FLAG_MIN_RESOLVED resolved bets AND win_rate above the
+# low bar; 0 otherwise. Set WINRATE_BINARY_MODE=false to restore legacy graded scoring.
+WINRATE_BINARY_MODE: bool = os.getenv("WINRATE_BINARY_MODE", "true").lower() == "true"
+WINRATE_FLAG_PTS: int = int(os.getenv("WINRATE_FLAG_PTS", "8"))
+WINRATE_FLAG_MIN_RESOLVED: int = int(os.getenv("WINRATE_FLAG_MIN_RESOLVED", "3"))
+
 # Max resolved positions to fetch per wallet (pagination cap).
 # The API returns at most 50 per page; we page until we hit this total or run out.
 WINRATE_MAX_CLOSED_POSITIONS: int = int(os.getenv("WINRATE_MAX_CLOSED_POSITIONS", "500"))

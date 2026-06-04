@@ -217,8 +217,19 @@ def _score_win_rate(
     high = config.WINRATE_HIGH_THRESHOLD  # 0.80
     low  = config.WINRATE_LOW_THRESHOLD   # 0.50
     sig  = config.WINRATE_SIGNIFICANCE_BETS  # 20
-
     wr = profile.win_rate
+
+    # 2026-06-03 — BINARY mode (default). The edge study showed the graded points are noise;
+    # only "the wallet HAS a winning track record" carries (weak) signal. Award a flat flag
+    # when there's enough resolved history above the low bar, else 0. Reversible via env
+    # (WINRATE_BINARY_MODE=false → legacy graded scoring below).
+    if config.WINRATE_BINARY_MODE:
+        flag_pts = min(max_pts, config.WINRATE_FLAG_PTS)
+        if profile.resolved_trades >= config.WINRATE_FLAG_MIN_RESOLVED and wr > low:
+            return flag_pts, f"{wr:.0%} on {profile.resolved_trades} resolved (track record ✓ +{flag_pts})"
+        return 0, f"{wr:.0%} on {profile.resolved_trades} resolved (no qualifying record)"
+
+    # --- Legacy graded scoring (WINRATE_BINARY_MODE=false) ---
     if wr <= low:
         raw_score = 0
     elif wr >= high:

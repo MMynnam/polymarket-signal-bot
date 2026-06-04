@@ -72,6 +72,12 @@ TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED"
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+# Optional separate "ops" channel for operational noise (skips, errors, sweeps, tier/cap
+# changes, low-balance, geoblock, redemptions). The audience channel (TELEGRAM_CHAT_ID) then
+# only carries the SHOW: bets placed, resolutions, recaps. If TELEGRAM_OPS_CHAT_ID is unset,
+# ops messages still go to the main channel but SILENTLY (no push notification), so the
+# friends' phones only buzz for the fun. 2026-06-03.
+TELEGRAM_OPS_CHAT_ID: str = os.getenv("TELEGRAM_OPS_CHAT_ID", "")
 ALCHEMY_RPC_URL: str = os.getenv("ALCHEMY_RPC_URL", "")
 
 # ---------------------------------------------------------------------------
@@ -146,9 +152,19 @@ TRADING_MAX_ENTRY_PRICE: float = float(os.getenv("TRADING_MAX_ENTRY_PRICE", "0.8
 FILTER_SOCCER_FAVORITES_ENABLED: bool = os.getenv("FILTER_SOCCER_FAVORITES_ENABLED", "false").lower() == "true"
 FILTER_SOCCER_FAVORITES_MAX_PRICE: float = float(os.getenv("FILTER_SOCCER_FAVORITES_MAX_PRICE", "0.50"))
 
-# Confidence-weighted position sizing — bet size scales linearly with score.
-# At score=TRADING_MIN_SCORE: TRADING_SCORE_BASE_PCT of bankroll.
-# At score=TRADING_SCORE_CEILING (and above): TRADING_MAX_PCT_PER_TRADE of bankroll.
+# Position sizing as a % of bankroll.
+#
+# 2026-06-03 — score-weighted sizing RETIRED by default. A 6,848-alert edge study (joined
+# to on-chain outcomes) showed the confidence score is NON-predictive of edge, and mildly
+# ANTI-predictive within the favorites band the bot actually trades (price >= 0.50). Scaling
+# stake UP with score therefore amplified misranking. Default is now a FLAT, score-independent
+# % of bankroll, set risk-neutral to ~ the prior average stake at typical scores. The clamps
+# below ([MIN,MAX] bet + 10% balance cap) are unchanged. Restore the legacy linear ramp with
+# TRADING_SCORE_WEIGHTED_SIZING=true.
+TRADING_SCORE_WEIGHTED_SIZING: bool = os.getenv("TRADING_SCORE_WEIGHTED_SIZING", "false").lower() == "true"
+TRADING_FLAT_PCT_PER_TRADE: float = float(os.getenv("TRADING_FLAT_PCT_PER_TRADE", "0.020"))
+# Legacy score-weighted ramp params (only used when TRADING_SCORE_WEIGHTED_SIZING=true):
+# pct ramps linearly from BASE_PCT at score=TRADING_MIN_SCORE to MAX_PCT at SCORE_CEILING.
 TRADING_SCORE_BASE_PCT: float = float(os.getenv("TRADING_SCORE_BASE_PCT", "0.010"))
 TRADING_MAX_PCT_PER_TRADE: float = float(os.getenv("TRADING_MAX_PCT_PER_TRADE", "0.040"))
 TRADING_SCORE_CEILING: int = int(os.getenv("TRADING_SCORE_CEILING", "90"))
@@ -484,24 +500,32 @@ async def _calculate_bet_size(http_client: httpx.AsyncClient, stats: dict, score
         )
         return TRADING_BET_SIZE_USDC
 
-    # DYNAMIC — score-weighted linear ramp
+    # DYNAMIC — bet size as a % of balance (flat by default; legacy score-ramp opt-in).
     try:
         balance = await _get_usdc_balance()
     except Exception as exc:
         log.warning("[Sizing] USDC balance fetch failed: %s — fixed $%.2f", exc, TRADING_BET_SIZE_USDC)
         return TRADING_BET_SIZE_USDC
 
-    score_range = max(1, TRADING_SCORE_CEILING - TRADING_MIN_SCORE)
-    score_excess = max(0, min(score - TRADING_MIN_SCORE, score_range))
-    pct = TRADING_SCORE_BASE_PCT + score_excess * (TRADING_MAX_PCT_PER_TRADE - TRADING_SCORE_BASE_PCT) / score_range
+    if TRADING_SCORE_WEIGHTED_SIZING:
+        # Legacy: linear ramp from BASE_PCT at MIN_SCORE to MAX_PCT at CEILING (flat above).
+        score_range = max(1, TRADING_SCORE_CEILING - TRADING_MIN_SCORE)
+        score_excess = max(0, min(score - TRADING_MIN_SCORE, score_range))
+        pct = TRADING_SCORE_BASE_PCT + score_excess * (TRADING_MAX_PCT_PER_TRADE - TRADING_SCORE_BASE_PCT) / score_range
+        mode = f"score-weighted (score={score})"
+    else:
+        # Default: flat, score-independent % — the score is non-predictive of edge.
+        pct = TRADING_FLAT_PCT_PER_TRADE
+        mode = "flat"
+
     raw_size = balance * pct
     clamped = max(TRADING_MIN_BET_USDC, min(TRADING_MAX_BET_USDC, raw_size))
     # Safety rail (fun-bot, thin wallet): never stake >10% of free balance on one trade.
     clamped = min(clamped, max(TRADING_MIN_BET_USDC, 0.10 * balance))
 
     log.info(
-        "[Sizing] Dynamic: score=%d pct=%.2f%% $%.2f × %.2f%% = $%.2f (clamp [$%.2f, $%.2f])",
-        score, pct * 100, balance, pct * 100, clamped, TRADING_MIN_BET_USDC, TRADING_MAX_BET_USDC,
+        "[Sizing] Dynamic %s: $%.2f × %.2f%% = $%.2f (clamp [$%.2f, $%.2f])",
+        mode, balance, pct * 100, clamped, TRADING_MIN_BET_USDC, TRADING_MAX_BET_USDC,
     )
 
     if not _graduation_notified:
@@ -707,7 +731,7 @@ async def _flush_skip_batch(http_client: httpx.AsyncClient, batch_key: tuple) ->
         f"{_html.escape(market_q[:70])}  [{_html.escape(bet_side)}]\n"
         f"Same signal, price kept moving.{price_str}"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_skip(
@@ -780,7 +804,7 @@ async def _notify_skip(
         f"Attempted <code>{attempted_str}</code>  (Δ {latency_s}s)"
         f"{price_line}"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 # ---------------------------------------------------------------------------
@@ -850,7 +874,7 @@ async def _send_positions_summary(http_client: httpx.AsyncClient) -> None:
         f"   Sweep at: ${VAULT_SWEEP_THRESHOLD_USDC:.2f} → floor ${VAULT_SWEEP_FLOOR_USDC:.2f}\n"
         f"   Target exposure: {TRADING_TARGET_EXPOSURE_PCT * 100:.0f}%  •  Current cap: {_current_max_positions}"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1514,20 +1538,55 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
 # Telegram notifications
 # ---------------------------------------------------------------------------
 
-async def _send_telegram(http_client: httpx.AsyncClient, text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+async def _send_telegram(http_client: httpx.AsyncClient, text: str, *, ops: bool = False) -> None:
+    """Send a Telegram message.
+
+    ops=False (default) → the AUDIENCE feed (TELEGRAM_CHAT_ID), with a push notification.
+    ops=True            → operational noise. Goes to TELEGRAM_OPS_CHAT_ID if configured
+                          (loud, for the operator); otherwise stays in the main channel but
+                          SILENT (disable_notification) so the friends' phones don't buzz.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    if ops and TELEGRAM_OPS_CHAT_ID:
+        chat_id, silent = TELEGRAM_OPS_CHAT_ID, False
+    else:
+        chat_id, silent = TELEGRAM_CHAT_ID, ops  # ops w/o ops-channel → silent in main feed
+    if not chat_id:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         resp = await http_client.post(
             url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_notification": silent,
+            },
             timeout=15,
         )
         if not resp.is_success:
             log.warning("[Telegram] Send failed %d: %s", resp.status_code, resp.text[:100])
     except Exception as exc:
         log.warning("[Telegram] Send error: %s", exc)
+
+
+def _odds_read(price: float) -> tuple[str, str]:
+    """Plain-English read of the entry price — the only honest signal (the insider score
+    was shown to be non-predictive, so we lead with the odds the market itself gives).
+    Returns (odds_word, house_banter). Pure presentation; no trading state."""
+    if price is None or price <= 0:
+        return "mystery line", "no read on this one — buckle up."
+    if price <= 0.15:
+        return "big longshot", "the bot is feeling BRAVE. 🫡"
+    if price <= 0.35:
+        return "underdog", "taking the dog. spicy. 🌶"
+    if price <= 0.60:
+        return "coin-flip", "genuine toss-up — nobody knows anything."
+    if price <= 0.80:
+        return "favorite", "leaning chalk. quietly confident."
+    return "heavy chalk", "boring but usually banks. 🥱"
 
 
 async def _notify_trade_filled(
@@ -1543,6 +1602,12 @@ async def _notify_trade_filled(
     alert_created_at: int = 0,
     score_breakdown_json: Optional[str] = None,
 ) -> None:
+    # AUDIENCE message — story-first. We deliberately DROP the score, score-bar, signal
+    # breakdown, detection latency, slippage, and the wallet/Polygonscan line: the edge study
+    # showed the score and its components are non-predictive noise, and the rest is ops
+    # forensics nobody in the feed reads. The price (as plain odds) is the only honest signal.
+    # (score / slippage / alert_created_at / score_breakdown_json kept in the signature for
+    # callers + the ops channel, intentionally unused here.)
     import html as _html
 
     try:
@@ -1550,41 +1615,22 @@ async def _notify_trade_filled(
     except Exception:
         remaining_balance = 0.0
 
-    now             = int(time.time())
-    profit_if_win   = (size / fill_price) - size if fill_price and fill_price > 0 else 0.0
-    bar             = _score_bar(score)
-    safe_q          = _html.escape(market_q[:80])
-    safe_side       = _html.escape(bet_side)
-    funder          = TRADING_FUNDER_ADDRESS or _wallet_address
-    slip_str        = f"±{slippage*100:.1f}%" if slippage is not None else "N/A"
-    detected_str    = time.strftime("%H:%M:%S UTC", time.gmtime(alert_created_at)) if alert_created_at else "unknown"
-    latency_s       = now - alert_created_at if alert_created_at else 0
-    breakdown_block = _fmt_score_breakdown(score_breakdown_json)
-
-    links = []
-    if market_url:
-        links.append(f'<a href="{market_url}">Polymarket</a>')
-    links.append(f"<code>{funder[:14]}…</code>")
-    links.append(f'<a href="https://polygonscan.com/address/{funder}">Polygonscan</a>')
-    link_line = "  ·  ".join(links)
-
-    breakdown_section = (
-        f"\n<b>Signal breakdown</b>\n<code>{breakdown_block}</code>\n"
-        if breakdown_block else ""
-    )
+    profit_if_win = (size / fill_price) - size if fill_price and fill_price > 0 else 0.0
+    safe_q        = _html.escape(str(market_q)[:90])
+    safe_side     = _html.escape(str(bet_side))
+    word, banter  = _odds_read(fill_price)
+    price_c       = f"{fill_price*100:.0f}¢" if fill_price and fill_price > 0 else "?"
 
     text = (
-        f"<b>TRADE  {score}  {bar}</b>\n"
-        f"{safe_q}\n"
-        f"\n<b>{safe_side}</b>  @  {fill_price*100:.0f}¢"
-        f"  ·  ${size:.2f}  →  <b>+${profit_if_win:.2f}</b> if won\n"
-        f"\nDetected  <code>{detected_str}</code>  (Δ {latency_s}s to trade)\n"
-        f"Slippage  {slip_str}\n"
-        f"Bankroll  ${remaining_balance:.2f}"
-        f"{breakdown_section}\n"
-        f"{link_line}\n"
-        "<i>Automated. Not financial advice.</i>"
+        f"🟢 <b>BET IN</b> — {word}\n"
+        f"{safe_q}\n\n"
+        f"<b>{safe_side}</b> at {price_c}  ·  ${size:.2f} to win <b>${profit_if_win:.2f}</b>\n"
+        f"🏦 ${remaining_balance:.2f} in the bank\n"
+        f"<i>{banter}</i>"
     )
+    if market_url:
+        safe_url = _html.escape(str(market_url), quote=True)
+        text += f'\n\n<a href="{safe_url}">watch it live →</a>'
     await _send_telegram(http_client, text)
 
 
@@ -1606,7 +1652,7 @@ async def _notify_geoblock_pause(http_client: httpx.AsyncClient, resume_ts: int)
         "🛠 If this persists, rotate the trader's egress IP (move fly region).\n"
         "<i>Open positions are unaffected; reads/resolutions continue.</i>"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_trade_error(
@@ -1618,13 +1664,17 @@ async def _notify_trade_error(
     status: str,
     error_msg: Optional[str],
 ) -> None:
-    err_line = f"\n❗ <code>{error_msg}</code>" if error_msg else ""
+    import html as _html
+    # HTML-escape all user/market/error-derived strings: CLOB/geoblock errors and market
+    # titles routinely contain '&', '<', '>' (e.g. "price < min", "S&P 500"), which would
+    # otherwise break Telegram HTML parsing and 400 the whole message.
+    err_line = f"\n❗ <code>{_html.escape(str(error_msg))}</code>" if error_msg else ""
     text = (
         f"❌ <b>TRADE {status.upper()}</b>\n"
-        f"📋 {market_q[:100]}\n"
-        f"🎯 {bet_side} @ {price:.3f} | Score: {score}{err_line}"
+        f"📋 {_html.escape(market_q[:100])}\n"
+        f"🎯 {_html.escape(str(bet_side))} @ {price:.3f} | Score: {score}{err_line}"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_graduation(
@@ -1641,7 +1691,7 @@ async def _notify_graduation(
         f"📊 Now sizing at {TRADING_SCORE_BASE_PCT * 100:.1f}–{TRADING_MAX_PCT_PER_TRADE * 100:.1f}% of bankroll, scaled by signal score\n\n"
         "<i>Bet sizes scale with signal confidence.</i>"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_sweep_initiated(
@@ -1658,7 +1708,7 @@ async def _notify_sweep_initiated(
         "Trading continues normally during the 1h timelock.\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_sweep_completed(
@@ -1685,7 +1735,7 @@ async def _notify_sweep_completed(
         f'🔍 <a href="https://polygonscan.com/address/{VAULT_WALLET_ADDRESS}">View vault</a>\n\n'
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_sweep_cancelled(
@@ -1700,7 +1750,7 @@ async def _notify_sweep_cancelled(
         "Deposit wallet has been unpaused. Trading resumed.\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_cap_change(
@@ -1716,7 +1766,7 @@ async def _notify_cap_change(
         f"💵 Bankroll: ${bankroll:.2f}  •  Bet size: ${bet_size:.2f}\n"
         f"🎯 Target exposure: {TRADING_TARGET_EXPOSURE_PCT * 100:.0f}%"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_tier_transition(
@@ -1743,7 +1793,7 @@ async def _notify_tier_transition(
             f"All qualifying alerts admitted.\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_sweep_stuck(http_client: httpx.AsyncClient) -> None:
@@ -1754,7 +1804,7 @@ async def _notify_sweep_stuck(http_client: httpx.AsyncClient) -> None:
         f"<code>Wallet: {VAULT_WALLET_ADDRESS}</code>\n\n"
         "Run <code>unpause()</code> manually via the contract."
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_redemption(
@@ -1770,7 +1820,7 @@ async def _notify_redemption(
         f"💰 <b>Recovered: ${recovered:.2f} USDC</b>\n"
         f"🏦 <b>Wallet balance: ${new_balance:.2f}</b>"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_low_balance(
@@ -1785,7 +1835,7 @@ async def _notify_low_balance(
         f"Bot will pause new trades until redemptions replenish balance above "
         f"${TRADING_MIN_BET_USDC:.2f}."
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 def _format_loss_lines(recent_losses: list) -> str:
@@ -1816,7 +1866,7 @@ async def _notify_loss_streak_warning(
         f"<b>Recent losses:</b>\n{loss_lines}\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, ops=True)
 
 
 async def _notify_loss_streak_pause(
@@ -1925,17 +1975,19 @@ def _streak_headline(status: str, streak: int) -> tuple[str, str]:
 
 
 # Live "ticker" thresholds — when a resolution clears one of these, the routine
-# win/loss callout gets a loud banner so the genuinely big moments pop out of the
-# feed. Deliberately SELECTIVE: measured against history, the bot's modal bet is a
-# ~0.50-0.55 favorite (it sits on the 0.50 floor), so "narrow favorite won" is the
-# default, not a highlight — celebrating it would dilute the banner. Frequent
-# momentum energy is already carried by the streak headlines (_streak_flair). These
-# tiers fire only on the rare, high-entertainment outcomes. Pure presentation,
-# env-tunable, all default sensibly (no env change needed).
+# win/loss callout gets a loud banner so the genuinely big moments pop out of the feed.
+# Deliberately SELECTIVE so banners stay rare; frequent momentum energy is carried by the
+# streak headlines. Pure presentation, env-tunable.
+#
+# 2026-06-03 — retuned to the ACTUAL stake scale. With ~$2-5 bets, the old $25 big-win /
+# $50 huge / $10 brutal thresholds were UNREACHABLE (max profit on a $5 bet is ~$5), so the
+# banners were effectively dead code. Dollar tiers are now reachable on this bankroll; the
+# longshot tier (≤20¢) is dormant under the 0.50 favorites floor and will light up only if
+# that floor is ever lowered (the open forward-test) — kept intact for that case.
 _TICKER_LONGSHOT_MAX: float = float(os.getenv("TICKER_LONGSHOT_MAX_PRICE", "0.20"))
-_TICKER_BIG_WIN_USDC: float = float(os.getenv("TICKER_BIG_WIN_USDC", "25"))
+_TICKER_BIG_WIN_USDC: float = float(os.getenv("TICKER_BIG_WIN_USDC", "3"))
 _TICKER_UPSET_FAV_PRICE: float = float(os.getenv("TICKER_UPSET_FAV_PRICE", "0.80"))
-_TICKER_BRUTAL_LOSS_USDC: float = float(os.getenv("TICKER_BRUTAL_LOSS_USDC", "10"))
+_TICKER_BRUTAL_LOSS_USDC: float = float(os.getenv("TICKER_BRUTAL_LOSS_USDC", "3"))
 
 
 def _big_moment(status: str, fill_price: float, pnl: float):
@@ -1982,24 +2034,35 @@ async def _notify_trade_resolution(
 
     headline, banter = _streak_headline(resolution_status, streak)
     moment = _big_moment(resolution_status, fill_price, pnl)
+    # Cap the header at ONE prepended banner so the market title still shows in the phone's
+    # notification preview. A rare big-moment (UNICORN / BIG WIN / UPSET) outranks a streak-snap.
     if moment:
-        # Loud banner above the streak headline; override banter with the hype line.
         headline = f"{moment[0]}\n{headline}"
         banter = moment[1]
-    if snap:
-        # Streak-snapped banner rides above everything (once per cycle).
+    elif snap:
         headline = f"{snap}\n{headline}"
-    # Escape only user/market-derived strings; headline/banter carry intentional <b> tags.
+
+    # Plain-money outcome line, matched to the audience (no "P&L"/"USDC" jargon). Wins show the
+    # cash multiple — the screenshot-and-post moment.
+    price_c = f"{fill_price*100:.0f}¢" if fill_price and fill_price > 0 else "?"
+    if resolution_status == "won":
+        mult = f"  (x{1.0/fill_price:.1f})" if fill_price and fill_price > 0 else ""
+        money_line = f"💰 <b>Won ${pnl:.2f}</b>{mult}"
+    elif resolution_status == "lost":
+        money_line = f"💸 <b>Lost ${abs(pnl):.2f}</b>"
+    else:
+        money_line = "↩️ <b>Refunded</b> — push, no harm"
+
     outcome_line = (
-        f"🏆 <b>Outcome:</b> {_html.escape(str(winning_outcome))}\n" if winning_outcome else ""
+        f"🏆 {_html.escape(str(winning_outcome))} took it\n" if winning_outcome else ""
     )
 
     text = (
         f"{headline}\n\n"
         f"📋 {_html.escape(market_q[:120])}\n"
-        f"🎯 {_html.escape(str(bet_side))} @ {fill_price:.3f}\n"
+        f"🎯 {_html.escape(str(bet_side))} at {price_c}\n"
         f"{outcome_line}"
-        f"💰 <b>P&amp;L:</b> ${pnl:+.2f} USDC\n"
+        f"{money_line}\n"
         f"<i>{banter}</i>"
     )
     await _send_telegram(http_client, text)
