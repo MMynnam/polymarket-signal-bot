@@ -1381,6 +1381,55 @@ def get_vault_sweep_stats() -> dict[str, Any]:
 # API helpers — used by api.py for the remote trader endpoints
 # ---------------------------------------------------------------------------
 
+def resolve_token_id_for_side(
+    clob_token_ids_json: Optional[str],
+    raw_outcomes,
+    bet_side: str,
+) -> Optional[str]:
+    """
+    Map an alert's bet_side to the CLOB token id of that outcome. Returns None
+    when the side cannot be resolved — in which case the alert MUST NOT trade.
+
+    HISTORY (audit 2026-06-11): Gamma serialises ``outcomes`` as a JSON-encoded
+    STRING ('["Yes", "No"]'), not a list. The old inline code iterated that
+    string character-by-character, so the name match never succeeded, and a
+    silent ``token_ids[0]`` fallback meant EVERY live fill in the bot's history
+    (636/636) bought the FIRST outcome regardless of the signal's side — 27%
+    of all bets were placed on the wrong side. Hence: parse the string form,
+    and never fall back to token_ids[0].
+    """
+    if not clob_token_ids_json:
+        return None
+    try:
+        token_ids = json.loads(clob_token_ids_json)
+        outcomes = raw_outcomes
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except Exception:
+                outcomes = []
+        if not isinstance(outcomes, list) or not isinstance(token_ids, list):
+            return None
+        target = (bet_side or "").strip().lower()
+        if not target:
+            return None
+        for i, outcome in enumerate(outcomes):
+            if str(outcome).strip().lower() == target and i < len(token_ids):
+                return token_ids[i]
+        # Normalized fallback: alert sides sometimes lose punctuation vs the
+        # market outcome name ("Anyones Legend" vs "Anyone's Legend"). Compare
+        # alphanumerics only — still a NAME match, never positional.
+        norm = lambda s: "".join(ch for ch in str(s).lower() if ch.isalnum())
+        tn = norm(target)
+        if tn:
+            hits = [i for i, o in enumerate(outcomes) if norm(o) == tn and i < len(token_ids)]
+            if len(hits) == 1:
+                return token_ids[hits[0]]
+    except Exception:
+        return None
+    return None
+
+
 def get_tradeable_alerts_for_api(
     min_score: int,
     since_timestamp: int,
@@ -1451,18 +1500,17 @@ def get_tradeable_alerts_for_api(
                 pass
 
         if clob_token_ids_json:
-            try:
-                token_ids = json.loads(clob_token_ids_json)
-                outcomes: list = raw.get("outcomes", [])
-                target = d["bet_side"].strip().lower()
-                for i, outcome in enumerate(outcomes):
-                    if outcome.strip().lower() == target and i < len(token_ids):
-                        clob_token_id = token_ids[i]
-                        break
-                if clob_token_id is None and token_ids:
-                    clob_token_id = token_ids[0]
-            except Exception:
-                pass
+            clob_token_id = resolve_token_id_for_side(
+                clob_token_ids_json, raw.get("outcomes"), d["bet_side"]
+            )
+            if clob_token_id is None:
+                # An unresolvable side must NEVER trade. The trader skips alerts
+                # with clob_token_id=None (trader_remote records status='failed').
+                log.warning(
+                    "[DB] Cannot resolve token for alert %s: bet_side=%r not in "
+                    "market outcomes %r — trader will skip it",
+                    d["alert_id"][:12], d["bet_side"], raw.get("outcomes"),
+                )
 
         if raw:
             neg_risk_val = raw.get("negRisk")
