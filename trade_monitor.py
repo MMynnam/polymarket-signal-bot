@@ -119,6 +119,12 @@ def _parse_trade_from_rest(raw: dict, market_id: str) -> Optional[Trade]:
         if not trade_id:
             return None
 
+        # An insider SELL is an exit/short of that outcome — treating it as a
+        # bullish signal on the SOLD outcome inverts the signal's direction.
+        # ~8% of the live feed is SELLs (sampled 2026-06-11); skip them.
+        if str(raw.get("side") or "").strip().upper() == "SELL":
+            return None
+
         price = float(raw.get("price", 0))
         size = float(raw.get("size", 0))
 
