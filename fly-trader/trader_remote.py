@@ -74,10 +74,15 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 # Optional separate "ops" channel for operational noise (skips, errors, sweeps, tier/cap
 # changes, low-balance, geoblock, redemptions). The audience channel (TELEGRAM_CHAT_ID) then
-# only carries the SHOW: bets placed, resolutions, recaps. If TELEGRAM_OPS_CHAT_ID is unset,
-# ops messages still go to the main channel but SILENTLY (no push notification), so the
-# friends' phones only buzz for the fun. 2026-06-03.
+# only carries the SHOW: bets placed, resolutions, recaps. 2026-06-03.
+#
+# Feed v2 (2026-06-12): if TELEGRAM_OPS_CHAT_ID is unset, ops messages are DROPPED from
+# Telegram (logged instead) — they used to fall back into the main channel silently, which
+# leaked the insider score (skip cards, error cards, loss lines) into the audience feed.
+# Set FEED_OPS_TO_MAIN=true to restore the old silent-in-main fallback. This mirrors the
+# Railway make_research_sender() contract (TELEGRAM_OPS_CHAT_ID / FEED_RESEARCH_TO_MAIN).
 TELEGRAM_OPS_CHAT_ID: str = os.getenv("TELEGRAM_OPS_CHAT_ID", "")
+FEED_OPS_TO_MAIN: bool = os.getenv("FEED_OPS_TO_MAIN", "false").strip().lower() in ("true", "1", "yes")
 ALCHEMY_RPC_URL: str = os.getenv("ALCHEMY_RPC_URL", "")
 
 # ---------------------------------------------------------------------------
@@ -1538,55 +1543,237 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
 # Telegram notifications
 # ---------------------------------------------------------------------------
 
-async def _send_telegram(http_client: httpx.AsyncClient, text: str, *, ops: bool = False) -> None:
-    """Send a Telegram message.
+async def _send_telegram(
+    http_client: httpx.AsyncClient,
+    text: str,
+    *,
+    ops: bool = False,
+    silent: Optional[bool] = None,
+    reply_to: Optional[int] = None,
+    buttons: Optional[list] = None,
+) -> Optional[int]:
+    """Send a Telegram message. Returns the sent message_id (for reply-threading), or None.
 
     ops=False (default) → the AUDIENCE feed (TELEGRAM_CHAT_ID), with a push notification.
     ops=True            → operational noise. Goes to TELEGRAM_OPS_CHAT_ID if configured
-                          (loud, for the operator); otherwise stays in the main channel but
-                          SILENT (disable_notification) so the friends' phones don't buzz.
+                          (loud, for the operator). With no ops channel it is DROPPED from
+                          Telegram and logged instead — ops content carries the insider
+                          score and must not reach the audience feed. FEED_OPS_TO_MAIN=true
+                          restores the pre-v2 silent-in-main fallback.
+    silent              → explicit notification override for AUDIENCE messages (feed v2
+                          notification discipline: betslips + routine settles are silent;
+                          big moments, recaps and pauses buzz). Ignored for ops routing.
+    reply_to            → message_id to thread under (settle replies to its betslip).
+                          Sends standalone if the target is gone (allow_sending_without_reply).
+    buttons             → [(label, url), ...] rendered as one row of inline URL buttons.
     """
     if not TELEGRAM_BOT_TOKEN:
-        return
+        return None
     if ops and TELEGRAM_OPS_CHAT_ID:
-        chat_id, silent = TELEGRAM_OPS_CHAT_ID, False
+        chat_id, quiet = TELEGRAM_OPS_CHAT_ID, False
+    elif ops and not FEED_OPS_TO_MAIN:
+        # No ops channel → ops output stays out of the audience feed entirely.
+        log.info("[Telegram] ops message dropped (no TELEGRAM_OPS_CHAT_ID): %.150s",
+                 text.replace("\n", " | "))
+        return None
     else:
-        chat_id, silent = TELEGRAM_CHAT_ID, ops  # ops w/o ops-channel → silent in main feed
+        chat_id = TELEGRAM_CHAT_ID
+        quiet = ops if silent is None else bool(silent)  # ops fallback → silent in main
     if not chat_id:
-        return
+        return None
+    payload: dict = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_notification": quiet,
+        "link_preview_options": {"is_disabled": True},
+    }
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+        payload["allow_sending_without_reply"] = True
+    if buttons:
+        payload["reply_markup"] = {
+            "inline_keyboard": [[{"text": str(lbl), "url": str(url)} for lbl, url in buttons]]
+        }
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        resp = await http_client.post(
-            url,
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_notification": silent,
-            },
-            timeout=15,
-        )
-        if not resp.is_success:
+    # Bounded retry on TRANSIENT failures (429/5xx/network) so a one-blip outage
+    # during a multi-settle grading batch doesn't permanently eat a card — settles
+    # are one-shot (marked notified + PATCHed regardless of send outcome, by design).
+    # Hard 4xx (e.g. 400 can't-parse-entities) never retries. Never raises.
+    for attempt in range(3):
+        try:
+            resp = await http_client.post(url, json=payload, timeout=15)
+            if resp.is_success:
+                try:
+                    return int(resp.json()["result"]["message_id"])
+                except Exception:
+                    return None
+            if resp.status_code == 429 and attempt < 2:
+                try:
+                    delay = float(resp.json()["parameters"]["retry_after"])
+                except Exception:
+                    delay = 2.0
+                await asyncio.sleep(min(delay, 5.0))
+                continue
+            if resp.status_code >= 500 and attempt < 2:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
             log.warning("[Telegram] Send failed %d: %s", resp.status_code, resp.text[:100])
-    except Exception as exc:
-        log.warning("[Telegram] Send error: %s", exc)
+            return None
+        except Exception as exc:
+            if attempt < 2:
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            log.warning("[Telegram] Send error: %s", exc)
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Feed v2 — betslip registry + house copy pools
+# ---------------------------------------------------------------------------
+
+# alert_id → Telegram message_id of its betslip, so the settle can thread as a
+# reply and read as one self-contained "did it hit" card. In-memory and capped:
+# a restart simply means the next settles post standalone (graceful).
+_slip_msgs: dict = {}
+_SLIP_MSGS_CAP = 600
+
+
+def _remember_slip(alert_id: str, message_id: Optional[int]) -> None:
+    if not alert_id or not message_id:
+        return
+    if len(_slip_msgs) >= _SLIP_MSGS_CAP:  # FIFO-ish evict (insertion-ordered dict)
+        _slip_msgs.pop(next(iter(_slip_msgs)), None)
+    _slip_msgs[alert_id] = message_id
+
+
+def _pick_line(pool: list, seed: int) -> str:
+    """Deterministic rotation through a copy pool — varied feed, reproducible tests."""
+    return pool[seed % len(pool)] if pool else ""
+
+
+# Odds vocabulary — price is the only honest signal (the insider score was proven
+# non-predictive noise), so every card leads with the market's own odds, in plain words.
+_ODDS_BANDS = [   # (max_price, key, display word)
+    (0.15, "big_longshot", "big longshot"),
+    (0.35, "underdog", "underdog"),
+    (0.60, "coin_flip", "coin-flip"),
+    (0.80, "favorite", "favorite"),
+    (1.01, "heavy_chalk", "heavy chalk"),
+]
+
+# House copy pools — written by a 3-register comedy panel + head-writer pass
+# (2026-06-12). Rotated deterministically per slip so the feed never repeats
+# itself two bets in a row. Honest down-bad voice; no score, no cheerleading.
+_SLIP_BANTER = {
+    "big_longshot": [
+        "the math says no. the heart says $2.",
+        "it found a 12-cent dream and put real money on it.",
+        "statistically doomed. spiritually undefeated.",
+        "if this hits, we're framing the slip.",
+        "long odds, short money, infinite belief.",
+    ],
+    "underdog": [
+        "it took the dog. somewhere a favorite is plotting its betrayal.",
+        "the dog has a puncher's chance and the bot has $3. let's dance.",
+        "backing the dog. us losers stick together.",
+        "everyone says no. the bot said $2 worth of yes.",
+        "live look at us begging the underdog to do it one time.",
+    ],
+    "coin_flip": [
+        "a coin flip. the bot brought a dollar and a feeling.",
+        "fifty-fifty. historically the bot finds a third option.",
+        "we could've flipped a real coin for free, but this has graphs.",
+        "heads we celebrate, tails we have material.",
+        "50/50. the bot specializes in finding the wrong 50.",
+    ],
+    "favorite": [
+        "backing the favorite. the favorite knows what it did last time.",
+        "back with the favorites. our most toxic relationship.",
+        "a favorite, lightly seasoned with dread. in it goes.",
+        "favorites owe this bot an apology tour, honestly.",
+        "trusting a favorite again. fool me 47 times.",
+    ],
+    "heavy_chalk": [
+        "ninety cents on a lock. locks around here come pre-picked.",
+        "big favorite. small payout. the risk is purely emotional.",
+        "should be free money. 'should' carries this entire operation.",
+        "laying chalk to win a gumball. we are not serious people.",
+        "so safe it's insulting. sweating it anyway, obviously.",
+    ],
+    "mystery": ["no read on this one — buckle up."],
+}
+_HIT_LINES = [
+    "a win?? in this economy??",
+    "a win. routine, professional, suspicious.",
+    "it bet the right side AND the right side won. growth.",
+    "won. don't ask about the lifetime number. just clap.",
+    "the vault is still empty, but it's a happier empty.",
+    "green. small, but legally green.",
+    "correct outcome achieved. on purpose, we're told.",
+]
+_MISS_LINES = [
+    "loss. anyway.",
+    "wrong again. the bot remains undefeated at this.",
+    "that money lives somewhere nicer now.",
+    "it's not a loss. it's a subscription to humility.",
+    "the bot would like to formally blame the favorite.",
+    "a miss. the dollar died doing what it loved: leaving.",
+    "another $2 donated to people smarter than us.",
+]
+_TIMEOUT_LINES = [
+    "the bot benched itself. first good read of the day.",
+    "losing too fast; the bot called its own timeout. growth, sort of.",
+    "the bot rage quit, responsibly. back soon.",
+    "trading halted by management. management is the bot. it knows.",
+    "benched. even the bot knows when to stop, and it's a bot.",
+]
+
+
+def _odds_key(price) -> tuple[str, str]:
+    """(pool_key, display_word) for an entry price; ('mystery', …) when unknowable."""
+    if price is None or not (0 < price < 1):
+        return "mystery", "mystery line"
+    for cap, key, word in _ODDS_BANDS:
+        if price <= cap:
+            return key, word
+    return "mystery", "mystery line"
 
 
 def _odds_read(price: float) -> tuple[str, str]:
-    """Plain-English read of the entry price — the only honest signal (the insider score
-    was shown to be non-predictive, so we lead with the odds the market itself gives).
-    Returns (odds_word, house_banter). Pure presentation; no trading state."""
-    if price is None or price <= 0:
-        return "mystery line", "no read on this one — buckle up."
-    if price <= 0.15:
-        return "big longshot", "the bot is feeling BRAVE. 🫡"
-    if price <= 0.35:
-        return "underdog", "taking the dog. spicy. 🌶"
-    if price <= 0.60:
-        return "coin-flip", "genuine toss-up — nobody knows anything."
-    if price <= 0.80:
-        return "favorite", "leaning chalk. quietly confident."
-    return "heavy chalk", "boring but usually banks. 🥱"
+    """Back-compat shim: (odds_word, a banter line). Prefer _odds_key + _pick_line."""
+    key, word = _odds_key(price)
+    return word, _SLIP_BANTER[key][0]
+
+
+def _build_slip_text(
+    market_q: str,
+    bet_side: str,
+    fill_price: float,
+    size: float,
+    bet_no: Optional[int] = None,
+) -> str:
+    """Pure betslip card (feed v2). One bet = one slip: number, odds word, the line,
+    stake → payout, one rotating banter line. No score, no bank line, no link clutter
+    (the market link rides as an inline button)."""
+    import html as _html
+
+    profit_if_win = (size / fill_price) - size if fill_price and fill_price > 0 else 0.0
+    safe_q   = _html.escape(str(market_q)[:90])
+    safe_side = _html.escape(str(bet_side))
+    key, word = _odds_key(fill_price)
+    seed     = bet_no if bet_no is not None else int(size * 100) + int((fill_price or 0) * 100)
+    banter   = _pick_line(_SLIP_BANTER.get(key) or _SLIP_BANTER["mystery"], seed)
+    price_c  = f"{fill_price*100:.0f}¢" if fill_price and fill_price > 0 else "?¢"
+    no_bit   = f" #{bet_no}" if bet_no else ""
+
+    return (
+        f"🎟 <b>BET{no_bit}</b> · {word}\n"
+        f"<b>{safe_side}</b> — {safe_q}\n\n"
+        f"{price_c} · ${size:.2f} riding to win <b>${profit_if_win:.2f}</b>\n"
+        f"<i>{banter}</i>"
+    )
 
 
 async def _notify_trade_filled(
@@ -1601,37 +1788,19 @@ async def _notify_trade_filled(
     *,
     alert_created_at: int = 0,
     score_breakdown_json: Optional[str] = None,
+    alert_id: str = "",
+    bet_no: Optional[int] = None,
 ) -> None:
-    # AUDIENCE message — story-first. We deliberately DROP the score, score-bar, signal
-    # breakdown, detection latency, slippage, and the wallet/Polygonscan line: the edge study
-    # showed the score and its components are non-predictive noise, and the rest is ops
-    # forensics nobody in the feed reads. The price (as plain odds) is the only honest signal.
-    # (score / slippage / alert_created_at / score_breakdown_json kept in the signature for
-    # callers + the ops channel, intentionally unused here.)
-    import html as _html
-
-    try:
-        remaining_balance = await _get_usdc_balance()
-    except Exception:
-        remaining_balance = 0.0
-
-    profit_if_win = (size / fill_price) - size if fill_price and fill_price > 0 else 0.0
-    safe_q        = _html.escape(str(market_q)[:90])
-    safe_side     = _html.escape(str(bet_side))
-    word, banter  = _odds_read(fill_price)
-    price_c       = f"{fill_price*100:.0f}¢" if fill_price and fill_price > 0 else "?"
-
-    text = (
-        f"🟢 <b>BET IN</b> — {word}\n"
-        f"{safe_q}\n\n"
-        f"<b>{safe_side}</b> at {price_c}  ·  ${size:.2f} to win <b>${profit_if_win:.2f}</b>\n"
-        f"🏦 ${remaining_balance:.2f} in the bank\n"
-        f"<i>{banter}</i>"
-    )
-    if market_url:
-        safe_url = _html.escape(str(market_url), quote=True)
-        text += f'\n\n<a href="{safe_url}">watch it live →</a>'
-    await _send_telegram(http_client, text)
+    # AUDIENCE betslip — feed v2. SILENT push (notification discipline: anticipation is
+    # browsable, results buzz). The slip's message_id is remembered so the settle threads
+    # under it as a reply and each bet reads as one self-contained card.
+    # (score / slippage / alert_created_at / score_breakdown_json kept in the signature
+    # for callers + ops parity, intentionally unused here — the score is dead, long live
+    # the price.)
+    text = _build_slip_text(market_q, bet_side, fill_price, size, bet_no)
+    buttons = [("⚡ watch it live", str(market_url))] if market_url else None
+    msg_id = await _send_telegram(http_client, text, silent=True, buttons=buttons)
+    _remember_slip(alert_id, msg_id)
 
 
 def _is_geoblock(error_msg: Optional[str]) -> bool:
@@ -1839,13 +2008,16 @@ async def _notify_low_balance(
 
 
 def _format_loss_lines(recent_losses: list) -> str:
-    """Format the recent-loss list into Telegram HTML lines."""
+    """Format the recent-loss list into Telegram HTML lines (market/side escaped —
+    a literal '<' in a question like "Will Elon post <40 tweets…" 400s the whole
+    parse_mode=HTML message and silently drops the circuit-breaker alert)."""
+    import html as _html
     if not recent_losses:
         return "  (no resolved trades available)"
     lines = []
     for t in recent_losses:
-        q     = (t.get("market_question") or "Unknown")[:60]
-        side  = t.get("bet_side") or "?"
+        q     = _html.escape((t.get("market_question") or "Unknown")[:60])
+        side  = _html.escape(str(t.get("bet_side") or "?"))
         price = t.get("bet_price_intended") or 0.0
         score = t.get("score") or "?"
         lines.append(f"  • {q}\n    {side} @ {price:.3f} · Score {score}")
@@ -1869,6 +2041,18 @@ async def _notify_loss_streak_warning(
     await _send_telegram(http_client, text, ops=True)
 
 
+def _build_timeout_text(reason_line: str, resume_ts: int, seed: int) -> str:
+    """Pure audience 'bot benched itself' card — the rails firing IS part of the show,
+    told honestly and short. Full forensic detail goes to ops separately."""
+    resume_str = time.strftime("%H:%M UTC", time.gmtime(resume_ts))
+    return (
+        f"🧯 <b>BOT IN TIMEOUT</b>\n"
+        f"{reason_line}\n"
+        f"⏳ benched {TRADING_PAUSE_DURATION_SECONDS // 60} min — back at {resume_str}\n"
+        f"<i>{_pick_line(_TIMEOUT_LINES, seed)}</i>"
+    )
+
+
 async def _notify_loss_streak_pause(
     http_client: httpx.AsyncClient,
     consecutive: int,
@@ -1876,19 +2060,24 @@ async def _notify_loss_streak_pause(
     resume_ts: int,
     recent_losses: list,
 ) -> None:
-    resume_str = time.strftime("%H:%M UTC", time.gmtime(resume_ts))
-    loss_lines = _format_loss_lines(recent_losses)
-    bal_str = f"${balance:.2f} USDC" if balance >= 0 else "unknown"
-    text = (
-        f"🚨 <b>CIRCUIT BREAKER — TRADING PAUSED</b>\n\n"
-        f"<b>{consecutive} consecutive losses detected.</b>\n"
-        f"⏸ Paused for {TRADING_PAUSE_DURATION_SECONDS // 60} min · resumes at {resume_str}\n"
-        f"💵 Bankroll: <b>{bal_str}</b>\n\n"
-        f"<b>Recent losses:</b>\n{loss_lines}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Investigate if unexpected. Bot resumes automatically."
+    # Audience: short, loud, honest. Ops: the full forensic version.
+    text = _build_timeout_text(
+        f"dropped <b>{consecutive} straight</b> — the rails stepped in",
+        resume_ts, consecutive,
     )
     await _send_telegram(http_client, text)
+
+    loss_lines = _format_loss_lines(recent_losses)
+    bal_str = f"${balance:.2f} USDC" if balance >= 0 else "unknown"
+    ops_text = (
+        f"🚨 <b>CIRCUIT BREAKER — TRADING PAUSED</b>\n\n"
+        f"<b>{consecutive} consecutive losses detected.</b>\n"
+        f"⏸ Paused for {TRADING_PAUSE_DURATION_SECONDS // 60} min\n"
+        f"💵 Bankroll: <b>{bal_str}</b>\n\n"
+        f"<b>Recent losses:</b>\n{loss_lines}\n\n"
+        "Investigate if unexpected. Bot resumes automatically."
+    )
+    await _send_telegram(http_client, ops_text, ops=True)
 
 
 async def _notify_cb_drawdown_pause(
@@ -1899,20 +2088,26 @@ async def _notify_cb_drawdown_pause(
     resume_ts: int,
     recent_losses: list,
 ) -> None:
-    resume_str = time.strftime("%H:%M UTC", time.gmtime(resume_ts))
-    loss_lines = _format_loss_lines(recent_losses)
     pct = (rolling_loss / max(bankroll, 1.0)) * 100
-    text = (
+    # Audience: short, loud, honest. Ops: the full forensic version.
+    text = _build_timeout_text(
+        f"down <b>${rolling_loss:.2f}</b> in {TRADING_CB_WINDOW_HOURS:.0f}h "
+        f"(that's {pct:.0f}% of the wallet, chief)",
+        resume_ts, int(rolling_loss * 100),
+    )
+    await _send_telegram(http_client, text)
+
+    loss_lines = _format_loss_lines(recent_losses)
+    ops_text = (
         f"🚨 <b>CIRCUIT BREAKER — TRADING PAUSED</b>\n\n"
         f"Rolling {TRADING_CB_WINDOW_HOURS:.0f}h loss: <b>${rolling_loss:.2f}</b> "
         f"({pct:.1f}% of bankroll, threshold {TRADING_CB_DRAWDOWN_PCT * 100:.0f}%)\n"
-        f"⏸ Paused for {TRADING_PAUSE_DURATION_SECONDS // 60} min · resumes at {resume_str}\n"
+        f"⏸ Paused for {TRADING_PAUSE_DURATION_SECONDS // 60} min\n"
         f"💵 Bankroll: <b>${bankroll:.2f} USDC</b>\n\n"
         f"<b>Recent losses:</b>\n{loss_lines}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Investigate if unexpected. Bot resumes automatically."
     )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, ops_text, ops=True)
 
 
 # Running win/loss streak for spectator-feed flavor (in-memory; resets on restart,
@@ -1984,10 +2179,16 @@ def _streak_headline(status: str, streak: int) -> tuple[str, str]:
 # banners were effectively dead code. Dollar tiers are now reachable on this bankroll; the
 # longshot tier (≤20¢) is dormant under the 0.50 favorites floor and will light up only if
 # that floor is ever lowered (the open forward-test) — kept intact for that case.
+#
+# 2026-06-12 (feed v2) — retuned again, upward. In v2 these banners GATE notifications
+# (loud settle ⇔ banner/snap/streak), and at $3 a banner fired on most coin-flip wins and
+# every near-max-stake loss — every other settle buzzed, so none of them meant anything.
+# Envelope under the $5 cap + 0.50 floor: win pnl ≤ +$5.00, loss pnl ≥ −$5.00. BIG WIN now
+# = the juiciest coin-flip wins (≤ ~53¢ at full stake), BRUTAL = a near-max-stake loss.
 _TICKER_LONGSHOT_MAX: float = float(os.getenv("TICKER_LONGSHOT_MAX_PRICE", "0.20"))
-_TICKER_BIG_WIN_USDC: float = float(os.getenv("TICKER_BIG_WIN_USDC", "3"))
+_TICKER_BIG_WIN_USDC: float = float(os.getenv("TICKER_BIG_WIN_USDC", "4.5"))
 _TICKER_UPSET_FAV_PRICE: float = float(os.getenv("TICKER_UPSET_FAV_PRICE", "0.80"))
-_TICKER_BRUTAL_LOSS_USDC: float = float(os.getenv("TICKER_BRUTAL_LOSS_USDC", "3"))
+_TICKER_BRUTAL_LOSS_USDC: float = float(os.getenv("TICKER_BRUTAL_LOSS_USDC", "4.75"))
 
 
 def _big_moment(status: str, fill_price: float, pnl: float):
@@ -2007,14 +2208,89 @@ def _big_moment(status: str, fill_price: float, pnl: float):
             return (f"🎰 <b>LONGSHOT HITS — {odds}:1</b>", "big odds, ice veins. cash. 🧊")
         if pnl >= _TICKER_BIG_WIN_USDC:
             tier = "💎 <b>HUGE WIN</b>" if pnl >= 2 * _TICKER_BIG_WIN_USDC else "🚀 <b>BIG WIN</b>"
-            return (f"{tier} — ${pnl:+.2f}", "that's the dinner bill. 🦞")
+            return (f"{tier} — +${pnl:.2f}", "that's the dinner bill. 🦞")
     elif status == "lost":
         if fill_price >= _TICKER_UPSET_FAV_PRICE:
             return (f"💀 <b>UPSET — backed the {fill_price * 100:.0f}% fav, got cooked</b>",
                     "that's the one that keeps you humble. 😮‍💨")
         if pnl <= -_TICKER_BRUTAL_LOSS_USDC:
-            return (f"💸 <b>BRUTAL BEAT — ${pnl:+.2f}</b>", "oof. pour one out. 🫗")
+            return (f"💸 <b>BRUTAL BEAT — −${abs(pnl):.2f}</b>", "oof. pour one out. 🫗")
     return None
+
+
+def _build_settle_text(
+    trade: dict,
+    resolution_status: str,
+    pnl: float,
+    streak: int = 0,
+    snap: str = "",
+    *,
+    threaded: bool = False,
+    balance: Optional[float] = None,
+) -> tuple[str, bool]:
+    """Pure settle card (feed v2). Returns (html_text, loud).
+
+    threaded=True → this message will post as a REPLY to its betslip, so the quoted
+    slip already shows the market + side + price; the card then leads with the result
+    and skips the title. threaded=False (slip unknown, e.g. after a restart) → the
+    card stays self-contained and includes the line it settled.
+
+    loud: only genuinely notable settles buzz phones — a big-moment banner, a ≥3-round
+    streak, or a streak snap. Routine wins/losses post silent (notification discipline)."""
+    import html as _html
+
+    market_q = trade.get("market_question") or trade.get("market_id", "")
+    bet_side = trade.get("bet_side", "")
+    fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.0
+    winning_outcome = trade.get("winning_outcome")
+    pnl = pnl or 0.0
+
+    headline, banter = _streak_headline(resolution_status, streak)
+    moment = _big_moment(resolution_status, fill_price, pnl)
+    # Cap the header at ONE prepended banner so the result still leads the phone's
+    # notification preview. A rare big-moment (UNICORN / BIG WIN / UPSET) outranks a snap.
+    if moment:
+        headline = f"{moment[0]}\n{headline}"
+        banter = moment[1]
+    elif snap:
+        headline = f"{snap}\n{headline}"
+    elif abs(streak) < 2:
+        # Ordinary (non-streak) settle → rotate the house lines so the feed doesn't
+        # repeat itself. Streak settles (|n|>=2) keep _streak_headline's curated
+        # escalation banter — overwriting it here would make those lines dead copy.
+        seed = abs(int(pnl * 100)) + int((fill_price or 0) * 100)
+        if resolution_status == "won":
+            banter = _pick_line(_HIT_LINES, seed)
+        elif resolution_status == "lost":
+            banter = _pick_line(_MISS_LINES, seed)
+
+    # A VOID/refund settle doesn't buzz for a stale running streak — a voids-only
+    # grading batch leaves _result_streak untouched, so the streak isn't this card's
+    # news. (A big-moment or snap banner still buzzes whatever card carries it.)
+    loud = bool(moment) or bool(snap) or \
+        (abs(streak) >= 3 and resolution_status in ("won", "lost"))
+
+    price_c = f"{fill_price*100:.0f}¢" if fill_price and fill_price > 0 else "?¢"
+    safe_side = _html.escape(str(bet_side))
+    if resolution_status == "won":
+        mult = f" (x{1.0/fill_price:.1f})" if fill_price and fill_price > 0 else ""
+        money_line = f"💰 <b>+${pnl:.2f}</b> — {safe_side} cashed at {price_c}{mult}"
+    elif resolution_status == "lost":
+        money_line = f"💸 <b>−${abs(pnl):.2f}</b> — {safe_side} at {price_c} didn't land"
+    else:
+        money_line = "↩️ <b>Refunded</b> — push, no harm"
+
+    lines = [headline, ""]
+    if not threaded:
+        lines.append(f"📋 {_html.escape(str(market_q)[:120])}")
+    lines.append(money_line)
+    # On a loss, name the side that actually won (only when it adds information).
+    if resolution_status == "lost" and winning_outcome:
+        lines.append(f"🏆 {_html.escape(str(winning_outcome))} took it")
+    if balance is not None and balance >= 0:
+        lines.append(f"🏦 bank ${balance:.2f}")
+    lines.append(f"<i>{banter}</i>")
+    return "\n".join(lines), loud
 
 
 async def _notify_trade_resolution(
@@ -2024,48 +2300,18 @@ async def _notify_trade_resolution(
     pnl: float,
     streak: int = 0,
     snap: str = "",
+    balance: Optional[float] = None,
 ) -> None:
-    import html as _html
-
-    market_q = trade.get("market_question") or trade.get("market_id", "")
-    bet_side = trade.get("bet_side", "")
-    fill_price = trade.get("bet_price_filled") or trade.get("bet_price_intended") or 0.0
-    winning_outcome = trade.get("winning_outcome")
-
-    headline, banter = _streak_headline(resolution_status, streak)
-    moment = _big_moment(resolution_status, fill_price, pnl)
-    # Cap the header at ONE prepended banner so the market title still shows in the phone's
-    # notification preview. A rare big-moment (UNICORN / BIG WIN / UPSET) outranks a streak-snap.
-    if moment:
-        headline = f"{moment[0]}\n{headline}"
-        banter = moment[1]
-    elif snap:
-        headline = f"{snap}\n{headline}"
-
-    # Plain-money outcome line, matched to the audience (no "P&L"/"USDC" jargon). Wins show the
-    # cash multiple — the screenshot-and-post moment.
-    price_c = f"{fill_price*100:.0f}¢" if fill_price and fill_price > 0 else "?"
-    if resolution_status == "won":
-        mult = f"  (x{1.0/fill_price:.1f})" if fill_price and fill_price > 0 else ""
-        money_line = f"💰 <b>Won ${pnl:.2f}</b>{mult}"
-    elif resolution_status == "lost":
-        money_line = f"💸 <b>Lost ${abs(pnl):.2f}</b>"
-    else:
-        money_line = "↩️ <b>Refunded</b> — push, no harm"
-
-    outcome_line = (
-        f"🏆 {_html.escape(str(winning_outcome))} took it\n" if winning_outcome else ""
+    # AUDIENCE settle — feed v2: threads as a reply under its betslip (one bet = one
+    # story), buzzes only when notable, shows the bank where the money changed.
+    # balance is fetched ONCE per grading batch by the caller (one RPC, not one per
+    # settle inside the trading loop); None just omits the bank line.
+    slip_id = _slip_msgs.get(str(trade.get("alert_id") or ""))
+    text, loud = _build_settle_text(
+        trade, resolution_status, pnl, streak, snap,
+        threaded=bool(slip_id), balance=balance,
     )
-
-    text = (
-        f"{headline}\n\n"
-        f"📋 {_html.escape(market_q[:120])}\n"
-        f"🎯 {_html.escape(str(bet_side))} at {price_c}\n"
-        f"{outcome_line}"
-        f"{money_line}\n"
-        f"<i>{banter}</i>"
-    )
-    await _send_telegram(http_client, text)
+    await _send_telegram(http_client, text, silent=not loud, reply_to=slip_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2361,12 +2607,22 @@ async def _execute_trade(
         if market_id and bet_side:
             _held_positions.add((market_id, bet_side))
             log.debug("[Dedup] Added (%s, %s) to _held_positions", market_id[:16], bet_side)
+        # Running slip number for the feed: lifetime filled bets (settled + open) + this
+        # one. Presentation-only; omitted gracefully if the stats payload lacks the keys.
+        try:
+            bet_no = int(stats.get("resolved", 0)) + int(stats.get("open_positions", 0)) + 1
+            if bet_no <= 0:
+                bet_no = None
+        except Exception:
+            bet_no = None
         await _notify_trade_filled(
             http_client, market_q, bet_side,
             fill_price or current_price or price_alert,
             filled_size, score, slippage, market_url,
             alert_created_at=int(alert.get("created_at") or 0),
             score_breakdown_json=alert.get("score_breakdown_json"),
+            alert_id=alert_id,
+            bet_no=bet_no,
         )
     elif status == "error" and _is_geoblock(error_msg):
         # Geoblock: trip a circuit-breaker so we stop hammering POST /order, and alert
@@ -2453,6 +2709,14 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
     _apply_round_streak(cyc_won, cyc_lost)
     snap = _streak_snap(prev_streak, _result_streak)
 
+    # One balance RPC per grading batch (not per settle — this loop runs inline in
+    # the trading loop, and per-settle eth_calls would stack RPC latency between
+    # resolution PATCHes). Wins don't move free USDC until redemption anyway.
+    try:
+        batch_balance = await _get_usdc_balance()
+    except Exception:
+        batch_balance = None
+
     first = True
     for trade in new:
         alert_id = trade["alert_id"]
@@ -2499,7 +2763,8 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
 
         # Streak is the cycle's round value; the snap banner rides only the first post.
         await _notify_trade_resolution(http_client, trade, resolution_status, pnl,
-                                       streak=_result_streak, snap=snap if first else "")
+                                       streak=_result_streak, snap=snap if first else "",
+                                       balance=batch_balance)
         first = False
 
         log.info(
