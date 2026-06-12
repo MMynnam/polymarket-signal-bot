@@ -2249,8 +2249,12 @@ async def _execute_trade(
                 fill_price = float(
                     resp.get("price") or resp.get("avgPrice") or current_price or price_alert
                 )
-                # Query order detail to get the actual USDC matched (may be < bet_size for FAK).
-                # Polymarket REST returns size_matched in USDC float, not micro-units.
+                # Query order detail to get the actual fill (may be < bet_size for FAK).
+                # IMPORTANT (audit 2026-06-11): get_order's size_matched is denominated in
+                # SHARES (outcome tokens), NOT USDC. The cash actually spent = shares × fill
+                # price. The old code recorded the raw share count as size_usdc, which inflated
+                # P&L (a $0.08-entry longshot booked ~12x its cost — the phantom "+$127.78 win")
+                # and broke the partial-fill check below (shares vs dollars). Convert to USDC.
                 # Retry once on failure; if still unresolvable, mark fill-unconfirmed so
                 # the trade is excluded from CB/bankroll math rather than defaulting to
                 # the intended full amount.
@@ -2274,7 +2278,9 @@ async def _execute_trade(
                             or _get_order_result.get("matched_amount")
                         )
                         if raw_matched is not None:
-                            filled_size = float(raw_matched)
+                            # shares × price = USDC cash spent (fill_price set above, >0 on a match).
+                            _shares = float(raw_matched)
+                            filled_size = _shares * fill_price if fill_price > 0 else bet_size
                         else:
                             # Exchange returned an order dict but no size field — unconfirmed.
                             log.warning(
