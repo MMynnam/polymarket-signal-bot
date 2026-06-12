@@ -363,6 +363,89 @@ class TelegramSender:
         log.error("Telegram: all %d document send attempts failed", config.HTTP_MAX_RETRIES)
         return False
 
+    async def send_photo(
+        self,
+        photo_bytes: bytes,
+        client: httpx.AsyncClient,
+        caption: Optional[str] = None,
+        silent: bool = False,
+    ) -> bool:
+        """
+        Send an in-memory PNG via sendPhoto (multipart POST). Returns True on success.
+        Captions over Telegram's 1024-char limit are truncated defensively — callers
+        wanting the full text should send it as a separate message instead.
+        """
+        backoff = 2.0
+        for attempt in range(1, config.HTTP_MAX_RETRIES + 1):
+            try:
+                form_data: dict = {"chat_id": self._chat_id}
+                if caption:
+                    form_data["caption"] = caption[:1024]
+                    form_data["parse_mode"] = "HTML"
+                if silent:
+                    form_data["disable_notification"] = "true"
+                resp = await client.post(
+                    f"{self._base_url}/sendPhoto",
+                    data=form_data,
+                    files={"photo": ("card.png", photo_bytes, "image/png")},
+                    timeout=config.HTTP_TIMEOUT_SECONDS,
+                )
+
+                if resp.status_code == 429:
+                    retry_after = float(
+                        resp.json().get("parameters", {}).get("retry_after", 5)
+                    )
+                    log.warning(
+                        "Telegram rate-limited (photo) — sleeping %.1fs (attempt %d/%d)",
+                        retry_after, attempt, config.HTTP_MAX_RETRIES,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                resp.raise_for_status()
+                return True
+
+            except httpx.HTTPStatusError as exc:
+                log.error(
+                    "Telegram photo HTTP error attempt %d/%d: %s — body: %s",
+                    attempt, config.HTTP_MAX_RETRIES,
+                    exc.response.status_code,
+                    exc.response.text[:200],
+                )
+            except Exception as exc:
+                log.error(
+                    "Telegram photo send error attempt %d/%d: %s",
+                    attempt, config.HTTP_MAX_RETRIES, exc,
+                )
+
+            if attempt < config.HTTP_MAX_RETRIES:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+
+        log.error("Telegram: all %d photo send attempts failed", config.HTTP_MAX_RETRIES)
+        return False
+
+
+def make_research_sender() -> Optional[TelegramSender]:
+    """
+    Sender for RESEARCH/OPS output (feed v2): the per-signal alert walls, the daily
+    intelligence brief + CSV, and terminal-style resolution duplicates. These are
+    operator material — they carry the (non-predictive) score and drown the friends'
+    feed, so they no longer ship to the audience channel:
+
+      TELEGRAM_OPS_CHAT_ID set        → a TelegramSender bound to the ops channel
+      FEED_RESEARCH_TO_MAIN=true      → the old behavior (main channel)
+      neither                         → None: caller must SKIP the Telegram send
+                                        (content still lands in logs + DB + API)
+
+    Audience output (betslips, settles, recaps) never goes through this.
+    """
+    if config.TELEGRAM_OPS_CHAT_ID:
+        return TelegramSender(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_OPS_CHAT_ID)
+    if config.FEED_RESEARCH_TO_MAIN:
+        return TelegramSender(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Alert queue worker
@@ -381,10 +464,16 @@ class AlertQueue:
     def __init__(self, dry_run: bool = False):
         self._queue: asyncio.Queue[AlertPayload] = asyncio.Queue()
         self._dry_run = dry_run
-        self._sender = TelegramSender(
-            token=config.TELEGRAM_BOT_TOKEN,
-            chat_id=config.TELEGRAM_CHAT_ID,
-        )
+        # Feed v2: signal alerts are research output → ops channel (or dropped from
+        # Telegram entirely when no ops channel is configured). The audience channel
+        # gets the betslip from the trader instead; DB/alert-history persistence in
+        # _process is unconditional either way, so the trading pipeline is unaffected.
+        self._sender = make_research_sender()
+        if self._sender is None:
+            log.info(
+                "Alert walls will NOT be sent to Telegram (no TELEGRAM_OPS_CHAT_ID, "
+                "FEED_RESEARCH_TO_MAIN=false) — alerts persist to DB/logs only"
+            )
         self._last_sent_at: float = 0.0
 
     async def enqueue(self, payload: AlertPayload) -> None:
@@ -447,6 +536,13 @@ class AlertQueue:
                     .replace("<code>", "").replace("</code>", ""),
             )
             sent = False  # dry-run: recorded as not sent
+        elif self._sender is None:
+            # Feed v2: no research channel configured — alert recorded, not telegrammed.
+            log.info(
+                "Alert recorded (no research channel): score=%d market=%s",
+                b.total, t.market_id,
+            )
+            sent = False
         else:
             log.info(
                 "Sending alert: score=%d market=%s wallet=%s",

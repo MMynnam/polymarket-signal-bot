@@ -23,6 +23,12 @@ import config
 import database
 from alerter import TelegramSender
 
+try:
+    from feed_card import render_recap_card
+except Exception:  # pillow/asset trouble must never take the recap down
+    def render_recap_card(**_kw):
+        return None
+
 log = logging.getLogger("results_recap")
 
 # ~09:00 Stockholm (CEST) — a morning "how'd yesterday go" ritual that captures
@@ -87,6 +93,99 @@ def _streak_emoji(n: int) -> str:
     if n >= 4:
         return "🔥🔥"
     return "🔥"
+
+
+def _winbar(wins: int, losses: int, cells: int = 10) -> str:
+    """Unicode win-rate bar — ▰ for the win share, ▱ for the rest."""
+    total = wins + losses
+    if total <= 0:
+        return "▱" * cells
+    k = round(cells * wins / total)
+    k = max(0, min(cells, k))
+    return "▰" * k + "▱" * (cells - k)
+
+
+def _money(x: float) -> str:
+    """One money grammar for the whole feed: +$4.80 / −$3.00 (sign first, true
+    minus) — matches the image card and the fly trader's settle cards."""
+    sign = "+" if x >= 0 else "−"
+    return f"{sign}${abs(x):.2f}"
+
+
+# Honest footer pools (feed v2; written by the 2026-06-12 copy panel).
+# {net} is the formatted all-time number; {n} the open-slip count.
+# Down-bad lines fire only when lifetime net is actually negative — joking about
+# "tuition" while up would be its own kind of dishonest.
+_LIFETIME_LINES = [
+    "lifetime: {net}. we prefer the term 'tuition.'",
+    "{net} since inception. inception was a mistake.",
+    "all-time stands at {net}. the vault remains theoretical.",
+    "all-time: {net}. somewhere out there, our money is thriving.",
+    "{net} all-time. every empire starts somewhere. usually not here.",
+    "all-time {net}. we paid that for entertainment. honestly? fair.",
+]
+_LIFETIME_UP_LINES = [
+    "all-time: {net}. somehow. nobody breathe.",
+    "{net} lifetime. the bot demands respect (a small amount).",
+    "all-time {net}. green. genuinely unclear how. don't jinx it.",
+]
+_SWEAT_LINES = [
+    "{n} slips still open overnight. sleep is for the solvent.",
+    "{n} open positions. schrödinger's bankroll till morning.",
+    "{n} bets sweating till morning. the bets are fine. we are not.",
+    "carrying {n} into the night. the night has a record against us.",
+]
+
+
+def _lifetime_line(lt_net: float, seed: int) -> str:
+    pool = _LIFETIME_LINES if lt_net < 0 else _LIFETIME_UP_LINES
+    return _pick(pool, seed).format(net=_money(lt_net))
+
+
+def _sweat_line(n: int) -> str:
+    """Overnight open-positions line. Seeded by count AND day so a cap-pinned bot
+    doesn't post the identical joke every single night; singular gets its own line."""
+    if n == 1:
+        return "one slip still open overnight. all eyes on it."
+    seed = n + datetime.utcnow().timetuple().tm_yday
+    return _pick(_SWEAT_LINES, seed).format(n=n)
+
+
+def _lifetime_stats():
+    """(record_str, net_float) lifetime, from the (chain-healed) trade stats; (None, None)
+    on any failure — the recap renders fine without it."""
+    try:
+        s = database.get_trade_stats()
+        won, lost = int(s.get("won") or 0), int(s.get("lost") or 0)
+        net = s.get("total_pnl")
+        if won + lost == 0 or net is None:
+            return None, None
+        return f"{won}W–{lost}L", float(net)
+    except Exception as exc:
+        log.warning("[Recap] lifetime stats unavailable: %s", exc)
+        return None, None
+
+
+def _fetch_curve(days: int = 30):
+    """[(resolved_at, cumulative_pnl), ...] ASC over the last N days — the card's
+    equity tape. Realized P&L only (the honest, settled number)."""
+    try:
+        db = database.get_db()
+        since = int((datetime.utcnow() - timedelta(days=days)).timestamp())
+        rows = db.execute(
+            "SELECT resolved_at, pnl FROM trade_executions "
+            "WHERE resolution_status IN ('won','lost') AND resolved_at >= ? AND pnl IS NOT NULL "
+            "ORDER BY resolved_at ASC",
+            (since,),
+        ).fetchall()
+        out, cum = [], 0.0
+        for ts, pnl in rows:
+            cum += float(pnl or 0.0)
+            out.append((int(ts), round(cum, 4)))
+        return out
+    except Exception as exc:
+        log.warning("[Recap] curve fetch failed: %s", exc)
+        return []
 
 
 def _fetch_recap_data(window_hours: int):
@@ -183,46 +282,60 @@ def _commentary(net: float, wins: int, losses: int, streak_kind: str, streak_n: 
     return "chop. lived to fight another day."
 
 
-def format_results_recap(resolved, open_count, streak, balance, milestone=None):
-    """Build the recap message (HTML) or None if there's truly nothing to say."""
+def format_results_recap(resolved, open_count, streak, balance, milestone=None,
+                         lifetime=None):
+    """Build the daily recap (HTML) or None if there's truly nothing to say.
+
+    Feed v2: tighter card grammar (winbar + record up top, real dollars — the share-units
+    bug is fixed and history chain-healed, so no more '(notional)' hedge), an honest
+    all-time line, and rotating sweat copy. lifetime=(record_str, net_float) or None.
+    Designed to fit a Telegram photo caption (≤1024 chars) so it can ride the image card."""
     streak_kind, streak_n = streak
     if not resolved and open_count == 0:
         return None
 
     now = datetime.utcnow()
     date_human = f"{now.strftime('%A, %b')} {now.day}"
-    lines = [f"📊 <b>DAILY RECAP</b> — <i>{date_human}</i>", ""]
+    lines = [f"📊 <b>THE DAILY</b> — <i>{date_human}</i>", ""]
 
     wins = [t for t in resolved if t["resolution_status"] == "won"]
     losses = [t for t in resolved if t["resolution_status"] == "lost"]
     net = sum((t.get("pnl") or 0.0) for t in resolved)
 
     if resolved:
-        lines.append(f"🏁 <b>{len(wins)}W–{len(losses)}L</b>{_streak_tag(streak_kind, streak_n)}")
-        lines.append(f"{'📈' if net >= 0 else '📉'} <b>Net:</b> ${net:+.2f} <i>(notional)</i>")
+        lines.append(f"{_winbar(len(wins), len(losses))}  <b>{len(wins)}W–{len(losses)}L</b>"
+                     f"{_streak_tag(streak_kind, streak_n)}")
+        lines.append(f"{'📈' if net >= 0 else '📉'} <b>{_money(net)}</b> on the day")
         lines.append("")
         if wins:
             bw = max(wins, key=lambda t: t.get("pnl") or 0.0)
-            lines.append(f"🏆 <b>Biggest win:</b> {html.escape(str(bw['bet_side']))} — {_mkt(bw)}  <b>${(bw.get('pnl') or 0.0):+.2f}</b>")
+            lines.append(f"🏆 {html.escape(str(bw['bet_side']))} @ {_price(bw)*100:.0f}¢ — {_mkt(bw, 36)}  <b>{_money(bw.get('pnl') or 0.0)}</b>")
         if losses:
             bl = min(losses, key=lambda t: t.get("pnl") or 0.0)
-            lines.append(f"💸 <b>Biggest loss:</b> {html.escape(str(bl['bet_side']))} — {_mkt(bl)}  <b>${(bl.get('pnl') or 0.0):+.2f}</b>")
+            lines.append(f"💀 {html.escape(str(bl['bet_side']))} @ {_price(bl)*100:.0f}¢ — {_mkt(bl, 36)}  <b>{_money(bl.get('pnl') or 0.0)}</b>")
         # Wildest call = longest-odds WINNER (most surprising hit); else boldest swing.
         if wins:
             w = min(wins, key=_price)
-            lines.append(f"🎲 <b>Wildest call:</b> {html.escape(str(w['bet_side']))} on {_mkt(w)} hit at <b>{_price(w)*100:.0f}¢</b> 🤯")
+            if _price(w) <= 0.45:
+                lines.append(f"🎲 wildest: {html.escape(str(w['bet_side']))} cashed at <b>{_price(w)*100:.0f}¢</b> 🤯")
         elif resolved:
             w = min(resolved, key=_price)
-            lines.append(f"🎲 <b>Boldest swing:</b> {html.escape(str(w['bet_side']))} on {_mkt(w)} @ {_price(w)*100:.0f}¢ — didn't land")
+            lines.append(f"🎲 boldest: {html.escape(str(w['bet_side']))} @ {_price(w)*100:.0f}¢ — didn't land")
         lines.append("")
     else:
-        lines.append("🦗 <b>Quiet 24h</b> — nothing resolved, but the kitchen's still open.")
+        lines.append("🦗 <b>quiet 24h</b> — nothing settled, kitchen's still open.")
         lines.append("")
 
     if open_count:
-        lines.append(f"📂 <b>{open_count}</b> position{'s' if open_count != 1 else ''} open going into tomorrow")
+        lines.append(f"📂 {_sweat_line(open_count)}")
+    money_bits = []
     if balance is not None:
-        lines.append(f"🏦 <b>Wallet:</b> ${balance:.2f} free")
+        money_bits.append(f"🏦 bank <b>${balance:.2f}</b>")
+    lt_record, lt_net = lifetime if lifetime else (None, None)
+    if lt_net is not None:
+        money_bits.append(f"all-time <b>{_money(lt_net)}</b>" + (f" ({lt_record})" if lt_record else ""))
+    if money_bits:
+        lines.append("  ·  ".join(money_bits))
     if milestone:
         lines.append("")
         lines.append(milestone)
@@ -282,7 +395,7 @@ def _compute_milestone(db, since_ts):
 
     cand = []  # (priority, line) — lowest priority number wins
     if all_max is not None and all_max > 0 and w_max is not None and w_max >= all_max:
-        cand.append((1, f"🥇 <b>New record:</b> biggest win ever — <b>${all_max:+.2f}</b>"))
+        cand.append((1, f"🥇 <b>New record:</b> biggest win ever — <b>{_money(all_max)}</b>"))
     if win_lens:
         longest = max(win_lens)
         if longest >= 3 and win_lens.count(longest) == 1 and any(
@@ -293,7 +406,7 @@ def _compute_milestone(db, since_ts):
         if boundary >= 100 and prior_total < boundary <= total:
             cand.append((3, f"🎯 <b>Milestone:</b> <b>{boundary}</b> total trades resolved"))
     if all_min is not None and all_min < 0 and w_min is not None and w_min <= all_min:
-        cand.append((4, f"💸 <b>New record:</b> biggest loss ever — <b>${all_min:+.2f}</b> (oof)"))
+        cand.append((4, f"💸 <b>New record:</b> biggest loss ever — <b>{_money(all_min)}</b> (oof)"))
     if loss_lens:
         longest = max(loss_lens)
         if longest >= 3 and loss_lens.count(longest) == 1 and any(
@@ -334,17 +447,19 @@ def _weekly_commentary(net, best_streak):
     return "breakeven-ish week — lived to bet another one."
 
 
-def format_weekly_highlights(resolved, balance):
+def format_weekly_highlights(resolved, balance, lifetime=None):
     """Sunday week-in-review message, or a graceful quiet-week line."""
     now = datetime.utcnow()
     start = now - timedelta(days=7)
     rng = f"{start.strftime('%b')} {start.day} – {now.strftime('%b')} {now.day}"
-    lines = [f"🗓️ <b>WEEK IN REVIEW</b> — <i>{rng}</i>", ""]
+    lines = [f"🗓 <b>THE WEEK</b> — <i>{rng}</i>", ""]
+
+    lt_record, lt_net = lifetime if lifetime else (None, None)
 
     if not resolved:
-        lines.append("🦗 <b>Quiet week</b> — nothing resolved. The grind continues. 🫡")
+        lines.append("🦗 <b>quiet week</b> — nothing settled. the grind continues. 🫡")
         if balance is not None:
-            lines.append(f"🏦 <b>Wallet:</b> ${balance:.2f} free")
+            lines.append(f"🏦 bank <b>${balance:.2f}</b>")
         return "\n".join(lines)
 
     wins = [t for t in resolved if t["resolution_status"] == "won"]
@@ -353,22 +468,26 @@ def format_weekly_highlights(resolved, balance):
     best = _best_win_streak(resolved)
 
     streak_bit = f"  ·  best run: {_streak_emoji(best)} {best} straight" if best >= 2 else ""
-    lines.append(f"🏁 <b>{len(wins)}W–{len(losses)}L</b> on the week{streak_bit}")
-    lines.append(f"{'📈' if net >= 0 else '📉'} <b>Net:</b> ${net:+.2f} <i>(notional)</i>")
+    lines.append(f"{_winbar(len(wins), len(losses))}  <b>{len(wins)}W–{len(losses)}L</b>{streak_bit}")
+    lines.append(f"{'📈' if net >= 0 else '📉'} <b>{_money(net)}</b> on the week")
     lines.append("")
     if wins:
         bw = max(wins, key=lambda t: t.get("pnl") or 0.0)
-        lines.append(f"🏆 <b>Win of the week:</b> {html.escape(str(bw['bet_side']))} — {_mkt(bw)}  <b>${(bw.get('pnl') or 0.0):+.2f}</b>")
+        lines.append(f"🏆 <b>win of the week:</b> {html.escape(str(bw['bet_side']))} @ {_price(bw)*100:.0f}¢ — {_mkt(bw, 40)}  <b>{_money(bw.get('pnl') or 0.0)}</b>")
         w = min(wins, key=_price)
-        lines.append(f"🎲 <b>Wildest call:</b> {html.escape(str(w['bet_side']))} on {_mkt(w)} hit at <b>{_price(w)*100:.0f}¢</b> 🤯")
+        if _price(w) <= 0.45:
+            lines.append(f"🎲 <b>wildest call:</b> {html.escape(str(w['bet_side']))} cashed at <b>{_price(w)*100:.0f}¢</b> 🤯")
     if losses:
         bl = min(losses, key=lambda t: t.get("pnl") or 0.0)
-        lines.append(f"💸 <b>Worst beat:</b> {html.escape(str(bl['bet_side']))} — {_mkt(bl)}  <b>${(bl.get('pnl') or 0.0):+.2f}</b>")
+        lines.append(f"💀 <b>worst beat:</b> {html.escape(str(bl['bet_side']))} @ {_price(bl)*100:.0f}¢ — {_mkt(bl, 40)}  <b>{_money(bl.get('pnl') or 0.0)}</b>")
     lines.append("")
     if balance is not None:
-        lines.append(f"🏦 <b>Wallet:</b> ${balance:.2f} free")
+        lines.append(f"🏦 bank <b>${balance:.2f}</b>")
     lines.append("")
-    lines.append(f"<i>{_weekly_commentary(net, best)}</i>")
+    if lt_net is not None:
+        lines.append(f"<i>{_lifetime_line(lt_net, len(resolved) + int(abs(lt_net)))}</i>")
+    else:
+        lines.append(f"<i>{_weekly_commentary(net, best)}</i>")
     return "\n".join(lines)
 
 
@@ -403,19 +522,19 @@ def _monthly_commentary(net, best_streak, wins, losses):
     return "a grind of a month — still standing. 🫡"
 
 
-def format_monthly_highlights(resolved, balance, prev_net=None):
+def format_monthly_highlights(resolved, balance, prev_net=None, lifetime=None):
     """Last-Sunday-of-month review over the prior 30 days, or a quiet-month line.
     prev_net (net of the 30 days before this window) adds optional MoM framing;
     pass None to omit it (e.g. first run, before two full windows of data)."""
     now = datetime.utcnow()
     start = now - timedelta(days=30)
     rng = f"{start.strftime('%b')} {start.day} – {now.strftime('%b')} {now.day}"
-    lines = [f"📅 <b>MONTH IN REVIEW</b> — <i>{rng}</i>", ""]
+    lines = [f"📅 <b>THE MONTH</b> — <i>{rng}</i>", ""]
 
     if not resolved:
-        lines.append("🦗 <b>Quiet month</b> — nothing resolved. The grind continues. 🫡")
+        lines.append("🦗 <b>quiet month</b> — nothing settled. the grind continues. 🫡")
         if balance is not None:
-            lines.append(f"🏦 <b>Wallet:</b> ${balance:.2f} free")
+            lines.append(f"🏦 bank <b>${balance:.2f}</b>")
         return "\n".join(lines)
 
     wins = [t for t in resolved if t["resolution_status"] == "won"]
@@ -424,27 +543,32 @@ def format_monthly_highlights(resolved, balance, prev_net=None):
     best = _best_win_streak(resolved)
 
     streak_bit = f"  ·  best run: {_streak_emoji(best)} {best} straight" if best >= 2 else ""
-    lines.append(f"🏁 <b>{len(wins)}W–{len(losses)}L</b> on the month{streak_bit}")
-    net_line = f"{'📈' if net >= 0 else '📉'} <b>Net:</b> ${net:+.2f} <i>(notional)</i>"
+    lines.append(f"{_winbar(len(wins), len(losses))}  <b>{len(wins)}W–{len(losses)}L</b> on the month{streak_bit}")
+    net_line = f"{'📈' if net >= 0 else '📉'} <b>{_money(net)}</b> on the month"
     if prev_net is not None:
         delta = net - prev_net
-        net_line += f"  ·  prev 30d ${prev_net:+.2f} ({'▲' if delta >= 0 else '▼'}${abs(delta):.2f})"
+        net_line += f"  ·  prev 30d {_money(prev_net)} ({'▲' if delta >= 0 else '▼'}${abs(delta):.2f})"
     lines.append(net_line)
-    lines.append(f"🗓️ <b>{_active_days(resolved)}</b> active days  ·  {len(resolved)} resolved")
+    lines.append(f"🗓 <b>{_active_days(resolved)}</b> active days  ·  {len(resolved)} resolved")
     lines.append("")
     if wins:
         bw = max(wins, key=lambda t: t.get("pnl") or 0.0)
-        lines.append(f"🏆 <b>Win of the month:</b> {html.escape(str(bw['bet_side']))} — {_mkt(bw)}  <b>${(bw.get('pnl') or 0.0):+.2f}</b>")
+        lines.append(f"🏆 <b>win of the month:</b> {html.escape(str(bw['bet_side']))} @ {_price(bw)*100:.0f}¢ — {_mkt(bw, 40)}  <b>{_money(bw.get('pnl') or 0.0)}</b>")
         w = min(wins, key=_price)
-        lines.append(f"🎲 <b>Wildest call:</b> {html.escape(str(w['bet_side']))} on {_mkt(w)} hit at <b>{_price(w)*100:.0f}¢</b> 🤯")
+        if _price(w) <= 0.45:
+            lines.append(f"🎲 <b>wildest call:</b> {html.escape(str(w['bet_side']))} cashed at <b>{_price(w)*100:.0f}¢</b> 🤯")
     if losses:
         bl = min(losses, key=lambda t: t.get("pnl") or 0.0)
-        lines.append(f"💸 <b>Loss of the month:</b> {html.escape(str(bl['bet_side']))} — {_mkt(bl)}  <b>${(bl.get('pnl') or 0.0):+.2f}</b>")
+        lines.append(f"💀 <b>worst beat:</b> {html.escape(str(bl['bet_side']))} @ {_price(bl)*100:.0f}¢ — {_mkt(bl, 40)}  <b>{_money(bl.get('pnl') or 0.0)}</b>")
     lines.append("")
     if balance is not None:
-        lines.append(f"🏦 <b>Wallet:</b> ${balance:.2f} free")
+        lines.append(f"🏦 bank <b>${balance:.2f}</b>")
     lines.append("")
-    lines.append(f"<i>{_monthly_commentary(net, best, len(wins), len(losses))}</i>")
+    lt_record, lt_net = lifetime if lifetime else (None, None)
+    if lt_net is not None:
+        lines.append(f"<i>{_lifetime_line(lt_net, len(resolved) + int(abs(lt_net)))}</i>")
+    else:
+        lines.append(f"<i>{_monthly_commentary(net, best, len(wins), len(losses))}</i>")
     return "\n".join(lines)
 
 
@@ -470,11 +594,24 @@ async def results_recap_loop(dry_run: bool = False) -> None:
                 resolved, open_count, streak = _fetch_recap_data(RECAP_WINDOW_HOURS)
                 milestone = _compute_milestone(db, since_ts)
                 balance = await _free_balance(client)
+                lifetime = _lifetime_stats()
 
-                posts = []
-                daily = format_results_recap(resolved, open_count, streak, balance, milestone)
+                posts = []  # (kind, text, photo_bytes_or_None)
+                daily = format_results_recap(resolved, open_count, streak, balance, milestone,
+                                             lifetime=lifetime)
                 if daily:
-                    posts.append(("daily", daily))
+                    nowp = datetime.utcnow()
+                    wins_n = sum(1 for t in resolved if t["resolution_status"] == "won")
+                    losses_n = sum(1 for t in resolved if t["resolution_status"] == "lost")
+                    net = sum((t.get("pnl") or 0.0) for t in resolved)
+                    card = render_recap_card(
+                        title="the daily",
+                        date_str=f"{nowp.strftime('%A, %b')} {nowp.day}",
+                        wins=wins_n, losses=losses_n, net=net,
+                        curve=_fetch_curve(30),
+                        lifetime_net=lifetime[1], balance=balance,
+                    )
+                    posts.append(("daily", daily, card))
                 nowd = datetime.utcnow()
                 if nowd.weekday() == 6:  # Sunday
                     # Last Sunday of the month ⇔ the next Sunday falls in a different
@@ -488,18 +625,35 @@ async def results_recap_loop(dry_run: bool = False) -> None:
                         last30 = [t for t in all60 if (t.get("resolved_at") or 0) >= cut]
                         prev30 = [t for t in all60 if (t.get("resolved_at") or 0) < cut]
                         prev_net = sum((t.get("pnl") or 0.0) for t in prev30) if prev30 else None
-                        posts.append(("monthly", format_monthly_highlights(last30, balance, prev_net)))
+                        posts.append(("monthly",
+                                      format_monthly_highlights(last30, balance, prev_net,
+                                                                lifetime=lifetime), None))
                     else:
                         weekly_resolved, _, _ = _fetch_recap_data(24 * 7)
-                        posts.append(("weekly", format_weekly_highlights(weekly_resolved, balance)))
+                        posts.append(("weekly",
+                                      format_weekly_highlights(weekly_resolved, balance,
+                                                               lifetime=lifetime), None))
 
                 if not posts:
                     log.info("[Recap] Nothing to recap — skipping")
-                for kind, text in posts:
+                for kind, text, photo in posts:
                     if dry_run:
-                        log.info("[Recap] DRY RUN (%s):\n%s", kind, text)
+                        log.info("[Recap] DRY RUN (%s, card=%s):\n%s",
+                                 kind, "yes" if photo else "no", text)
+                        continue
+                    sent_card = False
+                    # Caption hard cap is 1024 — if the text is longer, the card would
+                    # truncate it, so prefer the full text message instead.
+                    if photo and len(text) <= 1024:
+                        sent_card = await sender.send_photo(photo, client, caption=text)
+                    sent_text = False
+                    if not sent_card:
+                        sent_text = await sender.send_message(text, client)
+                    if sent_card or sent_text:
+                        log.info("[Recap] Posted %s recap (%s)", kind,
+                                 "card" if sent_card else "text")
                     else:
-                        await sender.send_message(text, client)
-                        log.info("[Recap] Posted %s recap", kind)
+                        log.error("[Recap] FAILED to post %s recap (photo and text "
+                                  "sends both failed)", kind)
             except Exception as exc:
                 log.exception("[Recap] Failed to build/post recap: %s", exc)

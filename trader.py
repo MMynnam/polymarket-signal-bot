@@ -19,6 +19,7 @@ Resolution cycle (every 10 minutes inside the main loop):
 """
 
 import asyncio
+import html
 import json
 import logging
 import time
@@ -712,9 +713,9 @@ async def _notify_trade(
         text = (
             "💰💰💰 <b>LIVE TRADE</b> 💰💰💰\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📋 <b>Market:</b> {market_q[:120]}\n"
+            f"📋 <b>Market:</b> {html.escape(str(market_q)[:120])}\n"
             f"{link_line}"
-            f"🎯 <b>Position:</b> <b>{bet_side}</b> @ {fill_price:.3f}\n"
+            f"🎯 <b>Position:</b> <b>{html.escape(str(bet_side))}</b> @ {fill_price:.3f}\n"
             f"💵 <b>Size:</b> ${size:.2f} USDC\n"
             f"📊 <b>Signal score:</b> {score}\n"
             f"📉 <b>Slippage:</b> {slippage_str}\n\n"
@@ -725,15 +726,21 @@ async def _notify_trade(
             "⚠️ <i>Automated trade. Not financial advice.</i>"
         )
     else:
-        err_line = f"\n❗ <code>{error_msg}</code>" if error_msg else ""
+        err_line = f"\n❗ <code>{html.escape(str(error_msg))}</code>" if error_msg else ""
         text = (
             f"❌ <b>TRADE {status.upper()}</b>\n"
-            f"📋 {market_q[:100]}\n"
-            f"🎯 {bet_side} @ {fill_price:.3f} | Score: {score}{err_line}"
+            f"📋 {html.escape(str(market_q)[:100])}\n"
+            f"🎯 {html.escape(str(bet_side))} @ {fill_price:.3f} | Score: {score}{err_line}"
         )
 
     try:
-        sender = TelegramSender(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
+        # Feed v2: this terminal-style card is research/ops output (the fly trader posts
+        # the audience-facing message). Ops channel or nothing — never the friends' feed.
+        from alerter import make_research_sender
+        sender = make_research_sender()
+        if sender is None:
+            log.info("[Trader] Trade notification suppressed (no research channel)")
+            return
         async with httpx.AsyncClient() as client:
             await sender.send_message(text, client)
     except Exception as exc:
@@ -759,7 +766,7 @@ async def _notify_trade_resolution(te: dict, resolution_status: str, pnl: float,
         else:
             result_emoji = "↩️"
 
-        outcome_line = f"🏆 <b>Outcome:</b> {winning_outcome}\n" if winning_outcome else ""
+        outcome_line = f"🏆 <b>Outcome:</b> {html.escape(str(winning_outcome))}\n" if winning_outcome else ""
 
         stats = database.get_trade_stats()
         if stats.get("total", 0) > 0 and stats.get("total_pnl") is not None:
@@ -777,15 +784,22 @@ async def _notify_trade_resolution(te: dict, resolution_status: str, pnl: float,
 
         text = (
             "🏁 <b>TRADE RESOLVED</b>\n\n"
-            f"📋 <b>Market:</b> {market_q[:120]}\n"
-            f"🎯 <b>Position:</b> {bet_side} @ {fill_price:.3f}\n"
+            f"📋 <b>Market:</b> {html.escape(str(market_q)[:120])}\n"
+            f"🎯 <b>Position:</b> {html.escape(str(bet_side))} @ {fill_price:.3f}\n"
             f"{outcome_line}"
             f"{result_emoji} <b>Result:</b> {resolution_status.upper()}\n"
             f"💰 <b>P&amp;L:</b> ${pnl:+.2f} USDC"
             f"{stats_line}"
         )
 
-        sender = TelegramSender(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
+        # Feed v2: this 🏁 TRADE RESOLVED card DUPLICATED the fly trader's audience
+        # settle for every resolution, in trading-terminal voice. It is research/ops
+        # output now — ops channel or nothing, never the friends' feed.
+        from alerter import make_research_sender
+        sender = make_research_sender()
+        if sender is None:
+            log.info("[Trader] Resolution notification suppressed (no research channel)")
+            return
         async with httpx.AsyncClient() as client:
             await sender.send_message(text, client)
     except Exception as exc:
