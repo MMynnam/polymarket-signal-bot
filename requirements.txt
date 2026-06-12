@@ -22,6 +22,9 @@ web3>=6.0.0,<8.0.0
 # --- Environment variable loading ---
 python-dotenv>=1.0.0,<2.0.0
 
+# --- Recap card rendering (feed_card.py; feed falls back to text if missing) ---
+pillow>=10.0.0,<13.0.0
+
 # --- Data validation (defensive schema checks on API responses) ---
 # pydantic is not required by the current architecture but is listed
 # as a lightweight option if schema validation is added later.
