@@ -427,10 +427,16 @@ async def digest_loop(buffer: DigestBuffer, dry_run: bool = False) -> None:
         config.DIGEST_SEND_HOUR_UTC, dry_run,
     )
 
-    sender = TelegramSender(
-        token=config.TELEGRAM_BOT_TOKEN,
-        chat_id=config.TELEGRAM_CHAT_ID,
-    )
+    # Feed v2: the intelligence brief is research output → ops channel, or dropped
+    # from Telegram when none is configured (buffering/CSV generation still run so
+    # the data exists; only the Telegram delivery is gated).
+    from alerter import make_research_sender
+    sender = make_research_sender()
+    if sender is None:
+        log.info(
+            "[Digest] No research channel (TELEGRAM_OPS_CHAT_ID unset, "
+            "FEED_RESEARCH_TO_MAIN=false) — daily briefs will not be telegrammed"
+        )
 
     async with httpx.AsyncClient() as client:
         while True:
@@ -504,6 +510,11 @@ async def digest_loop(buffer: DigestBuffer, dry_run: bool = False) -> None:
                         .replace("<i>", "").replace("</i>", "")
                         .replace("<code>", "").replace("</code>", ""),
                 )
+            elif sender is None:
+                log.info(
+                    "[Digest] Brief #%s built (%d signals) — no research channel, not sent",
+                    digest_id, len(entries),
+                )
             else:
                 ok = await sender.send_message(text, client)
                 if ok:
@@ -525,6 +536,8 @@ async def digest_loop(buffer: DigestBuffer, dry_run: bool = False) -> None:
                         "[DRY-RUN] Would send CSV %s (%d rows, path=%s)",
                         csv_filename, len(entries), csv_path,
                     )
+                elif sender is None:
+                    log.info("[Digest] CSV %s written — no research channel, not sent", csv_filename)
                 else:
                     ok_csv = await sender.send_document(
                         file_path=csv_path,

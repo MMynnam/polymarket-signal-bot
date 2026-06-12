@@ -29,6 +29,16 @@ logging.basicConfig(
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Feed v2 (2026-06-12): TELEGRAM_CHAT_ID is the AUDIENCE feed — the friends' channel.
+# Research/ops output (the per-signal INSIDER SIGNAL walls, the Daily Intelligence
+# Brief + CSV, and the terminal-style TRADE RESOLVED duplicates) routes to
+# TELEGRAM_OPS_CHAT_ID when set. When unset, that output is DROPPED from Telegram
+# (it remains in logs + DB + the API) so the audience channel stays clean — set
+# FEED_RESEARCH_TO_MAIN=true to restore the old everything-in-one-channel behavior.
+# Mirrors the fly trader's TELEGRAM_OPS_CHAT_ID / FEED_OPS_TO_MAIN contract.
+TELEGRAM_OPS_CHAT_ID: str = os.getenv("TELEGRAM_OPS_CHAT_ID", "")
+FEED_RESEARCH_TO_MAIN: bool = os.getenv("FEED_RESEARCH_TO_MAIN", "false").strip().lower() in ("true", "1", "yes")
+
 # Polymarket enforces no more than 1 message per 1.5 seconds per chat to
 # avoid Telegram rate-limit (429) errors.
 TELEGRAM_RATE_LIMIT_SECONDS: float = float(os.getenv("TELEGRAM_RATE_LIMIT_SECONDS", "1.5"))
