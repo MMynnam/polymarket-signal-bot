@@ -44,6 +44,7 @@ import alerter as alerter_module
 from alerter import AlertPayload, AlertQueue
 from digest import DigestBuffer, digest_loop
 from results_recap import results_recap_loop
+from self_assessment import self_assessment_loop
 from market_discovery import get_market_end_date, get_market_title, get_market_slug, get_market_liquidity
 from trade_monitor import Trade, WebSocketManager, RestTradePoller
 from wallet_profiler import get_wallet_profile
@@ -578,6 +579,13 @@ async def amain(dry_run: bool) -> None:
                 name="results-recap",
             ),
             name="results-recap",
+        ),
+        asyncio.create_task(
+            supervised_task(
+                lambda: self_assessment_loop(dry_run=dry_run),
+                name="self-assessment",
+            ),
+            name="self-assessment",
         ),
         asyncio.create_task(
             heartbeat_loop(interval_seconds=300),
