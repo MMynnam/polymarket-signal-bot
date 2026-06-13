@@ -123,6 +123,23 @@ VAULT_SWEEP_HOUR_UTC: int = int(os.getenv("VAULT_SWEEP_HOUR_UTC", "4"))
 # Bypasses the time-of-day check — fires on the next poll cycle. Set to 0 for normal operation.
 VAULT_SWEEP_TEST_AMOUNT_USDC: float = float(os.getenv("VAULT_SWEEP_TEST_AMOUNT_USDC", "0"))
 
+# ---------------------------------------------------------------------------
+# Continuous win-ratchet (2026-06-13). The bot has no proven edge (see EDGE_AUDIT),
+# so the only honest way to END UP with money on a high-variance book is to take
+# winnings OFF THE TABLE during lucky runs instead of round-tripping them. Each win
+# banks SWEEP_WIN_PCT of its PROFIT into a "vault tab"; losses stay in the float. When
+# the tab clears VAULT_RATCHET_MIN_SETTLE_USDC and there's free cash above the operating
+# floor, the existing (proven) sweep state machine moves it on-chain to the vault, where
+# it can never be re-risked. This relocates money — it does NOT create edge — but it
+# preserves variance-driven upswings and gives the audience a live "lifeline" to watch.
+VAULT_RATCHET_ENABLED: bool = os.getenv("VAULT_RATCHET_ENABLED", "true").lower() == "true"
+SWEEP_WIN_PCT: float = float(os.getenv("SWEEP_WIN_PCT", "0.33"))  # share of each win's PROFIT banked
+VAULT_RATCHET_MIN_SETTLE_USDC: float = float(os.getenv("VAULT_RATCHET_MIN_SETTLE_USDC", "8.0"))
+# Operating floor the ratchet won't sweep below (keeps enough free USDC to keep trading).
+# Lower than the legacy $110 working-capital floor ON PURPOSE: the ratchet is meant to bank
+# winnings continuously even while the float erodes (the accepted 33% wind-down tradeoff).
+VAULT_RATCHET_FLOOR_USDC: float = float(os.getenv("VAULT_RATCHET_FLOOR_USDC", "40.0"))
+
 REDEMPTION_CHECK_INTERVAL: int = int(os.getenv("REDEMPTION_CHECK_INTERVAL", "600"))
 LOW_BALANCE_WARN_USD: float = float(os.getenv("LOW_BALANCE_WARN_USD", "10.0"))
 POSITIONS_SUMMARY_INTERVAL_SECONDS: int = int(os.getenv("POSITIONS_SUMMARY_INTERVAL_SECONDS", "21600"))
@@ -235,6 +252,10 @@ _sweep_state: str = "idle"      # idle | pause_pending | pause_ready
 _sweep_paused_at: float = 0.0
 _sweep_intended_amount: float = 0.0  # calculated at pause time; rechecked at withdraw time
 _sweep_last_date: str = ""          # "YYYY-MM-DD" UTC; prevents double-firing on restart
+_vault_tab: float = 0.0             # win-ratchet: profit accrued but not yet swept on-chain
+                                    # (in-process; the TRUE banked total is the vault's
+                                    # on-chain balance — this is just the pending buffer)
+_ratchet_last_log: float = 0.0      # throttle for the dry-run "would secure" log
 _current_max_positions: int = TRADING_MAX_CONCURRENT_POSITIONS  # updated each cycle by _compute_max_positions
 _legacy_max_positions_ceiling: Optional[int] = None  # set at startup if old env var is detected
 _current_tier: str = "normal"  # "normal" | "premium" | "hardcap"; drives transition notifications
@@ -890,7 +911,9 @@ async def _send_positions_summary(http_client: httpx.AsyncClient) -> None:
         f"{vault_footer}\n\n"
         f"🎯 <b>System config:</b>\n"
         f"   Working capital: ${TRADING_WORKING_CAPITAL_USDC:.2f}\n"
-        f"   Sweep at: ${VAULT_SWEEP_THRESHOLD_USDC:.2f} → floor ${VAULT_SWEEP_FLOOR_USDC:.2f}\n"
+        f"   Ratchet: bank {SWEEP_WIN_PCT*100:.0f}% of wins → vault (tab ${_vault_tab:.2f}, "
+        f"settle ≥${VAULT_RATCHET_MIN_SETTLE_USDC:.0f}, floor ${VAULT_RATCHET_FLOOR_USDC:.0f}, "
+        f"{'ARMED' if VAULT_SWEEP_ENABLED else 'dry-run'})\n"
         f"   Target exposure: {TRADING_TARGET_EXPOSURE_PCT * 100:.0f}%  •  Current cap: {_current_max_positions}"
     )
     await _send_telegram(http_client, text, ops=True)
@@ -1309,11 +1332,52 @@ def _get_eoa_pusd_balance_sync() -> float:
     return raw / (10 ** _USDC_DECIMALS)
 
 
+# ---------------------------------------------------------------------------
+# Win-ratchet helpers — pure decisions (tested) + the tab mutators.
+# ---------------------------------------------------------------------------
+
+def _ratchet_slice(profit: float, pct: float = SWEEP_WIN_PCT) -> float:
+    """The slice of a single win's PROFIT to bank. 0 for losses / non-positive profit."""
+    if not profit or profit <= 0:
+        return 0.0
+    return round(profit * pct, 4)
+
+
+def _ratchet_settle_amount(tab: float, free_balance, floor: float = VAULT_RATCHET_FLOOR_USDC,
+                           min_settle: float = VAULT_RATCHET_MIN_SETTLE_USDC) -> float:
+    """How much to move on-chain this cycle: min(tab, free above floor), but only once the
+    tab clears min_settle AND that much cash is actually free above the operating floor.
+    Returns 0.0 when no settle should fire (dust, no headroom, or below the min batch)."""
+    if tab < min_settle or free_balance is None:
+        return 0.0
+    headroom = free_balance - floor
+    if headroom < min_settle:
+        return 0.0
+    return round(min(tab, headroom), 4)
+
+
+def _accrue_vault_tab(profit: float) -> float:
+    """Bank a win's slice into the tab. Returns the slice (for the feed). No-op on losses."""
+    global _vault_tab
+    slice_ = _ratchet_slice(profit)
+    if slice_ > 0:
+        _vault_tab = round(_vault_tab + slice_, 4)
+    return slice_
+
+
+def _debit_vault_tab(amount: float) -> None:
+    """Reduce the tab after a successful on-chain settle (clamped at 0)."""
+    global _vault_tab
+    _vault_tab = round(max(0.0, _vault_tab - amount), 4)
+
+
 async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
     """
-    Daily vault sweep: pause() → 1h timelock → withdrawERC20() → unpause().
+    Vault sweep state machine: pause() → 1h timelock → withdrawERC20() → unpause().
 
-    Phase 1 (idle):  Daily trigger at VAULT_SWEEP_HOUR_UTC (or immediately in test mode).
+    Phase 1 (idle):  Win-ratchet trigger — sweep when the accrued tab clears the min batch
+                     and there's free cash above the operating floor (legacy daily/threshold
+                     trigger retired in favor of the continuous ratchet, 2026-06-13).
                      Records intended_amount at pause time for later recalculation.
     Phase 2 (pause_pending): Polls each cycle; advances once timelock elapses.
     Phase 3 (pause_ready):  Re-reads balance, recalculates amount (min of intended vs
@@ -1370,7 +1434,9 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
                 actual_amount   = VAULT_SWEEP_TEST_AMOUNT_USDC
                 intended_amount = VAULT_SWEEP_TEST_AMOUNT_USDC
             else:
-                _p3_floor = max(VAULT_SWEEP_FLOOR_USDC, VAULT_BANKROLL_FLOOR_USDC)
+                # Same operating floor Phase 1 used to size the ratchet sweep — otherwise
+                # the withdraw would self-cancel against the legacy (higher) floor.
+                _p3_floor = VAULT_RATCHET_FLOOR_USDC
                 available = balance - _p3_floor
                 if available <= 0:
                     log.warning(
@@ -1463,6 +1529,9 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
                 await _notify_sweep_stuck(http_client)
 
             _sweep_state = "idle"
+            # Ratchet: the banked slice is now locked on-chain — clear it from the tab.
+            if VAULT_SWEEP_TEST_AMOUNT_USDC <= 0:
+                _debit_vault_tab(actual_amount)
             await _notify_sweep_completed(
                 http_client, actual_amount, intended_amount, usdce_received,
                 remaining_balance, vault_total, unwrap_tx,
@@ -1482,67 +1551,65 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
         return
 
     # ------------------------------------------------------------------
-    # Phase 1 (idle) — daily time-of-day trigger
+    # Phase 1 (idle) — win-ratchet trigger (continuous), or fixed test amount
     # ------------------------------------------------------------------
+    global _ratchet_last_log
     from datetime import datetime, timezone
-    now_utc  = datetime.now(timezone.utc)
-    today    = now_utc.strftime("%Y-%m-%d")
-    is_test  = VAULT_SWEEP_TEST_AMOUNT_USDC > 0
+    is_test = VAULT_SWEEP_TEST_AMOUNT_USDC > 0
 
-    # Per-day guard prevents double-firing on restart
-    if _sweep_last_date == today:
-        return
-
-    # Production: fire only at the configured hour. Test mode: fire immediately.
-    if not is_test and now_utc.hour != VAULT_SWEEP_HOUR_UTC:
-        return
-
-    try:
-        balance = await _get_usdc_balance()
-    except Exception as exc:
-        log.warning("[Vault] Balance fetch failed: %s — skipping sweep check", exc)
-        return
-
-    threshold = VAULT_SWEEP_TEST_AMOUNT_USDC if is_test else VAULT_SWEEP_THRESHOLD_USDC
-    if balance < threshold:
-        # Mark as checked so we don't log on every poll during the sweep hour
-        _sweep_last_date = today
-        log.info("[Vault] Daily check: balance $%.2f < threshold $%.2f — skip", balance, threshold)
-        return
+    if is_test:
+        # Operator one-shot: sweep a fixed amount once per day to exercise the on-chain path.
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if _sweep_last_date == today:
+            return
+        intended_amount = VAULT_SWEEP_TEST_AMOUNT_USDC
+        balance = None
+    else:
+        if not VAULT_RATCHET_ENABLED:
+            return
+        if _vault_tab < VAULT_RATCHET_MIN_SETTLE_USDC:
+            return  # tab too small to bother with an on-chain batch
+        try:
+            balance = await _get_usdc_balance()
+        except Exception as exc:
+            log.warning("[Vault] Balance fetch failed: %s — skipping ratchet check", exc)
+            return
+        intended_amount = _ratchet_settle_amount(_vault_tab, balance)
+        if intended_amount <= 0:
+            return  # tab is ready but no free cash above the operating floor yet
 
     try:
         matic = await asyncio.to_thread(_get_matic_balance_sync)
         if matic < _SWEEP_MIN_MATIC:
             log.warning("[Vault] Insufficient MATIC (%.4f) — skipping sweep", matic)
-            return  # don't mark today — retry next poll in case MATIC recovers
+            return  # don't consume the trigger — retry next poll if MATIC recovers
     except Exception as exc:
         log.warning("[Vault] MATIC check failed: %s — skipping sweep", exc)
         return
 
-    _effective_floor = max(VAULT_SWEEP_FLOOR_USDC, VAULT_BANKROLL_FLOOR_USDC)
-    intended_amount = VAULT_SWEEP_TEST_AMOUNT_USDC if is_test else (balance - _effective_floor)
-    if intended_amount <= 0:
-        _sweep_last_date = today
-        log.info("[Vault] Intended sweep amount $%.2f <= 0 — skip", intended_amount)
-        return
-
     if not VAULT_SWEEP_ENABLED:
-        _sweep_last_date = today
-        log.info(
-            "[Vault] DRY RUN (VAULT_SWEEP_ENABLED=false): "
-            "balance $%.2f | would move $%.2f | would retain $%.2f | threshold $%.2f | floor $%.2f",
-            balance, intended_amount, balance - intended_amount,
-            VAULT_SWEEP_THRESHOLD_USDC, max(VAULT_SWEEP_FLOOR_USDC, VAULT_BANKROLL_FLOOR_USDC),
-        )
+        # Dry-run: the ratchet still accrues and the feed shows the lifeline growing, but no
+        # money moves until the operator arms it. Throttle the log (sweep runs every cycle).
+        now = time.time()
+        if now - _ratchet_last_log > 600:
+            _ratchet_last_log = now
+            log.info("[Vault] DRY RUN (VAULT_SWEEP_ENABLED=false): tab $%.2f | would secure "
+                     "$%.2f to the vault (free $%s, floor $%.2f)",
+                     _vault_tab, intended_amount,
+                     f"{balance:.2f}" if balance is not None else "?", VAULT_RATCHET_FLOOR_USDC)
+        if is_test:
+            _sweep_last_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         return
 
-    log.info("[Vault] Initiating daily sweep (balance $%.2f, intended $%.2f)...", balance, intended_amount)
+    log.info("[Vault] Initiating ratchet sweep (tab $%.2f, securing $%.2f)...",
+             _vault_tab, intended_amount)
     try:
         await asyncio.to_thread(_initiate_sweep_pause_sync)
         _sweep_paused_at       = time.time()
         _sweep_intended_amount = intended_amount
         _sweep_state           = "pause_pending"
-        _sweep_last_date       = today
+        if is_test:
+            _sweep_last_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         log.info("[Vault] pause() submitted. Withdraw unlocks in %ds.", _DEPOSIT_WALLET_TIMELOCK_SECONDS)
 
         from datetime import timedelta
@@ -1743,6 +1810,24 @@ _TIMEOUT_LINES = [
     "trading halted by management. management is the bot. it knows.",
     "benched. even the bot knows when to stop, and it's a bot.",
 ]
+# Win-ratchet: copy for a slice of a win being banked to the vault — the bot taking money
+# off the table to literally extend its own life (no profit → project winds down).
+_RATCHET_LINES = [
+    "another day bought.",
+    "locked away where it can't lose it back.",
+    "survival fund, +1.",
+    "the lifeline grows. the bot lives.",
+    "off the table, into the vault, can't be re-risked.",
+    "buying its own existence one slice at a time.",
+    "banked. the bot exhales.",
+]
+# Win-ratchet: copy for the actual on-chain SECURED moment (the batch settle lands).
+_SWEEP_SECURED_LINES = [
+    "that's real, on-chain, and ours forever.",
+    "moved to safety. the market can't claw it back now.",
+    "the vault just got heavier. the bot earned a day.",
+    "secured. whatever happens next, we keep this.",
+]
 
 
 def _odds_key(price) -> tuple[str, str]:
@@ -1904,11 +1989,23 @@ async def _notify_sweep_completed(
     unwrap_tx: str,
 ) -> None:
     adjusted = actual_amount < intended_amount - 0.01
+
+    # AUDIENCE: the payoff moment — winnings just got locked on-chain where they can't be
+    # lost back. Loud (this is the whole point of the ratchet), survival-themed.
+    seed = int((vault_total + actual_amount) * 100)
+    audience = (
+        f"🏛️ <b>SECURED — ${usdce_received:.2f} BANKED TO THE VAULT</b>\n"
+        f"vault now holds <b>${vault_total:.2f}</b>  ·  this can never be re-risked\n"
+        f"<i>{_pick_line(_SWEEP_SECURED_LINES, seed)}</i>"
+    )
+    await _send_telegram(http_client, audience, silent=False)
+
+    # OPS: the full forensic record.
     adjusted_line = (
         f"\n⚠️ <i>Adjusted down from ${intended_amount:.2f} (balance dropped during timelock)</i>"
         if adjusted else ""
     )
-    text = (
+    ops_text = (
         "🏦 <b>VAULT SWEEP COMPLETED</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"💸 <b>Swept:</b> ${actual_amount:.2f} pUSD → ${usdce_received:.2f} USDC.e{adjusted_line}\n"
@@ -1918,7 +2015,7 @@ async def _notify_sweep_completed(
         f'🔍 <a href="https://polygonscan.com/address/{VAULT_WALLET_ADDRESS}">View vault</a>\n\n'
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
-    await _send_telegram(http_client, text, ops=True)
+    await _send_telegram(http_client, ops_text, ops=True)
 
 
 async def _notify_sweep_cancelled(
@@ -2241,6 +2338,8 @@ def _build_settle_text(
     *,
     threaded: bool = False,
     balance: Optional[float] = None,
+    vault_slice: float = 0.0,
+    vault_total: float = 0.0,
 ) -> tuple[str, bool]:
     """Pure settle card (feed v2). Returns (html_text, loud).
 
@@ -2301,7 +2400,13 @@ def _build_settle_text(
     # On a loss, name the side that actually won (only when it adds information).
     if resolution_status == "lost" and winning_outcome:
         lines.append(f"🏆 {_html.escape(str(winning_outcome))} took it")
-    if balance is not None and balance >= 0:
+    # Win-ratchet: show the slice banked toward the vault lifeline — the bot taking
+    # winnings off the table to survive another day.
+    if vault_slice and vault_slice > 0:
+        seed = int((vault_total + vault_slice) * 100)
+        lines.append(f"🏦 <b>+${vault_slice:.2f}</b> to the vault  ·  lifeline ${vault_total:.2f}  "
+                     f"<i>{_pick_line(_RATCHET_LINES, seed)}</i>")
+    elif balance is not None and balance >= 0:
         lines.append(f"🏦 bank ${balance:.2f}")
     lines.append(f"<i>{banter}</i>")
     return "\n".join(lines), loud
@@ -2315,15 +2420,19 @@ async def _notify_trade_resolution(
     streak: int = 0,
     snap: str = "",
     balance: Optional[float] = None,
+    vault_slice: float = 0.0,
+    vault_total: float = 0.0,
 ) -> None:
     # AUDIENCE settle — feed v2: threads as a reply under its betslip (one bet = one
     # story), buzzes only when notable, shows the bank where the money changed.
     # balance is fetched ONCE per grading batch by the caller (one RPC, not one per
-    # settle inside the trading loop); None just omits the bank line.
+    # settle inside the trading loop); None just omits the bank line. vault_slice>0 shows
+    # the win-ratchet banking a slice toward the lifeline.
     slip_id = _slip_msgs.get(str(trade.get("alert_id") or ""))
     text, loud = _build_settle_text(
         trade, resolution_status, pnl, streak, snap,
         threaded=bool(slip_id), balance=balance,
+        vault_slice=vault_slice, vault_total=vault_total,
     )
     await _send_telegram(http_client, text, silent=not loud, reply_to=slip_id)
 
@@ -2787,6 +2896,9 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
             resolution_status = "invalid"
             pnl = 0.0
 
+        # Win-ratchet: bank a slice of this win's profit toward the vault lifeline.
+        vault_slice = _accrue_vault_tab(pnl) if VAULT_RATCHET_ENABLED else 0.0
+
         # Write resolution back to Railway so stats stay accurate.
         # Mark as 'prospective' so the CB backfill and sizing graduation
         # can distinguish these from historical backfill artifacts.
@@ -2821,7 +2933,8 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
         # Streak is the cycle's round value; the snap banner rides only the first post.
         await _notify_trade_resolution(http_client, trade, resolution_status, pnl,
                                        streak=_result_streak, snap=snap if first else "",
-                                       balance=batch_balance)
+                                       balance=batch_balance,
+                                       vault_slice=vault_slice, vault_total=_vault_tab)
         first = False
 
         log.info(
@@ -2954,10 +3067,11 @@ async def main() -> None:
     log.info("Funder (USDC balance):   %s",
              TRADING_FUNDER_ADDRESS if TRADING_FUNDER_ADDRESS else f"{_wallet_address} (EOA)")
     log.info("Poll:        every %ds | Min score: %d", POLL_INTERVAL, TRADING_MIN_SCORE)
-    log.info("Vault:       %s  sweep=%s  threshold=$%.0f  floor=$%.0f",
+    log.info("Vault:       %s  sweep=%s  ratchet=%s (%.0f%% of wins, settle>=$%.0f, floor=$%.0f)",
              VAULT_WALLET_ADDRESS or "disabled",
              "ARMED" if VAULT_SWEEP_ENABLED else "dry-run",
-             VAULT_SWEEP_THRESHOLD_USDC, VAULT_SWEEP_FLOOR_USDC)
+             "on" if VAULT_RATCHET_ENABLED else "off",
+             SWEEP_WIN_PCT * 100, VAULT_RATCHET_MIN_SETTLE_USDC, VAULT_RATCHET_FLOOR_USDC)
     log.info("Scaling:     capital=$%.0f  headroom=$%.0f  exposure=%.0f%%  floor=%d  normal=%d  premium=%d  score_floor=%d",
              TRADING_WORKING_CAPITAL_USDC, TRADING_SWEEP_HEADROOM_USDC,
              TRADING_TARGET_EXPOSURE_PCT * 100,
