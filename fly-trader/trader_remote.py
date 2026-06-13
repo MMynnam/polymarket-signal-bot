@@ -149,6 +149,16 @@ TRADING_DYNAMIC_SLIPPAGE_ENABLED: bool = os.getenv("TRADING_DYNAMIC_SLIPPAGE_ENA
 TRADING_SLIPPAGE_MAX_EXPANSION: float = float(os.getenv("TRADING_SLIPPAGE_MAX_EXPANSION", "0.03"))
 TRADING_MAX_ENTRY_PRICE: float = float(os.getenv("TRADING_MAX_ENTRY_PRICE", "0.85"))
 
+# Opposite-side vig gate (2026-06-13 edge audit). 33% of alerted markets get alerts on
+# BOTH sides; copying both locks in the insiders' combined overround. For a binary,
+# holding side A at price pa and then buying side B at pb with pa+pb>1 spends >$1 to
+# guarantee a $1 return (exactly one side wins) = a mechanical locked loss of (pa+pb-1)
+# per share — verified WR=50% by identity, ~45-54% of the tradeable stream, -3.5..-4.9pp
+# drag. So: once we hold one side of a market, only take a DIFFERENT side if the two
+# entry prices sum to <= this cap (i.e. the pair locks in >= a small profit / is a real
+# cheap hedge). Set to >=1.0 to restore the old behavior (always take the second side).
+TRADING_OPPOSITE_SIDE_MAX_SUM: float = float(os.getenv("TRADING_OPPOSITE_SIDE_MAX_SUM", "0.98"))
+
 # Soccer-favorites filter: skip sports-category alerts where price > this threshold.
 # Entertainment-mode (2026-05-31): DISABLED (default OFF). The -39.9% evidence was
 # inversion-era; clean data shows sports favorites only ~-3.5%, and sports are the
@@ -229,6 +239,10 @@ _current_max_positions: int = TRADING_MAX_CONCURRENT_POSITIONS  # updated each c
 _legacy_max_positions_ceiling: Optional[int] = None  # set at startup if old env var is detected
 _current_tier: str = "normal"  # "normal" | "premium" | "hardcap"; drives transition notifications
 _held_positions: set[tuple[str, str]] = set()  # (market_id, bet_side); per-market dedup
+# market_id -> {bet_side: entry_price}; powers the opposite-side vig gate (don't take a
+# second side of a market unless the two legs lock in a profit). Kept in lockstep with
+# _held_positions at every seed/add/discard site.
+_held_side_px: dict[str, dict[str, float]] = {}
 _held_positions_seeded: bool = False  # False until startup seed succeeds
 
 # ---------------------------------------------------------------------------
@@ -2401,6 +2415,19 @@ async def _execute_trade(
 
     slippage = abs(current_price - price_alert) if current_price is not None else None
 
+    # Gate-orientation regression guard (2026-06-13). The pre-fix token[0] bug fed the
+    # OPPOSITE token's price into the slippage gate, so price_current ≈ 1 - price_alert and
+    # the gate spuriously rejected the best flow while everything looked healthy. The fix
+    # (correct clob_token_id) cured it, but a regression would be silent — so warn loudly
+    # if the inversion signature reappears: current ≈ 1-alert AND current is far from alert.
+    if (current_price is not None and slippage is not None and slippage > 0.10
+            and abs(current_price - (1.0 - price_alert)) < 0.03):
+        log.warning(
+            "[GateGuard] PRICE-INVERSION SIGNATURE for alert %s: current=%.3f ≈ 1-alert=%.3f "
+            "(alert=%.3f). Possible token-side regression — gate price feed may be inverted.",
+            alert_id[:12], current_price, 1.0 - price_alert, price_alert,
+        )
+
     if slippage is not None and slippage > TRADING_SLIPPAGE_THRESHOLD:
         log.warning(
             "[Trade] High slippage for alert %s: intended=%.3f current=%.3f delta=%.3f",
@@ -2603,9 +2630,12 @@ async def _execute_trade(
         if filled_size > 0:
             global _session_avg_bet
             _session_avg_bet = 0.9 * _session_avg_bet + 0.1 * filled_size
-        # Track held position for per-market/side dedup.
+        # Track held position for per-market/side dedup + opposite-side vig gate.
         if market_id and bet_side:
             _held_positions.add((market_id, bet_side))
+            _entry_px = fill_price or current_price or price_alert
+            if _entry_px:
+                _held_side_px.setdefault(market_id, {})[bet_side] = float(_entry_px)
             log.debug("[Dedup] Added (%s, %s) to _held_positions", market_id[:16], bet_side)
         # Running slip number for the feed: lifetime filled bets (settled + open) + this
         # one. Presentation-only; omitted gracefully if the stats payload lacks the keys.
@@ -2646,6 +2676,22 @@ async def _execute_trade(
 # Per-market/side dedup — startup seed
 # ---------------------------------------------------------------------------
 
+def _opposite_side_vig(new_px, held_sides: dict, new_side: str,
+                       cap: float = TRADING_OPPOSITE_SIDE_MAX_SUM):
+    """Pure decision for the opposite-side vig gate. Given the price we'd pay for new_side
+    and {side: entry_px} we already hold in this market, return (skip, worst_sum) where
+    skip=True means taking new_side would lock in the insiders' overround (the tightest
+    pair sums to > cap, i.e. > $1-ish for a guaranteed $1). Same-side or no-data → no skip
+    (the same-side case is handled by the dedup set; this gate is only for NEW sides)."""
+    if not held_sides or not new_px or new_side in held_sides:
+        return False, 0.0
+    others = [p for s, p in held_sides.items() if s != new_side and p]
+    if not others:
+        return False, 0.0
+    worst = max(others)  # the held side that makes the tightest (most -EV) pair
+    return (new_px + worst) > cap, new_px + worst
+
+
 async def _seed_held_positions(http_client: httpx.AsyncClient) -> None:
     """
     Seed _held_positions from /api/positions/open with retry + backoff.
@@ -2653,7 +2699,7 @@ async def _seed_held_positions(http_client: httpx.AsyncClient) -> None:
     On persistent failure, dedup stays inactive (_held_positions_seeded=False)
     and a recurring WARNING is emitted each cycle until a restart recovers it.
     """
-    global _held_positions, _held_positions_seeded
+    global _held_positions, _held_side_px, _held_positions_seeded
     for attempt in range(5):
         try:
             positions = await _api_get(http_client, "/api/positions/open")
@@ -2663,6 +2709,12 @@ async def _seed_held_positions(http_client: httpx.AsyncClient) -> None:
                     for p in positions
                     if p.get("market_id") and p.get("bet_side")
                 }
+                _held_side_px = {}
+                for p in positions:
+                    mid, side = p.get("market_id"), p.get("bet_side")
+                    px = p.get("bet_price_filled") or p.get("bet_price_intended")
+                    if mid and side and px:
+                        _held_side_px.setdefault(mid, {})[side] = float(px)
                 _held_positions_seeded = True
                 log.info(
                     "[Dedup] Seeded _held_positions: %d open positions",
@@ -2759,6 +2811,11 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
         _bside = trade.get("bet_side", "")
         if _mid and _bside:
             _held_positions.discard((_mid, _bside))
+            _sides = _held_side_px.get(_mid)
+            if _sides is not None:
+                _sides.pop(_bside, None)
+                if not _sides:
+                    _held_side_px.pop(_mid, None)
             log.debug("[Dedup] Cleared (%s, %s) after resolution", _mid[:16], _bside)
 
         # Streak is the cycle's round value; the snap banner rides only the first post.
@@ -3129,6 +3186,22 @@ async def main() -> None:
                                 (alert.get("alert_id") or "")[:12], _dmid[:16], _dside,
                             )
                             await _notify_skip(http_client, alert, "already holding position")
+                            continue
+                        # Opposite-side vig gate: we already hold a DIFFERENT side of this
+                        # market. Taking this side too locks the pair; only do it if the two
+                        # entry prices sum to <= the cap (a real cheap hedge / arb). Otherwise
+                        # it's the insiders' overround as a guaranteed loss — skip it.
+                        _vig_skip, _vig_sum = _opposite_side_vig(
+                            alert.get("bet_price_at_alert"),
+                            _held_side_px.get(_dmid) or {}, _dside)
+                        if _vig_skip:
+                            log.info(
+                                "[Dedup] Skipping %s — opposite-side vig: %s would lock "
+                                "a pair summing to %.2f > %.2f",
+                                (alert.get("alert_id") or "")[:12], _dside, _vig_sum,
+                                TRADING_OPPOSITE_SIDE_MAX_SUM,
+                            )
+                            await _notify_skip(http_client, alert, "opposite-side vig")
                             continue
 
                     # Max-age discard (source-2 fix): reject CB/daily-limit-trapped signals
