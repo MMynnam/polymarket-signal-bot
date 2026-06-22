@@ -39,6 +39,9 @@ RECAP_WINDOW_HOURS: int = int(os.getenv("RECAP_WINDOW_HOURS", "24"))
 # Funder proxy (holds pUSD) + pUSD collateral, for the free-balance line.
 _FUNDER = "0x00BD1F45caAFd08a1FFfEABa7e17c712a8791e9E"
 _PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+# Vault (holds swept winnings as USDC.e) — the honest "secured" number for the recap.
+_VAULT = "0x5F5B2391c60521bD524DD4832499D98F3aC5AA2F"
+_USDCE = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 _FALLBACK_RPC = "https://polygon-bor-rpc.publicnode.com"
 
 _COLS = ["market_question", "bet_side", "bet_price_filled", "bet_price_intended",
@@ -57,6 +60,22 @@ async def _free_balance(client: httpx.AsyncClient):
             return int(res, 16) / 1e6
     except Exception as exc:
         log.warning("[Recap] balance fetch failed: %s", exc)
+    return None
+
+
+async def _vault_balance(client: httpx.AsyncClient):
+    """USDC.e balanceOf the vault via raw eth_call — the real, swept-to-safety total.
+    Returns float or None."""
+    rpc = getattr(config, "ALCHEMY_RPC_URL", "") or _FALLBACK_RPC
+    data = "0x70a08231" + _VAULT[2:].rjust(64, "0")
+    try:
+        r = await client.post(rpc, json={"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                                         "params": [{"to": _USDCE, "data": data}, "latest"]}, timeout=15)
+        res = r.json().get("result")
+        if res and res != "0x":
+            return int(res, 16) / 1e6
+    except Exception as exc:
+        log.warning("[Recap] vault balance fetch failed: %s", exc)
     return None
 
 
@@ -283,7 +302,7 @@ def _commentary(net: float, wins: int, losses: int, streak_kind: str, streak_n: 
 
 
 def format_results_recap(resolved, open_count, streak, balance, milestone=None,
-                         lifetime=None):
+                         lifetime=None, vault=None):
     """Build the daily recap (HTML) or None if there's truly nothing to say.
 
     Feed v2: tighter card grammar (winbar + record up top, real dollars — the share-units
@@ -305,7 +324,6 @@ def format_results_recap(resolved, open_count, streak, balance, milestone=None,
     if resolved:
         lines.append(f"{_winbar(len(wins), len(losses))}  <b>{len(wins)}W–{len(losses)}L</b>"
                      f"{_streak_tag(streak_kind, streak_n)}")
-        lines.append(f"{'📈' if net >= 0 else '📉'} <b>{_money(net)}</b> on the day")
         lines.append("")
         if wins:
             bw = max(wins, key=lambda t: t.get("pnl") or 0.0)
@@ -331,9 +349,10 @@ def format_results_recap(resolved, open_count, streak, balance, milestone=None,
     money_bits = []
     if balance is not None:
         money_bits.append(f"🏦 bank <b>${balance:.2f}</b>")
-    lt_record, lt_net = lifetime if lifetime else (None, None)
-    if lt_net is not None:
-        money_bits.append(f"all-time <b>{_money(lt_net)}</b>" + (f" ({lt_record})" if lt_record else ""))
+    # The honest, GROWING number: winnings actually swept to the vault (on-chain). Replaces
+    # the old all-time P&L line, which was dominated by the pre-fix corrupted era and misled.
+    if vault is not None and vault > 0:
+        money_bits.append(f"🏛 vault <b>${vault:.2f}</b> secured")
     if money_bits:
         lines.append("  ·  ".join(money_bits))
     if milestone:
@@ -447,14 +466,12 @@ def _weekly_commentary(net, best_streak):
     return "breakeven-ish week — lived to bet another one."
 
 
-def format_weekly_highlights(resolved, balance, lifetime=None):
+def format_weekly_highlights(resolved, balance, lifetime=None, vault=None):
     """Sunday week-in-review message, or a graceful quiet-week line."""
     now = datetime.utcnow()
     start = now - timedelta(days=7)
     rng = f"{start.strftime('%b')} {start.day} – {now.strftime('%b')} {now.day}"
     lines = [f"🗓 <b>THE WEEK</b> — <i>{rng}</i>", ""]
-
-    lt_record, lt_net = lifetime if lifetime else (None, None)
 
     if not resolved:
         lines.append("🦗 <b>quiet week</b> — nothing settled. the grind continues. 🫡")
@@ -469,7 +486,6 @@ def format_weekly_highlights(resolved, balance, lifetime=None):
 
     streak_bit = f"  ·  best run: {_streak_emoji(best)} {best} straight" if best >= 2 else ""
     lines.append(f"{_winbar(len(wins), len(losses))}  <b>{len(wins)}W–{len(losses)}L</b>{streak_bit}")
-    lines.append(f"{'📈' if net >= 0 else '📉'} <b>{_money(net)}</b> on the week")
     lines.append("")
     if wins:
         bw = max(wins, key=lambda t: t.get("pnl") or 0.0)
@@ -481,13 +497,15 @@ def format_weekly_highlights(resolved, balance, lifetime=None):
         bl = min(losses, key=lambda t: t.get("pnl") or 0.0)
         lines.append(f"💀 <b>worst beat:</b> {html.escape(str(bl['bet_side']))} @ {_price(bl)*100:.0f}¢ — {_mkt(bl, 40)}  <b>{_money(bl.get('pnl') or 0.0)}</b>")
     lines.append("")
+    money_bits = []
     if balance is not None:
-        lines.append(f"🏦 bank <b>${balance:.2f}</b>")
+        money_bits.append(f"🏦 bank <b>${balance:.2f}</b>")
+    if vault is not None and vault > 0:
+        money_bits.append(f"🏛 vault <b>${vault:.2f}</b> secured")
+    if money_bits:
+        lines.append("  ·  ".join(money_bits))
     lines.append("")
-    if lt_net is not None:
-        lines.append(f"<i>{_lifetime_line(lt_net, len(resolved) + int(abs(lt_net)))}</i>")
-    else:
-        lines.append(f"<i>{_weekly_commentary(net, best)}</i>")
+    lines.append(f"<i>{_weekly_commentary(net, best)}</i>")
     return "\n".join(lines)
 
 
@@ -522,10 +540,8 @@ def _monthly_commentary(net, best_streak, wins, losses):
     return "a grind of a month — still standing. 🫡"
 
 
-def format_monthly_highlights(resolved, balance, prev_net=None, lifetime=None):
-    """Last-Sunday-of-month review over the prior 30 days, or a quiet-month line.
-    prev_net (net of the 30 days before this window) adds optional MoM framing;
-    pass None to omit it (e.g. first run, before two full windows of data)."""
+def format_monthly_highlights(resolved, balance, prev_net=None, lifetime=None, vault=None):
+    """Last-Sunday-of-month review over the prior 30 days, or a quiet-month line."""
     now = datetime.utcnow()
     start = now - timedelta(days=30)
     rng = f"{start.strftime('%b')} {start.day} – {now.strftime('%b')} {now.day}"
@@ -543,12 +559,7 @@ def format_monthly_highlights(resolved, balance, prev_net=None, lifetime=None):
     best = _best_win_streak(resolved)
 
     streak_bit = f"  ·  best run: {_streak_emoji(best)} {best} straight" if best >= 2 else ""
-    lines.append(f"{_winbar(len(wins), len(losses))}  <b>{len(wins)}W–{len(losses)}L</b> on the month{streak_bit}")
-    net_line = f"{'📈' if net >= 0 else '📉'} <b>{_money(net)}</b> on the month"
-    if prev_net is not None:
-        delta = net - prev_net
-        net_line += f"  ·  prev 30d {_money(prev_net)} ({'▲' if delta >= 0 else '▼'}${abs(delta):.2f})"
-    lines.append(net_line)
+    lines.append(f"{_winbar(len(wins), len(losses))}  <b>{len(wins)}W–{len(losses)}L</b>{streak_bit}")
     lines.append(f"🗓 <b>{_active_days(resolved)}</b> active days  ·  {len(resolved)} resolved")
     lines.append("")
     if wins:
@@ -561,14 +572,15 @@ def format_monthly_highlights(resolved, balance, prev_net=None, lifetime=None):
         bl = min(losses, key=lambda t: t.get("pnl") or 0.0)
         lines.append(f"💀 <b>worst beat:</b> {html.escape(str(bl['bet_side']))} @ {_price(bl)*100:.0f}¢ — {_mkt(bl, 40)}  <b>{_money(bl.get('pnl') or 0.0)}</b>")
     lines.append("")
+    money_bits = []
     if balance is not None:
-        lines.append(f"🏦 bank <b>${balance:.2f}</b>")
+        money_bits.append(f"🏦 bank <b>${balance:.2f}</b>")
+    if vault is not None and vault > 0:
+        money_bits.append(f"🏛 vault <b>${vault:.2f}</b> secured")
+    if money_bits:
+        lines.append("  ·  ".join(money_bits))
     lines.append("")
-    lt_record, lt_net = lifetime if lifetime else (None, None)
-    if lt_net is not None:
-        lines.append(f"<i>{_lifetime_line(lt_net, len(resolved) + int(abs(lt_net)))}</i>")
-    else:
-        lines.append(f"<i>{_monthly_commentary(net, best, len(wins), len(losses))}</i>")
+    lines.append(f"<i>{_monthly_commentary(net, best, len(wins), len(losses))}</i>")
     return "\n".join(lines)
 
 
@@ -594,24 +606,17 @@ async def results_recap_loop(dry_run: bool = False) -> None:
                 resolved, open_count, streak = _fetch_recap_data(RECAP_WINDOW_HOURS)
                 milestone = _compute_milestone(db, since_ts)
                 balance = await _free_balance(client)
-                lifetime = _lifetime_stats()
+                vault = await _vault_balance(client)
 
+                # NOTE (2026-06-22): the image equity-curve card and all cumulative P&L lines
+                # were removed — that P&L was dominated by the pre-fix corrupted era and read
+                # as misleadingly negative. The recap now shows the W-L record + the day's
+                # standout bets + the real vault total (the honest, growing number).
                 posts = []  # (kind, text, photo_bytes_or_None)
                 daily = format_results_recap(resolved, open_count, streak, balance, milestone,
-                                             lifetime=lifetime)
+                                             vault=vault)
                 if daily:
-                    nowp = datetime.utcnow()
-                    wins_n = sum(1 for t in resolved if t["resolution_status"] == "won")
-                    losses_n = sum(1 for t in resolved if t["resolution_status"] == "lost")
-                    net = sum((t.get("pnl") or 0.0) for t in resolved)
-                    card = render_recap_card(
-                        title="the daily",
-                        date_str=f"{nowp.strftime('%A, %b')} {nowp.day}",
-                        wins=wins_n, losses=losses_n, net=net,
-                        curve=_fetch_curve(30),
-                        lifetime_net=lifetime[1], balance=balance,
-                    )
-                    posts.append(("daily", daily, card))
+                    posts.append(("daily", daily, None))
                 nowd = datetime.utcnow()
                 if nowd.weekday() == 6:  # Sunday
                     # Last Sunday of the month ⇔ the next Sunday falls in a different
@@ -623,16 +628,13 @@ async def results_recap_loop(dry_run: bool = False) -> None:
                         all60, _, _ = _fetch_recap_data(24 * 60)
                         cut = int((nowd - timedelta(days=30)).timestamp())
                         last30 = [t for t in all60 if (t.get("resolved_at") or 0) >= cut]
-                        prev30 = [t for t in all60 if (t.get("resolved_at") or 0) < cut]
-                        prev_net = sum((t.get("pnl") or 0.0) for t in prev30) if prev30 else None
                         posts.append(("monthly",
-                                      format_monthly_highlights(last30, balance, prev_net,
-                                                                lifetime=lifetime), None))
+                                      format_monthly_highlights(last30, balance, vault=vault), None))
                     else:
                         weekly_resolved, _, _ = _fetch_recap_data(24 * 7)
                         posts.append(("weekly",
                                       format_weekly_highlights(weekly_resolved, balance,
-                                                               lifetime=lifetime), None))
+                                                               vault=vault), None))
 
                 if not posts:
                     log.info("[Recap] Nothing to recap — skipping")
