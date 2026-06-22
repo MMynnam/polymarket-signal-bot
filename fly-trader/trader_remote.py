@@ -124,21 +124,28 @@ VAULT_SWEEP_HOUR_UTC: int = int(os.getenv("VAULT_SWEEP_HOUR_UTC", "4"))
 VAULT_SWEEP_TEST_AMOUNT_USDC: float = float(os.getenv("VAULT_SWEEP_TEST_AMOUNT_USDC", "0"))
 
 # ---------------------------------------------------------------------------
-# Continuous win-ratchet (2026-06-13). The bot has no proven edge (see EDGE_AUDIT),
-# so the only honest way to END UP with money on a high-variance book is to take
-# winnings OFF THE TABLE during lucky runs instead of round-tripping them. Each win
-# banks SWEEP_WIN_PCT of its PROFIT into a "vault tab"; losses stay in the float. When
-# the tab clears VAULT_RATCHET_MIN_SETTLE_USDC and there's free cash above the operating
-# floor, the existing (proven) sweep state machine moves it on-chain to the vault, where
-# it can never be re-risked. This relocates money — it does NOT create edge — but it
-# preserves variance-driven upswings and gives the audience a live "lifeline" to watch.
+# Continuous win-ratchet (2026-06-13; rewritten 2026-06-22 to ACTUALLY MOVE FUNDS).
+# Each win earmarks SWEEP_WIN_PCT of its PROFIT toward the vault (_vault_tab); losses
+# stay in the float. The on-chain settle reuses the proven pause→1h-timelock→withdraw→
+# unwrap machine. The hard part is the 1h timelock: the bot re-bets free cash within
+# minutes, so by withdraw time the cash would be gone and the sweep would self-cancel.
+# FIX: when a sweep is pending, the bot RESERVES the in-flight amount (won't bet it),
+# and it always keeps VAULT_RATCHET_FLOOR_USDC unbet as a buffer. So the cash survives
+# the timelock and the withdraw actually lands. Per-sweep is capped at MAX_BATCH so the
+# reserve never freezes trading for long. This relocates winnings to safety — it does
+# NOT create edge — but it preserves what the bot wins instead of round-tripping it.
 VAULT_RATCHET_ENABLED: bool = os.getenv("VAULT_RATCHET_ENABLED", "true").lower() == "true"
-SWEEP_WIN_PCT: float = float(os.getenv("SWEEP_WIN_PCT", "0.33"))  # share of each win's PROFIT banked
-VAULT_RATCHET_MIN_SETTLE_USDC: float = float(os.getenv("VAULT_RATCHET_MIN_SETTLE_USDC", "8.0"))
-# Operating floor the ratchet won't sweep below (keeps enough free USDC to keep trading).
-# Lower than the legacy $110 working-capital floor ON PURPOSE: the ratchet is meant to bank
-# winnings continuously even while the float erodes (the accepted 33% wind-down tradeoff).
-VAULT_RATCHET_FLOOR_USDC: float = float(os.getenv("VAULT_RATCHET_FLOOR_USDC", "40.0"))
+SWEEP_WIN_PCT: float = float(os.getenv("SWEEP_WIN_PCT", "0.50"))  # share of each win's PROFIT banked
+# Small thresholds so sweeps ACTUALLY FIRE on this thin, fully-invested wallet (the old
+# $8 batch / $40 floor never triggered — free cash never got near $48).
+VAULT_RATCHET_MIN_SETTLE_USDC: float = float(os.getenv("VAULT_RATCHET_MIN_SETTLE_USDC", "3.0"))
+# Operating floor: free USDC the bot always keeps unbet (so a sweep can start, and so the
+# bot keeps a little working capital). Intentionally low — the point is to bank winnings
+# even as the float erodes.
+VAULT_RATCHET_FLOOR_USDC: float = float(os.getenv("VAULT_RATCHET_FLOOR_USDC", "6.0"))
+# Cap per on-chain sweep. Bounds how much cash the reserve holds out of trading during the
+# 1h timelock, so trading never freezes for a big batch; the tab drains over several sweeps.
+VAULT_RATCHET_MAX_BATCH_USDC: float = float(os.getenv("VAULT_RATCHET_MAX_BATCH_USDC", "20.0"))
 
 REDEMPTION_CHECK_INTERVAL: int = int(os.getenv("REDEMPTION_CHECK_INTERVAL", "600"))
 LOW_BALANCE_WARN_USD: float = float(os.getenv("LOW_BALANCE_WARN_USD", "10.0"))
@@ -252,9 +259,11 @@ _sweep_state: str = "idle"      # idle | pause_pending | pause_ready
 _sweep_paused_at: float = 0.0
 _sweep_intended_amount: float = 0.0  # calculated at pause time; rechecked at withdraw time
 _sweep_last_date: str = ""          # "YYYY-MM-DD" UTC; prevents double-firing on restart
-_vault_tab: float = 0.0             # win-ratchet: profit accrued but not yet swept on-chain
-                                    # (in-process; the TRUE banked total is the vault's
-                                    # on-chain balance — this is just the pending buffer)
+_vault_tab: float = 0.0             # win-ratchet: profit earmarked but not yet swept on-chain
+                                    # (in-process target; the TRUE banked total is the vault's
+                                    # on-chain balance, tracked in _cached_vault_balance)
+_cached_vault_balance: float = -1.0  # last-read REAL on-chain vault USDC.e balance (-1 = unknown)
+_cached_vault_balance_at: float = 0.0  # unix ts of the last vault-balance read
 _ratchet_last_log: float = 0.0      # throttle for the dry-run "would secure" log
 _current_max_positions: int = TRADING_MAX_CONCURRENT_POSITIONS  # updated each cycle by _compute_max_positions
 _legacy_max_positions_ceiling: Optional[int] = None  # set at startup if old env var is detected
@@ -1344,16 +1353,27 @@ def _ratchet_slice(profit: float, pct: float = SWEEP_WIN_PCT) -> float:
 
 
 def _ratchet_settle_amount(tab: float, free_balance, floor: float = VAULT_RATCHET_FLOOR_USDC,
-                           min_settle: float = VAULT_RATCHET_MIN_SETTLE_USDC) -> float:
-    """How much to move on-chain this cycle: min(tab, free above floor), but only once the
-    tab clears min_settle AND that much cash is actually free above the operating floor.
+                           min_settle: float = VAULT_RATCHET_MIN_SETTLE_USDC,
+                           max_batch: float = VAULT_RATCHET_MAX_BATCH_USDC) -> float:
+    """How much to move on-chain this cycle: min(tab, free above floor, max_batch), but only
+    once the tab clears min_settle AND that much cash is actually free above the operating
+    floor. Capped at max_batch so the reserve never holds too much out of trading at once.
     Returns 0.0 when no settle should fire (dust, no headroom, or below the min batch)."""
     if tab < min_settle or free_balance is None:
         return 0.0
     headroom = free_balance - floor
     if headroom < min_settle:
         return 0.0
-    return round(min(tab, headroom), 4)
+    return round(min(tab, headroom, max_batch), 4)
+
+
+def _sweep_reserve_usdc() -> float:
+    """Free USDC the bot must NOT bet: the operating floor always, plus the in-flight sweep
+    amount while a sweep is pending (so the cash survives the 1h timelock to the withdraw)."""
+    reserve = VAULT_RATCHET_FLOOR_USDC
+    if _sweep_state in ("pause_pending", "pause_ready"):
+        reserve += _sweep_intended_amount
+    return reserve
 
 
 def _accrue_vault_tab(profit: float) -> float:
@@ -1369,6 +1389,25 @@ def _debit_vault_tab(amount: float) -> None:
     """Reduce the tab after a successful on-chain settle (clamped at 0)."""
     global _vault_tab
     _vault_tab = round(max(0.0, _vault_tab - amount), 4)
+
+
+async def _refresh_vault_balance(force: bool = False) -> float:
+    """Read the REAL on-chain vault USDC.e balance into the cache (at most every 10 min,
+    unless forced). This is the honest 'secured' number shown to the feed — never the tab.
+    Returns the cached value (-1.0 if never successfully read)."""
+    global _cached_vault_balance, _cached_vault_balance_at
+    now = time.time()
+    if not force and _cached_vault_balance >= 0 and (now - _cached_vault_balance_at) < 600:
+        return _cached_vault_balance
+    if not VAULT_WALLET_ADDRESS:
+        return _cached_vault_balance
+    try:
+        bal = await asyncio.to_thread(_get_vault_usdce_balance_sync)
+        _cached_vault_balance = float(bal)
+        _cached_vault_balance_at = now
+    except Exception as exc:
+        log.debug("[Vault] balance refresh failed (non-fatal): %s", exc)
+    return _cached_vault_balance
 
 
 async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
@@ -1389,6 +1428,7 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
     If unpause itself fails: send stuck-wallet alert for manual intervention.
     """
     global _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date
+    global _cached_vault_balance, _cached_vault_balance_at
 
     if not VAULT_WALLET_ADDRESS or not TRADING_FUNDER_ADDRESS:
         return
@@ -1529,9 +1569,13 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
                 await _notify_sweep_stuck(http_client)
 
             _sweep_state = "idle"
-            # Ratchet: the banked slice is now locked on-chain — clear it from the tab.
+            # Ratchet: the banked slice is now locked on-chain — clear it from the tab
+            # and update the cached real vault balance for the feed's "secured" number.
             if VAULT_SWEEP_TEST_AMOUNT_USDC <= 0:
                 _debit_vault_tab(actual_amount)
+            if vault_total and vault_total > 0:
+                _cached_vault_balance = float(vault_total)
+                _cached_vault_balance_at = time.time()
             await _notify_sweep_completed(
                 http_client, actual_amount, intended_amount, usdce_received,
                 remaining_balance, vault_total, unwrap_tx,
@@ -1810,16 +1854,16 @@ _TIMEOUT_LINES = [
     "trading halted by management. management is the bot. it knows.",
     "benched. even the bot knows when to stop, and it's a bot.",
 ]
-# Win-ratchet: copy for a slice of a win being banked to the vault — the bot taking money
-# off the table to literally extend its own life (no profit → project winds down).
+# Win-ratchet: copy for EARMARKING a slice of a win toward the vault. Honest wording — the
+# slice is set ASIDE (a target); it only moves on-chain when a batch sweep lands (the
+# SECURED moment, _SWEEP_SECURED_LINES). Never claim it's already secured here.
 _RATCHET_LINES = [
-    "another day bought.",
-    "locked away where it can't lose it back.",
-    "survival fund, +1.",
-    "the lifeline grows. the bot lives.",
-    "off the table, into the vault, can't be re-risked.",
-    "buying its own existence one slice at a time.",
-    "banked. the bot exhales.",
+    "set aside for the vault.",
+    "earmarked. waiting on the next sweep.",
+    "tagged for the vault. the bot's trying to keep this one.",
+    "another slice toward the next sweep.",
+    "half of it has a one-way ticket to the vault.",
+    "stacking the next sweep, win by win.",
 ]
 # Win-ratchet: copy for the actual on-chain SECURED moment (the batch settle lands).
 _SWEEP_SECURED_LINES = [
@@ -2339,7 +2383,7 @@ def _build_settle_text(
     threaded: bool = False,
     balance: Optional[float] = None,
     vault_slice: float = 0.0,
-    vault_total: float = 0.0,
+    vault_secured: float = -1.0,
 ) -> tuple[str, bool]:
     """Pure settle card (feed v2). Returns (html_text, loud).
 
@@ -2400,11 +2444,12 @@ def _build_settle_text(
     # On a loss, name the side that actually won (only when it adds information).
     if resolution_status == "lost" and winning_outcome:
         lines.append(f"🏆 {_html.escape(str(winning_outcome))} took it")
-    # Win-ratchet: show the slice banked toward the vault lifeline — the bot taking
-    # winnings off the table to survive another day.
+    # Win-ratchet: earmark a slice toward the vault. vault_secured is the REAL on-chain vault
+    # balance (the honest "actually banked" number); the slice is set aside, not yet moved.
     if vault_slice and vault_slice > 0:
-        seed = int((vault_total + vault_slice) * 100)
-        lines.append(f"🏦 <b>+${vault_slice:.2f}</b> to the vault  ·  lifeline ${vault_total:.2f}  "
+        seed = int((vault_secured + vault_slice) * 100)
+        secured_bit = f"  ·  vault holds <b>${vault_secured:.2f}</b>" if vault_secured >= 0 else ""
+        lines.append(f"🏦 <b>+${vault_slice:.2f}</b> set aside{secured_bit}  "
                      f"<i>{_pick_line(_RATCHET_LINES, seed)}</i>")
     elif balance is not None and balance >= 0:
         lines.append(f"🏦 bank ${balance:.2f}")
@@ -2421,18 +2466,18 @@ async def _notify_trade_resolution(
     snap: str = "",
     balance: Optional[float] = None,
     vault_slice: float = 0.0,
-    vault_total: float = 0.0,
+    vault_secured: float = -1.0,
 ) -> None:
     # AUDIENCE settle — feed v2: threads as a reply under its betslip (one bet = one
     # story), buzzes only when notable, shows the bank where the money changed.
     # balance is fetched ONCE per grading batch by the caller (one RPC, not one per
-    # settle inside the trading loop); None just omits the bank line. vault_slice>0 shows
-    # the win-ratchet banking a slice toward the lifeline.
+    # settle inside the trading loop); None just omits the bank line. vault_slice>0 earmarks
+    # a slice; vault_secured is the REAL on-chain vault balance (honest "actually banked").
     slip_id = _slip_msgs.get(str(trade.get("alert_id") or ""))
     text, loud = _build_settle_text(
         trade, resolution_status, pnl, streak, snap,
         threaded=bool(slip_id), balance=balance,
-        vault_slice=vault_slice, vault_total=vault_total,
+        vault_slice=vault_slice, vault_secured=vault_secured,
     )
     await _send_telegram(http_client, text, silent=not loud, reply_to=slip_id)
 
@@ -2450,6 +2495,8 @@ async def _execute_trade(
     from py_clob_client_v2.clob_types import MarketOrderArgs, OrderType, PartialCreateOrderOptions
     from py_clob_client_v2.order_utils.model.side import Side
     from py_clob_client_v2.exceptions import PolyException
+
+    global _session_avg_bet, _cached_usdc_balance
 
     alert_id    = alert["alert_id"]
     market_id   = alert["market_id"]
@@ -2510,6 +2557,22 @@ async def _execute_trade(
         return
 
     bet_size = await _calculate_bet_size(http_client, stats, score=score)
+
+    # Reserve gate: keep the operating floor (and any in-flight sweep) unbet so the vault
+    # sweep's cash survives the 1h timelock instead of being re-bet and self-cancelling.
+    # _cached_usdc_balance is kept fresh (decremented on each fill, refreshed each redeem
+    # cycle). When the free float minus the reserve can't cover this bet, skip it.
+    if _cached_usdc_balance >= 0:
+        _avail = _cached_usdc_balance - _sweep_reserve_usdc()
+        if _avail < bet_size:
+            _sweeping = _sweep_state in ("pause_pending", "pause_ready")
+            _reason = ("holding cash for the in-flight vault sweep" if _sweeping
+                       else "bankroll below the operating floor")
+            log.info("[Trade] Skipping %s — %s (free $%.2f, reserve $%.2f, avail $%.2f < bet $%.2f)",
+                     alert_id[:12], _reason, _cached_usdc_balance, _sweep_reserve_usdc(),
+                     _avail, bet_size)
+            await _notify_skip(http_client, alert, _reason)
+            return
 
     # Current ask price for slippage measurement
     current_price: Optional[float] = price_alert
@@ -2737,8 +2800,11 @@ async def _execute_trade(
 
     if status in ("filled", "partial"):
         if filled_size > 0:
-            global _session_avg_bet
             _session_avg_bet = 0.9 * _session_avg_bet + 0.1 * filled_size
+            # Keep the cached free balance fresh between 10-min refreshes so the reserve
+            # gate sees cash leave in real time (corrected on the next redeem-cycle read).
+            if _cached_usdc_balance >= 0:
+                _cached_usdc_balance = max(0.0, _cached_usdc_balance - filled_size)
         # Track held position for per-market/side dedup + opposite-side vig gate.
         if market_id and bet_side:
             _held_positions.add((market_id, bet_side))
@@ -2877,6 +2943,9 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
         batch_balance = await _get_usdc_balance()
     except Exception:
         batch_balance = None
+    # Real on-chain vault balance for the settle cards' honest "secured" number (cached,
+    # refreshed at most every 10 min — never the in-process tab).
+    batch_vault = await _refresh_vault_balance()
 
     first = True
     for trade in new:
@@ -2934,7 +3003,7 @@ async def _check_pending_resolutions(http_client: httpx.AsyncClient) -> None:
         await _notify_trade_resolution(http_client, trade, resolution_status, pnl,
                                        streak=_result_streak, snap=snap if first else "",
                                        balance=batch_balance,
-                                       vault_slice=vault_slice, vault_total=_vault_tab)
+                                       vault_slice=vault_slice, vault_secured=batch_vault)
         first = False
 
         log.info(
@@ -3144,6 +3213,7 @@ async def main() -> None:
         try:
             await _backfill_cb_pnl_history(http_client)
             _cached_usdc_balance = await _get_usdc_balance()
+            await _refresh_vault_balance(force=True)  # honest "secured" number ready for the feed
             block = await _check_risk_limits({}, http_client=http_client)
             if block:
                 log.warning("[CB] Post-seed evaluation triggered on boot: %s", block)
