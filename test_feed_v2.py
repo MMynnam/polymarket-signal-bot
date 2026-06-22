@@ -247,26 +247,31 @@ def test_sweat_line():
 
 
 def test_daily_recap():
+    # 2026-06-22: cumulative P&L (net-on-day + all-time) REMOVED as misleading; the real
+    # vault balance is the honest growing number shown instead.
     out = results_recap.format_results_recap(RES, 3, ("lost", 2), 56.10,
-                                             milestone="🥇 <b>New record</b>",
-                                             lifetime=("333W–303L", -147.42))
+                                             milestone="🥇 <b>New record</b>", vault=4.20)
     assert "THE DAILY" in out
-    assert "1W–1L" in out and "▰" in out
-    assert "+$3.16" in out                       # real net, and...
-    assert "(notional)" not in out               # ...the hedge is gone
-    assert "all-time <b>−$147.42</b>" in out     # honest lifetime line
+    assert "1W–1L" in out and "▰" in out          # W-L record stays
+    assert "on the day" not in out                # the cumulative P&L line is gone
+    assert "all-time" not in out                  # the misleading lifetime line is gone
+    assert "(notional)" not in out
+    assert "🏛 vault <b>$4.20</b> secured" in out  # honest, growing number
     assert "New record" in out
     assert "&lt;script&gt;" in out and "<script>" not in out
     assert "score" not in out.lower()
+    # no vault yet -> just the bank line, no vault clutter
+    out_nv = results_recap.format_results_recap(RES, 3, ("lost", 2), 56.10, vault=None)
+    assert "vault" not in out_nv and "bank" in out_nv
     # empty day with open positions still posts the sweat line
-    out2 = results_recap.format_results_recap([], 4, ("none", 0), None, lifetime=(None, None))
+    out2 = results_recap.format_results_recap([], 4, ("none", 0), None)
     assert out2 and "4" in out2
     # truly nothing -> no post
     assert results_recap.format_results_recap([], 0, ("none", 0), None) is None
-    print("  [ok] daily recap: v2 grammar, honest dollars, escaped, None-safe")
+    print("  [ok] daily recap: no cumulative P&L, real vault line, escaped, None-safe")
 
 
-def test_daily_recap_fits_photo_caption():
+def test_daily_recap_is_concise():
     long_q = "Will " + "a very long market question " * 8 + "happen?"
     res = [dict(market_question=long_q, bet_side="SomeVeryLongTeamName FC", bet_price_filled=0.5,
                 bet_price_intended=0.5, pnl=(2.5 if i % 2 else -2.5),
@@ -274,24 +279,24 @@ def test_daily_recap_fits_photo_caption():
            for i in range(40)]
     out = results_recap.format_results_recap(res, 9, ("won", 4), 56.10,
                                              milestone="🔥 <b>New record:</b> longest win streak — <b>9 in a row</b>",
-                                             lifetime=("333W–303L", -147.42))
-    assert len(out) <= 1024, f"caption too long: {len(out)}"
-    print(f"  [ok] daily recap fits sendPhoto caption (worst-case {len(out)}/1024)")
+                                             vault=12.50)
+    assert len(out) <= 1024, f"recap too long: {len(out)}"
+    print(f"  [ok] daily recap stays concise (worst-case {len(out)} chars)")
 
 
 def test_weekly_and_monthly():
-    wk = results_recap.format_weekly_highlights(RES, 56.10, lifetime=("333W–303L", -147.42))
-    assert "THE WEEK" in wk and "(notional)" not in wk and "▰" in wk
-    assert "−$147.42" in wk
-    mo = results_recap.format_monthly_highlights(RES, 56.10, prev_net=-12.4,
-                                                 lifetime=("333W–303L", -147.42))
-    assert "THE MONTH" in mo and "(notional)" not in mo and "▰" in mo
-    assert "prev 30d −$12.40" in mo
-    assert "−$147.42" in mo
+    wk = results_recap.format_weekly_highlights(RES, 56.10, vault=4.20)
+    assert "THE WEEK" in wk and "▰" in wk
+    assert "on the week" not in wk and "lifetime" not in wk   # cumulative P&L gone
+    assert "🏛 vault <b>$4.20</b> secured" in wk
+    mo = results_recap.format_monthly_highlights(RES, 56.10, vault=4.20)
+    assert "THE MONTH" in mo and "▰" in mo
+    assert "on the month" not in mo and "prev 30d" not in mo and "lifetime" not in mo
+    assert "🏛 vault <b>$4.20</b> secured" in mo
     # quiet variants stay graceful
     assert "quiet week" in results_recap.format_weekly_highlights([], None)
     assert "quiet month" in results_recap.format_monthly_highlights([], None)
-    print("  [ok] weekly + monthly: v2 grammar, honest lifetime footer")
+    print("  [ok] weekly + monthly: no cumulative P&L, real vault line")
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +373,7 @@ if __name__ == "__main__":
     test_lifetime_line_sign_aware()
     test_sweat_line()
     test_daily_recap()
-    test_daily_recap_fits_photo_caption()
+    test_daily_recap_is_concise()
     test_weekly_and_monthly()
     test_card_renders_png()
     test_card_failure_returns_none()
