@@ -438,6 +438,12 @@ BRAIN_VET_ENSEMBLE_N: int = int(os.getenv("BRAIN_VET_ENSEMBLE_N", "2"))
 # Audience decision digest (to V1 Poly): how often the brain broadcasts a readable summary of
 # what it blessed / passed on, keeping the channel alive between bets.
 BRAIN_DIGEST_HOURS: float = float(os.getenv("BRAIN_DIGEST_HOURS", "4"))
+# Web search in the REAL-TIME vet: measured at ~69s and ~$0.58/call (token-heavy search context)
+# — too slow for the trade path (the connection times out before it returns) and far too costly.
+# Default OFF: the real-time vet reasons fast from the model's own knowledge + base rates + the
+# market price (~8s, ~$0.02). The hourly SCANNER still web-researches its independent ideas, where
+# latency doesn't matter. Set true to web-research each vet (accepting the latency/cost/timeout risk).
+BRAIN_VET_WEB_SEARCH: bool = os.getenv("BRAIN_VET_WEB_SEARCH", "false").lower() in ("true", "1", "yes")
 # If the ensemble's stdev exceeds this, spend one supervisor call to reconcile.
 BRAIN_RECONCILE_STD: float = float(os.getenv("BRAIN_RECONCILE_STD", "0.15"))
 # Platt/log-odds extremization coefficient (√3≈1.73 counteracts LLM hedging toward 0.5).

@@ -2987,7 +2987,7 @@ async def _brain_vet_realtime(http_client: httpx.AsyncClient, alert: dict) -> Op
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
-        log.info("[Brain] real-time vet unavailable (%s) — base size", exc)
+        log.info("[Brain] real-time vet unavailable [%s: %r] — base size", type(exc).__name__, exc)
         return None
     if not isinstance(data, dict) or not data.get("ok"):
         reason = data.get("reason", "no verdict") if isinstance(data, dict) else "bad response"

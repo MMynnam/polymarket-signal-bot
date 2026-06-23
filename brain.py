@@ -661,9 +661,19 @@ async def vet_alert(alert: dict) -> dict:
         "alert_id": alert.get("alert_id"),
     }
     cost_before = _spend.spent_today()
-    brief, _ = await _research(market)
-    if not brief:
-        return {"ok": False, "reason": "no research produced"}
+    if config.BRAIN_VET_WEB_SEARCH:
+        # Opt-in deep path: research the open web (slow ~45-70s, costly — risks the trade-path
+        # timeout). Only use when the caller accepts the latency/cost.
+        brief, _ = await _research(market)
+        if not brief:
+            return {"ok": False, "reason": "no research produced"}
+    else:
+        # Default fast path: no web search. Reason from the model's own knowledge + base rates +
+        # the market price (~8s, ~$0.02). The model is told to stay humble without live research.
+        brief = ("(Fast real-time vet — NO live web search. Reason from base rates, your own "
+                 "knowledge of the participants/event, and the market price. Factor in the extra "
+                 "uncertainty of not having searched — do NOT claim a strong edge unless your "
+                 "priors are genuinely strong; when unsure, stay near the market price.)")
     forecasts = []
     for i in range(max(1, config.BRAIN_VET_ENSEMBLE_N)):
         if not _spend.can_afford(0.0):
