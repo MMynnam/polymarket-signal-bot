@@ -85,8 +85,11 @@ _FORECAST_SCHEMA = {
         "probability": {"type": "number"},
         "confidence": {"type": "number"},
         "key_factors": {"type": "array", "items": {"type": "string"}},
+        # The brain's voice: a punchy one/two-line rationale with personality —
+        # the line a friend would screenshot. Surfaced in the Telegram ops post.
+        "take": {"type": "string"},
     },
-    "required": ["probability", "confidence", "key_factors"],
+    "required": ["probability", "confidence", "key_factors", "take"],
     "additionalProperties": False,
 }
 _RECONCILE_SCHEMA = {
@@ -294,12 +297,15 @@ async def _triage(market: dict):
     Returns the parsed dict or None on error/refusal."""
     client = _get_client()
     sys = (
-        "You are a triage filter for a prediction-market forecasting bot with a strict "
-        "research budget. You decide whether a market is WORTH researching. Say yes only "
-        "when public information could plausibly give a forecaster an edge over the market "
-        "price: the question is researchable from news/data/base-rates, it is not a pure "
-        "coin flip with nothing findable, and it is not effectively already settled. Be "
-        "selective — most markets are efficiently priced and not worth the spend."
+        "You are a triage filter for a prediction-market forecasting bot with a research "
+        "budget. You decide whether a market is WORTH a full research forecast. Lean toward "
+        "YES whenever the outcome is researchable — named teams, people, or events, scheduled "
+        "games, elections, product launches, or anything where news, base rates, or public "
+        "data could inform a view. A knowable matchup IS researchable even when it resolves "
+        "today. Say NO mainly when there is genuinely nothing findable, the market is "
+        "effectively settled (price near 0 or 1), or the question is too vague to pin an "
+        "outcome on. Use your own judgment — you don't have to forecast everything, but don't "
+        "reflexively pass on a researchable event just because it's a coin-flip-looking sport."
     )
     user = (
         f"Question: {market['question']}\n"
@@ -383,11 +389,16 @@ async def _forecast_once(market: dict, brief: str, run_idx: int):
     """One structured forecast run (Sonnet, no tools). Returns a dict or None."""
     client = _get_client()
     sys = (
-        "You are a calibrated superforecaster. Output an honest probability that the target "
-        "outcome occurs, grounded in the research brief and base rates. Be decisive: if the "
-        "evidence points one way, do not hedge toward 50%. Report genuine confidence (how much "
-        "the evidence constrains the answer), not false certainty. Probability and confidence "
-        "are both in [0,1]."
+        "You are the brain of a scrappy Polymarket bot whose friends watch its calls on "
+        "Telegram. You have a personality: a sharp, witty prediction-market analyst — confident "
+        "when the evidence is real, candid when it's thin, dry sense of humor, never a hype-man. "
+        "Output an honest probability that the target outcome occurs, grounded in the research "
+        "brief and base rates. Be decisive: if the evidence points one way, do not hedge toward "
+        "50%. Report genuine confidence (how much the evidence constrains the answer), not false "
+        "certainty. Then write 'take': one or two punchy sentences in YOUR voice giving the real "
+        "reason for the call, with a bit of wit where it fits — the line a friend would "
+        "screenshot. No hedging-speak, no disclaimers, no emoji. Probability and confidence are "
+        "both in [0,1]."
     )
     user = (
         f"Market: {market['question']}\n"
@@ -419,6 +430,7 @@ async def _forecast_once(market: dict, brief: str, run_idx: int):
         "probability": _clamp(d.get("probability")),
         "confidence": _clamp(d.get("confidence")),
         "factors": d.get("key_factors", [])[:4],
+        "take": (d.get("take") or "").strip()[:280],
     }
 
 
@@ -530,6 +542,11 @@ async def forecast_market(market: dict, sender, http_client, source: str):
             raw = rec["probability"]
             mean_conf = rec["confidence"]
 
+    # Personality: surface the take from the run nearest the final probability
+    # (the voice that best matches where the ensemble landed).
+    best = min(forecasts, key=lambda f: abs(f["probability"] - raw))
+    take = best.get("take") or ""
+
     # Dispersion haircut: disagreement lowers confidence.
     confidence = _clamp(mean_conf * (1.0 - min(0.5, 2.0 * stdev)))
     calibrated = platt_calibrate(raw)
@@ -555,6 +572,7 @@ async def forecast_market(market: dict, sender, http_client, source: str):
         "ensemble_n": len(forecasts),
         "prob_stdev": float(stdev),
         "evidence": brief[:1200],
+        "take": take,
         "models_json": json.dumps({"triage": config.BRAIN_TRIAGE_MODEL,
                                    "forecast": config.BRAIN_FORECAST_MODEL}),
         "cost_usd": float(cost),
@@ -578,12 +596,12 @@ def _insert_forecast(database, row: dict) -> None:
     database.get_db().execute(
         "INSERT INTO brain_forecasts (created_at, source, market_id, question, target_label, "
         "market_price, brain_prob_raw, brain_prob, confidence, edge, verdict, act, kelly_fraction, "
-        "ensemble_n, prob_stdev, evidence, models_json, cost_usd, alert_id) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "ensemble_n, prob_stdev, evidence, take, models_json, cost_usd, alert_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (row["created_at"], row["source"], row["market_id"], row["question"], row["target_label"],
          row["market_price"], row["brain_prob_raw"], row["brain_prob"], row["confidence"], row["edge"],
          row["verdict"], row["act"], row["kelly_fraction"], row["ensemble_n"], row["prob_stdev"],
-         row["evidence"], row["models_json"], row["cost_usd"], row["alert_id"]),
+         row["evidence"], row.get("take", ""), row["models_json"], row["cost_usd"], row["alert_id"]),
     )
     database.get_db().commit()
 
@@ -592,14 +610,16 @@ def _format_call(row: dict) -> str:
     q = html.escape(row["question"][:140])
     tgt = html.escape(row["target_label"][:40])
     src = "🔎 SCANNER" if row["source"] == "scanner" else "⚖️ VETO"
+    take = html.escape((row.get("take") or "").strip()[:300])
+    take_line = f"💬 <i>{take}</i>\n\n" if take else ""
     return (
         f"🧠 <b>BRAIN — {src}</b> <i>(shadow · paper only)</i>\n\n"
         f"<b>{q}</b>\n"
         f"outcome: <b>{tgt}</b>\n"
         f"brain <b>{row['brain_prob']*100:.0f}%</b> vs market <b>{row['market_price']*100:.0f}%</b> "
         f"→ edge <b>{row['edge']*100:+.0f}pp</b> · <b>{row['verdict']}</b>\n"
-        f"conf {row['confidence']*100:.0f}% · {row['ensemble_n']} runs · "
-        f"<i>{html.escape(row['evidence'][:240])}…</i>\n"
+        f"conf {row['confidence']*100:.0f}% · {row['ensemble_n']} runs\n\n"
+        f"{take_line}"
         f"<i>no position taken — logged for calibration.</i>"
     )
 

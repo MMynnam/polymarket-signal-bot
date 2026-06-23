@@ -233,6 +233,7 @@ CREATE TABLE IF NOT EXISTS brain_forecasts (
     ensemble_n        INTEGER NOT NULL DEFAULT 0,
     prob_stdev        REAL NOT NULL DEFAULT 0,
     evidence          TEXT NOT NULL DEFAULT '',      -- truncated research brief
+    take              TEXT NOT NULL DEFAULT '',      -- the brain's voice: one-line rationale + personality
     models_json       TEXT NOT NULL DEFAULT '{}',
     cost_usd          REAL NOT NULL DEFAULT 0,
     alert_id          TEXT,                 -- veto: the insider alert this re-judges; NULL for scanner
@@ -258,7 +259,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_SCHEMA_VERSION = 11
+_CURRENT_SCHEMA_VERSION = 12
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -460,6 +461,18 @@ def _apply_migrations() -> None:
         db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(11)")
         db.commit()
         log.info("Applied schema migration → version 11 (brain_forecasts)")
+
+    if current < 12:
+        # Version 12 — 'take' column on brain_forecasts: the brain's personality
+        # line (one-liner rationale) surfaced in the Telegram ops post.
+        try:
+            db.execute("ALTER TABLE brain_forecasts ADD COLUMN take TEXT NOT NULL DEFAULT ''")
+            log.info("Migration 12: added take column to brain_forecasts")
+        except Exception:
+            pass  # Column already exists (idempotent re-run / fresh schema)
+        db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(12)")
+        db.commit()
+        log.info("Applied schema migration → version 12 (brain_forecasts.take)")
 
 
 # ---------------------------------------------------------------------------
