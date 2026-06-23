@@ -399,6 +399,70 @@ VAULT_SWEEP_FLOOR_USDC: float = float(os.getenv("VAULT_SWEEP_FLOOR_USDC", str(TR
 VAULT_SWEEP_INTERVAL_SECONDS: int = int(os.getenv("VAULT_SWEEP_INTERVAL_SECONDS", "3600"))
 
 # ---------------------------------------------------------------------------
+# The "brain" — LLM forecaster (shadow-mode, hard cost cap)
+# ---------------------------------------------------------------------------
+# An independent calibrated forecaster (Claude) that researches a market from
+# the open web and produces its OWN probability — the bot's attempt at real
+# alpha after the edge audit proved the insider signal is a 50/50 coin flip.
+# It runs in SHADOW by default: it logs forecasts to brain_forecasts and posts
+# high-conviction calls to the ops channel, but NEVER trades. No API key (or
+# BRAIN_ENABLED=false) → the whole subsystem no-ops. Forward-validate calibration
+# (Brier vs market) for weeks before any graduation to real bets.
+
+# Master switch. Off until an Anthropic API key is provided AND we choose to run it.
+BRAIN_ENABLED: bool = os.getenv("BRAIN_ENABLED", "false").lower() in ("true", "1", "yes")
+# The bot's OWN Anthropic API key (separate from the user's Claude Max subscription).
+BRAIN_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+# Shadow mode: log + post forecasts, NEVER place a real trade. Keep true until calibration is proven.
+BRAIN_SHADOW: bool = os.getenv("BRAIN_SHADOW", "true").lower() in ("true", "1", "yes")
+
+# Models: cheap triage (Haiku tier) gates the spend; stronger research/forecast (Sonnet tier).
+BRAIN_TRIAGE_MODEL: str = os.getenv("BRAIN_TRIAGE_MODEL", "claude-haiku-4-5")
+BRAIN_FORECAST_MODEL: str = os.getenv("BRAIN_FORECAST_MODEL", "claude-sonnet-4-6")
+# Effort for the Sonnet calls (low is cheap and still strong). Haiku gets no effort param.
+BRAIN_EFFORT: str = os.getenv("BRAIN_EFFORT", "low")
+
+# Hard daily spend cap (USD). Token + web-search cost is tracked per call; once the
+# cap is hit, the brain stops making calls until UTC-midnight rollover.
+BRAIN_DAILY_USD_CAP: float = float(os.getenv("BRAIN_DAILY_USD_CAP", "1.00"))
+# Conservative pre-check estimate of one full forecast's cost (triage+research+ensemble).
+BRAIN_EST_FORECAST_USD: float = float(os.getenv("BRAIN_EST_FORECAST_USD", "0.05"))
+
+# Ensemble: N independent forecast runs → mean → (reconcile if they disagree) → calibrate.
+BRAIN_ENSEMBLE_N: int = int(os.getenv("BRAIN_ENSEMBLE_N", "3"))
+# If the ensemble's stdev exceeds this, spend one supervisor call to reconcile.
+BRAIN_RECONCILE_STD: float = float(os.getenv("BRAIN_RECONCILE_STD", "0.15"))
+# Platt/log-odds extremization coefficient (√3≈1.73 counteracts LLM hedging toward 0.5).
+# This is a literature PRIOR — re-fit from resolved forecasts once enough have graded.
+BRAIN_PLATT_COEF: float = float(os.getenv("BRAIN_PLATT_COEF", "1.73"))
+
+# Decision thresholds (shadow: controls what gets flagged; live: would gate a trade).
+BRAIN_EDGE_THRESHOLD: float = float(os.getenv("BRAIN_EDGE_THRESHOLD", "0.10"))   # min |brain_prob − price|
+BRAIN_MIN_CONFIDENCE: float = float(os.getenv("BRAIN_MIN_CONFIDENCE", "0.55"))
+BRAIN_KELLY_CAP: float = float(os.getenv("BRAIN_KELLY_CAP", "0.25"))             # quarter-Kelly ceiling
+
+# Loop cadence + per-cycle caps (also bounded by the daily spend cap).
+BRAIN_SCAN_INTERVAL_SECONDS: int = int(os.getenv("BRAIN_SCAN_INTERVAL_SECONDS", "3600"))
+BRAIN_MAX_PER_CYCLE: int = int(os.getenv("BRAIN_MAX_PER_CYCLE", "6"))
+BRAIN_REFORECAST_HOURS: float = float(os.getenv("BRAIN_REFORECAST_HOURS", "24"))  # don't re-forecast a market within this window
+
+# Scanner (long-tail mispricing hunt) market filters.
+BRAIN_SCAN_MIN_PRICE: float = float(os.getenv("BRAIN_SCAN_MIN_PRICE", "0.12"))
+BRAIN_SCAN_MAX_PRICE: float = float(os.getenv("BRAIN_SCAN_MAX_PRICE", "0.88"))
+BRAIN_SCAN_MIN_DAYS: float = float(os.getenv("BRAIN_SCAN_MIN_DAYS", "1"))
+BRAIN_SCAN_MAX_DAYS: float = float(os.getenv("BRAIN_SCAN_MAX_DAYS", "30"))
+BRAIN_SCAN_MIN_VOL_USD: float = float(os.getenv("BRAIN_SCAN_MIN_VOL_USD", "2000"))   # enough liquidity to be real
+BRAIN_SCAN_MAX_VOL_USD: float = float(os.getenv("BRAIN_SCAN_MAX_VOL_USD", "250000")) # but thin/obscure (LLM edge lives here, not on liquid markets)
+BRAIN_SCAN_GAMMA_LIMIT: int = int(os.getenv("BRAIN_SCAN_GAMMA_LIMIT", "120"))
+
+# Veto/confirm layer: re-forecast recent insider alerts to log agree/disagree.
+BRAIN_VETO_MIN_SCORE: int = int(os.getenv("BRAIN_VETO_MIN_SCORE", "60"))
+BRAIN_VETO_LOOKBACK_HOURS: float = float(os.getenv("BRAIN_VETO_LOOKBACK_HOURS", "12"))
+
+# Daily calibration report (Brier brain vs market) to ops.
+BRAIN_CAL_REPORT_HOUR_UTC: int = int(os.getenv("BRAIN_CAL_REPORT_HOUR_UTC", "13"))
+
+# ---------------------------------------------------------------------------
 # API server (Railway auto-injects PORT; 8080 is the fallback)
 # ---------------------------------------------------------------------------
 

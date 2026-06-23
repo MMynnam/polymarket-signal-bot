@@ -209,6 +209,48 @@ CREATE INDEX IF NOT EXISTS idx_skip_telemetry_shadow_status
     ON skip_telemetry(shadow_resolution_status);
 
 -- ------------------------------------------------------------------
+-- brain_forecasts: the LLM forecaster's OWN probability for a market.
+-- Shadow-mode: logged here for forward calibration; no money at risk.
+-- 'target_label' is the explicit outcome string the probability refers to,
+-- so grading is unambiguous (avoids the token[0] side bug). market_price is
+-- that same outcome's implied probability at forecast time.
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS brain_forecasts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at        INTEGER NOT NULL,
+    source            TEXT NOT NULL,        -- 'scanner' | 'veto'
+    market_id         TEXT NOT NULL,
+    question          TEXT NOT NULL,
+    target_label      TEXT NOT NULL,        -- the outcome P() refers to (scanner: outcomes[0]; veto: bet_side)
+    market_price      REAL NOT NULL,        -- implied P(target_label) at forecast time, 0..1
+    brain_prob_raw    REAL NOT NULL,        -- ensemble mean before calibration
+    brain_prob        REAL NOT NULL,        -- Platt-calibrated final probability
+    confidence        REAL NOT NULL,
+    edge              REAL NOT NULL,        -- signed brain_prob − market_price
+    verdict           TEXT NOT NULL,        -- CONFIRM/VETO (veto) or UNDERPRICED/OVERPRICED/FAIR (scanner)
+    act               INTEGER NOT NULL DEFAULT 0,   -- 1 if cleared edge+confidence bars (would trade if live)
+    kelly_fraction    REAL NOT NULL DEFAULT 0,
+    ensemble_n        INTEGER NOT NULL DEFAULT 0,
+    prob_stdev        REAL NOT NULL DEFAULT 0,
+    evidence          TEXT NOT NULL DEFAULT '',      -- truncated research brief
+    models_json       TEXT NOT NULL DEFAULT '{}',
+    cost_usd          REAL NOT NULL DEFAULT 0,
+    alert_id          TEXT,                 -- veto: the insider alert this re-judges; NULL for scanner
+    resolved_outcome  INTEGER,              -- 1 if target_label won, 0 if lost; NULL until resolved
+    resolved_at       INTEGER,
+    brier_brain       REAL,                 -- (brain_prob − outcome)^2; NULL until resolved
+    brier_market      REAL                  -- (market_price − outcome)^2; NULL until resolved
+);
+CREATE INDEX IF NOT EXISTS idx_brain_forecasts_created
+    ON brain_forecasts(created_at);
+CREATE INDEX IF NOT EXISTS idx_brain_forecasts_market
+    ON brain_forecasts(market_id);
+CREATE INDEX IF NOT EXISTS idx_brain_forecasts_resolved
+    ON brain_forecasts(resolved_outcome);
+CREATE INDEX IF NOT EXISTS idx_brain_forecasts_alert
+    ON brain_forecasts(alert_id);
+
+-- ------------------------------------------------------------------
 -- schema_version: simple migration tracking
 -- ------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -216,7 +258,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-_CURRENT_SCHEMA_VERSION = 10
+_CURRENT_SCHEMA_VERSION = 11
 
 # ---------------------------------------------------------------------------
 # Connection management
@@ -411,6 +453,13 @@ def _apply_migrations() -> None:
         db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(10)")
         db.commit()
         log.info("Applied schema migration → version 10 (resolution_source)")
+
+    if current < 11:
+        # Version 11 — brain_forecasts table (created via _SCHEMA_SQL above).
+        # The LLM forecaster's shadow-mode probability log. No ALTER needed.
+        db.execute("INSERT OR IGNORE INTO schema_version(version) VALUES(11)")
+        db.commit()
+        log.info("Applied schema migration → version 11 (brain_forecasts)")
 
 
 # ---------------------------------------------------------------------------
