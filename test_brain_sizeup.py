@@ -93,16 +93,29 @@ def test_unknown_balance_allows_cap():
     print("  [ok] unknown balance (-1) → cap allowed (reserve gate still runs after)")
 
 
-def test_betslip_renders_brain_take_and_escapes():
+def test_betslip_renders_brain_verdict_on_every_vetted_slip():
+    # Un-vetted bet → no brain line at all.
     plain = tr._build_slip_text("Knicks make playoffs?", "Yes", 0.40, 2.0, bet_no=7)
-    assert "brain conviction" not in plain          # no brain line on a normal bet
+    assert "🧠" not in plain
+    # Sized-up CONFIRM → conviction line + take, bigger stake, HTML-escaped.
     sized = tr._build_slip_text("Knicks <playoffs> & more", "Yes", 0.40, 15.0, bet_no=8,
-                                brain_take="Healthy roster, soft schedule — 40c is a gift.")
-    assert "brain conviction" in sized and "sized up" in sized
-    assert "gift." in sized
-    assert "&lt;playoffs&gt;" in sized              # HTML-escaped question
-    assert "$15.00" in sized                        # the bigger stake
-    print("  [ok] betslip shows brain rationale only when sized up; HTML-escaped")
+                                brain_verdict={"verdict": "CONFIRM", "take": "40c is a gift.",
+                                               "brain_prob": 0.66, "market_price": 0.40},
+                                brain_sized_up=True)
+    assert "CONVICTION" in sized and "sized up" in sized and "gift." in sized
+    assert "&lt;playoffs&gt;" in sized and "$15.00" in sized
+    # VETO → the brain's disagreement is shown, bet still rides at base.
+    veto = tr._build_slip_text("England vs Ghana O/U 3.5", "Over", 0.39, 1.95, bet_no=9,
+                               brain_verdict={"verdict": "VETO", "take": "leans Under.",
+                                              "brain_prob": 0.28, "market_price": 0.39})
+    assert "leans the other way" in veto and "riding the signal anyway" in veto
+    assert "28% vs market 39%" in veto and "leans Under." in veto
+    # NEUTRAL → coin-flip line.
+    neutral = tr._build_slip_text("Will Mexico win?", "Yes", 0.52, 1.5, bet_no=10,
+                                  brain_verdict={"verdict": "NEUTRAL", "take": "no clear edge.",
+                                                 "brain_prob": 0.53, "market_price": 0.52})
+    assert "coin-flip" in neutral and "no edge to add" in neutral
+    print("  [ok] betslip shows the brain's verdict on EVERY vetted slip (agree/veto/neutral)")
 
 
 if __name__ == "__main__":
@@ -114,5 +127,5 @@ if __name__ == "__main__":
     test_clamped_to_available_cash()
     test_daily_cap_blocks_further_sizeups()
     test_unknown_balance_allows_cap()
-    test_betslip_renders_brain_take_and_escapes()
+    test_betslip_renders_brain_verdict_on_every_vetted_slip()
     print("all brain-sizeup tests passed")

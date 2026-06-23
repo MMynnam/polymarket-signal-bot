@@ -1932,12 +1932,14 @@ def _build_slip_text(
     fill_price: float,
     size: float,
     bet_no: Optional[int] = None,
-    brain_take: Optional[str] = None,
+    brain_verdict: Optional[dict] = None,
+    brain_sized_up: bool = False,
 ) -> str:
     """Pure betslip card (feed v2). One bet = one slip: number, odds word, the line,
     stake → payout, one rotating banter line. No score, no bank line, no link clutter
-    (the market link rides as an inline button). When the brain sized this bet up, its
-    rationale rides on the slip — bigger bet + the reasoning, in the channel it's taken."""
+    (the market link rides as an inline button). Whenever the brain VETTED this bet (in
+    real time at trade time), its verdict + reasoning ride on the slip — agree, coin-flip,
+    or disagree — so the brain's read is visible on every position it weighed in on."""
     import html as _html
 
     profit_if_win = (size / fill_price) - size if fill_price and fill_price > 0 else 0.0
@@ -1948,8 +1950,25 @@ def _build_slip_text(
     banter   = _pick_line(_SLIP_BANTER.get(key) or _SLIP_BANTER["mystery"], seed)
     price_c  = f"{fill_price*100:.0f}¢" if fill_price and fill_price > 0 else "?¢"
     no_bit   = f" #{bet_no}" if bet_no else ""
-    brain_line = (f"\n\n🧠 <b>brain conviction — sized up</b>\n<i>{_html.escape(str(brain_take)[:240])}</i>"
-                  if brain_take else "")
+
+    brain_line = ""
+    if brain_verdict and brain_verdict.get("verdict"):
+        v = brain_verdict["verdict"]
+        take = _html.escape(str(brain_verdict.get("take") or "")[:220])
+        odds_bit = ""
+        try:
+            odds_bit = f" — its read {float(brain_verdict['brain_prob'])*100:.0f}% vs market {float(brain_verdict['market_price'])*100:.0f}%"
+        except Exception:
+            pass
+        if brain_sized_up:
+            head = "🧠 <b>BRAIN CONVICTION — sized up</b>"
+        elif v == "CONFIRM":
+            head = f"🧠 <b>brain agrees</b>{odds_bit}"
+        elif v == "VETO":
+            head = f"🧠 <b>brain leans the other way</b>{odds_bit} · riding the signal anyway"
+        else:  # NEUTRAL / anything else
+            head = f"🧠 <b>brain sees a coin-flip</b>{odds_bit} · no edge to add"
+        brain_line = f"\n\n{head}" + (f"\n<i>{take}</i>" if take else "")
 
     return (
         f"🎟 <b>BET{no_bit}</b> · {word}\n"
@@ -1973,15 +1992,17 @@ async def _notify_trade_filled(
     score_breakdown_json: Optional[str] = None,
     alert_id: str = "",
     bet_no: Optional[int] = None,
-    brain_take: Optional[str] = None,
+    brain_verdict: Optional[dict] = None,
+    brain_sized_up: bool = False,
 ) -> None:
     # AUDIENCE betslip — feed v2. SILENT push (notification discipline: anticipation is
     # browsable, results buzz). The slip's message_id is remembered so the settle threads
     # under it as a reply and each bet reads as one self-contained card.
     # (score / slippage / alert_created_at / score_breakdown_json kept in the signature
     # for callers + ops parity, intentionally unused here — the score is dead, long live
-    # the price.) brain_take, when present, adds the brain's conviction rationale.
-    text = _build_slip_text(market_q, bet_side, fill_price, size, bet_no, brain_take=brain_take)
+    # the price.) brain_verdict, when present, shows the brain's read (agree/coin-flip/disagree).
+    text = _build_slip_text(market_q, bet_side, fill_price, size, bet_no,
+                            brain_verdict=brain_verdict, brain_sized_up=brain_sized_up)
     buttons = [("⚡ watch it live", str(market_url))] if market_url else None
     msg_id = await _send_telegram(http_client, text, silent=True, buttons=buttons)
     _remember_slip(alert_id, msg_id)
@@ -2876,8 +2897,9 @@ async def _execute_trade(
                 bet_no = None
         except Exception:
             bet_no = None
-        # Brain conviction: count the sized-up bet (bounds the per-day cap) and carry the
-        # brain's rationale onto the betslip — the bet AND its reasoning land together.
+        # Brain: count the sized-up bet (bounds the per-day cap) and carry the brain's read
+        # onto the betslip — whether it agreed, saw a coin-flip, or disagreed, its verdict +
+        # reasoning land with the bet so the brain is visible on every position it vetted.
         if _brain_conf:
             _brain_sizeups_today += 1
         await _notify_trade_filled(
@@ -2888,7 +2910,8 @@ async def _execute_trade(
             score_breakdown_json=alert.get("score_breakdown_json"),
             alert_id=alert_id,
             bet_no=bet_no,
-            brain_take=(_brain_conf or {}).get("take") if _brain_conf else None,
+            brain_verdict=_brain_verdict,
+            brain_sized_up=bool(_brain_conf),
         )
     elif status == "error" and _is_geoblock(error_msg):
         # Geoblock: trip a circuit-breaker so we stop hammering POST /order, and alert
