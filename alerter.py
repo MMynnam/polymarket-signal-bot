@@ -447,6 +447,14 @@ def make_research_sender() -> Optional[TelegramSender]:
     return None
 
 
+def make_audience_sender() -> Optional[TelegramSender]:
+    """Sender for the AUDIENCE channel (V1 Poly) — the friends' feed. Used for audience-facing
+    brain content like the decision digest. None if the audience channel isn't configured."""
+    if config.TELEGRAM_CHAT_ID:
+        return TelegramSender(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Alert queue worker
 # ---------------------------------------------------------------------------

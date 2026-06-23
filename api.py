@@ -79,6 +79,16 @@ class BulkResolutionCorrection(BaseModel):
     source: str = "reconcile"
 
 
+class BrainVetRequest(BaseModel):
+    market_id: str
+    bet_side: str
+    bet_price_at_alert: float
+    alert_id: str = ""
+    market_question: str = ""
+    market_category: Optional[str] = None
+    hours_to_close_at_alert: Optional[float] = None
+
+
 class SkipTelemetryReport(BaseModel):
     alert_id: str
     market_id: str
@@ -195,6 +205,30 @@ def get_open_positions(_key: None = Depends(_verify_api_key)):
     except Exception as exc:
         log.error("[API] get_open_positions failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Database error")
+
+
+@app.post("/api/brain/vet")
+async def post_brain_vet(
+    body: BrainVetRequest,
+    _key: None = Depends(_verify_api_key),
+):
+    """Real-time brain vet of one alert AT TRADE TIME. Runs the streamlined brain pipeline
+    (~20-40s) and returns its verdict for the trader's conviction size-up. Always returns a
+    dict with `ok`; on any failure ok=False and the trader proceeds at base size."""
+    import brain
+    try:
+        return await brain.vet_alert({
+            "alert_id": body.alert_id,
+            "market_id": body.market_id,
+            "market_question": body.market_question,
+            "bet_side": body.bet_side,
+            "bet_price_at_alert": body.bet_price_at_alert,
+            "market_category": body.market_category,
+            "hours_to_close_at_alert": body.hours_to_close_at_alert,
+        })
+    except Exception as exc:
+        log.error("[API] brain vet failed: %s", exc, exc_info=True)
+        return {"ok": False, "reason": "vet error"}
 
 
 @app.get("/api/brain/confirmations")

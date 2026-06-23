@@ -91,6 +91,11 @@ BRAIN_SIZEUP_MIN_EDGE: float = float(os.getenv("BRAIN_SIZEUP_MIN_EDGE", "0.12"))
 BRAIN_SIZEUP_MAX_PER_DAY: int = int(os.getenv("BRAIN_SIZEUP_MAX_PER_DAY", "5"))
 BRAIN_CONFIRM_POLL_SECONDS: int = int(os.getenv("BRAIN_CONFIRM_POLL_SECONDS", "300"))
 BRAIN_CONFIRM_LOOKBACK_HOURS: float = float(os.getenv("BRAIN_CONFIRM_LOOKBACK_HOURS", "18"))
+# Real-time vet: ask the brain to analyze each alert AT TRADE TIME (synchronous ~20-40s call
+# to /api/brain/vet) so it can actually weigh in before the position is taken — the whole point.
+# When off, falls back to the polled confirmation cache (which rarely matches fresh alerts).
+BRAIN_REALTIME_VET_ENABLED: bool = os.getenv("BRAIN_REALTIME_VET_ENABLED", "false").lower() in ("true", "1", "yes")
+BRAIN_VET_TIMEOUT_S: float = float(os.getenv("BRAIN_VET_TIMEOUT_S", "90"))
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -2594,12 +2599,16 @@ async def _execute_trade(
 
     bet_size = await _calculate_bet_size(http_client, stats, score=score)
 
-    # Brain conviction size-up: bump toward the cap when the brain has INDEPENDENTLY
-    # confirmed this exact market+side with high conviction (a confluence signal). Clamped
-    # to free cash above the sweep reserve so the reserve gate below can't reject it; None
-    # unless a qualifying CONFIRM exists. Reuses every downstream rail on the bigger size.
+    # Brain conviction size-up: the brain vets this alert IN REAL TIME (synchronous ~20-40s
+    # call) so it can actually weigh in before the position is taken; falls back to the polled
+    # confirmation cache if real-time vetting is off/unavailable. On a high-conviction CONFIRM
+    # the bet is bumped toward the cap, clamped to free cash above the sweep reserve so the
+    # reserve gate below can't reject it. Every downstream rail still runs on the bigger size.
     _avail_for_sizeup = (_cached_usdc_balance - _sweep_reserve_usdc()) if _cached_usdc_balance >= 0 else -1.0
-    bet_size, _brain_conf = _apply_brain_sizeup(bet_size, market_id, bet_side, _avail_for_sizeup)
+    _brain_verdict = await _brain_vet_realtime(http_client, alert)
+    if _brain_verdict is None:
+        _brain_verdict = _brain_confirmations.get((market_id, bet_side))  # cache fallback
+    bet_size, _brain_conf = _apply_brain_sizeup(bet_size, _brain_verdict, _avail_for_sizeup)
     if _brain_conf:
         log.info("[Brain] conviction size-up: %s %s/%s → $%.2f (conf %.2f edge %+.2f)",
                  alert_id[:12], market_id[:16], bet_side, bet_size,
@@ -2927,18 +2936,17 @@ def _utc_day() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
-def _apply_brain_sizeup(base_size: float, market_id: str, bet_side: str,
+def _apply_brain_sizeup(base_size: float, info: Optional[dict],
                         avail: float) -> tuple[float, Optional[dict]]:
-    """Pure decision. When the brain has INDEPENDENTLY confirmed this exact market+side
-    with high conviction (and the per-day cap isn't spent), return a size bumped toward
-    BRAIN_SIZEUP_MAX_USDC — never below base_size, never above the cash available above
-    the sweep reserve (so the reserve gate that follows can't reject the trade), never
-    above the cap. Otherwise base_size unchanged. Second element is the confirmation dict
-    (carrying the brain's take) when a size-up applies, else None. No side effects."""
-    if not BRAIN_SIZEUP_ENABLED:
+    """Pure decision. Given the brain's verdict for THIS bet (a real-time vet result or a
+    cached confirm), size up toward BRAIN_SIZEUP_MAX_USDC when it's a high-conviction CONFIRM
+    (and the per-day cap isn't spent) — never below base_size, never above the cash available
+    above the sweep reserve (so the reserve gate that follows can't reject the trade), never
+    above the cap. Otherwise base_size unchanged. Second element is the verdict dict (carrying
+    the brain's take) when a size-up applies, else None. No side effects."""
+    if not BRAIN_SIZEUP_ENABLED or not info:
         return base_size, None
-    info = _brain_confirmations.get((market_id, bet_side))
-    if not info:
+    if info.get("verdict") != "CONFIRM":
         return base_size, None
     if info.get("confidence", 0.0) < BRAIN_SIZEUP_MIN_CONFIDENCE:
         return base_size, None
@@ -2953,6 +2961,49 @@ def _apply_brain_sizeup(base_size: float, market_id: str, bet_side: str,
     if target <= base_size + 1e-9:   # no headroom to actually size up
         return base_size, None
     return round(target, 2), info
+
+
+async def _brain_vet_realtime(http_client: httpx.AsyncClient, alert: dict) -> Optional[dict]:
+    """Ask the brain to vet this alert AT TRADE TIME (synchronous ~20-40s call). Returns the
+    verdict dict {verdict, confidence, edge, brain_prob, market_price, take} or None (disabled,
+    timeout, error, or the brain is over budget). The base trade proceeds regardless — this only
+    governs the conviction size-up."""
+    if not BRAIN_REALTIME_VET_ENABLED:
+        return None
+    body = {
+        "alert_id": alert.get("alert_id", ""),
+        "market_id": alert.get("market_id", ""),
+        "market_question": alert.get("market_question") or "",
+        "bet_side": alert.get("bet_side", ""),
+        "bet_price_at_alert": alert.get("bet_price_at_alert"),
+        "market_category": alert.get("market_category") or "",
+        "hours_to_close_at_alert": alert.get("hours_to_close_at_alert"),
+    }
+    try:
+        resp = await http_client.post(
+            f"{RAILWAY_API_URL}/api/brain/vet", headers=_headers(), json=body,
+            timeout=BRAIN_VET_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.info("[Brain] real-time vet unavailable (%s) — base size", exc)
+        return None
+    if not isinstance(data, dict) or not data.get("ok"):
+        reason = data.get("reason", "no verdict") if isinstance(data, dict) else "bad response"
+        log.info("[Brain] real-time vet returned no verdict (%s) — base size", reason)
+        return None
+    log.info("[Brain] real-time vet: %s conf=%.2f edge=%+.2f for %s",
+             data.get("verdict"), float(data.get("confidence") or 0.0),
+             float(data.get("edge") or 0.0), (alert.get("alert_id") or "")[:12])
+    return {
+        "verdict": data.get("verdict"),
+        "confidence": float(data.get("confidence") or 0.0),
+        "edge": float(data.get("edge") or 0.0),
+        "brain_prob": float(data.get("brain_prob") or 0.0),
+        "market_price": float(data.get("market_price") or 0.0),
+        "take": (data.get("take") or "")[:300],
+    }
 
 
 async def _poll_brain_confirmations(http_client: httpx.AsyncClient) -> None:
@@ -2978,6 +3029,7 @@ async def _poll_brain_confirmations(http_client: httpx.AsyncClient) -> None:
         if not mid or not side:
             continue
         cache[(mid, side)] = {
+            "verdict": "CONFIRM",   # the endpoint only returns CONFIRM+act rows
             "confidence": float(r.get("confidence") or 0.0),
             "edge": float(r.get("edge") or 0.0),
             "brain_prob": float(r.get("brain_prob") or 0.0),

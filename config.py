@@ -424,12 +424,20 @@ BRAIN_EFFORT: str = os.getenv("BRAIN_EFFORT", "low")
 
 # Hard daily spend cap (USD). Token + web-search cost is tracked per call; once the
 # cap is hit, the brain stops making calls until UTC-midnight rollover.
-BRAIN_DAILY_USD_CAP: float = float(os.getenv("BRAIN_DAILY_USD_CAP", "1.00"))
+# Raised 1.00→3.00 for real-time vetting: each trade-time vet costs ~$0.05-0.10, so $1 only
+# covered ~10-14 trades/day before degrading to base-size. $3 covers ~40. Env-overridable.
+BRAIN_DAILY_USD_CAP: float = float(os.getenv("BRAIN_DAILY_USD_CAP", "3.00"))
 # Conservative pre-check estimate of one full forecast's cost (triage+research+ensemble).
 BRAIN_EST_FORECAST_USD: float = float(os.getenv("BRAIN_EST_FORECAST_USD", "0.05"))
 
 # Ensemble: N independent forecast runs → mean → (reconcile if they disagree) → calibrate.
 BRAIN_ENSEMBLE_N: int = int(os.getenv("BRAIN_ENSEMBLE_N", "3"))
+# Real-time vet (the trader calls /api/brain/vet at trade time): a SMALLER ensemble so the
+# verdict comes back fast enough to actually size the position (~20-40s vs the full pipeline).
+BRAIN_VET_ENSEMBLE_N: int = int(os.getenv("BRAIN_VET_ENSEMBLE_N", "2"))
+# Audience decision digest (to V1 Poly): how often the brain broadcasts a readable summary of
+# what it blessed / passed on, keeping the channel alive between bets.
+BRAIN_DIGEST_HOURS: float = float(os.getenv("BRAIN_DIGEST_HOURS", "4"))
 # If the ensemble's stdev exceeds this, spend one supervisor call to reconcile.
 BRAIN_RECONCILE_STD: float = float(os.getenv("BRAIN_RECONCILE_STD", "0.15"))
 # Platt/log-odds extremization coefficient (√3≈1.73 counteracts LLM hedging toward 0.5).

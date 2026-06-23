@@ -625,6 +625,89 @@ def _format_call(row: dict) -> str:
 
 
 # ===========================================================================
+# Real-time vet — called synchronously by the trader at trade time
+# ===========================================================================
+
+async def vet_alert(alert: dict) -> dict:
+    """Real-time, on-demand vet of ONE tradeable alert — called synchronously by the trader at
+    trade time so the brain actually weighs in BEFORE the position is taken (the hourly loop is
+    far too slow to action a ~30s trade). Streamlined for latency: research → small ensemble →
+    calibrate (no separate triage; the trader already wants this one). Logs to brain_forecasts
+    (source='live') for the calibration record + the audience digest, and returns the verdict
+    for the trader to size on. Respects the daily spend cap (returns ok=False on exhaustion)."""
+    import database
+    if not _enabled():
+        return {"ok": False, "reason": "brain disabled"}
+    market_id = alert.get("market_id")
+    bet_side = alert.get("bet_side")
+    try:
+        price = float(alert.get("bet_price_at_alert"))
+    except (TypeError, ValueError):
+        price = None
+    if not (market_id and bet_side) or price is None or not (0.0 < price < 1.0):
+        return {"ok": False, "reason": "unvettable alert"}
+    if not _spend.can_afford(config.BRAIN_EST_FORECAST_USD * 0.6):
+        log.info("[Brain] LIVE vet skipped — daily budget reached ($%.2f spent)", _spend.spent_today())
+        return {"ok": False, "reason": "daily budget reached", "verdict": "BUDGET"}
+
+    market = {
+        "market_id": market_id,
+        "question": alert.get("market_question") or market_id,
+        "target_label": bet_side,
+        "market_price": price,
+        "description": "(live insider alert — is this side mispriced right now?)",
+        "category": alert.get("market_category") or "unknown",
+        "hours_to_close": alert.get("hours_to_close_at_alert") or 0.0,
+        "alert_id": alert.get("alert_id"),
+    }
+    cost_before = _spend.spent_today()
+    brief, _ = await _research(market)
+    if not brief:
+        return {"ok": False, "reason": "no research produced"}
+    forecasts = []
+    for i in range(max(1, config.BRAIN_VET_ENSEMBLE_N)):
+        if not _spend.can_afford(0.0):
+            break
+        f = await _forecast_once(market, brief, i)
+        if f:
+            forecasts.append(f)
+    if not forecasts:
+        return {"ok": False, "reason": "no forecast produced"}
+
+    probs = [f["probability"] for f in forecasts]
+    raw = statistics.fmean(probs)
+    stdev = statistics.pstdev(probs) if len(probs) > 1 else 0.0
+    mean_conf = statistics.fmean(f["confidence"] for f in forecasts)
+    best = min(forecasts, key=lambda f: abs(f["probability"] - raw))
+    take = best.get("take") or ""
+    confidence = _clamp(mean_conf * (1.0 - min(0.5, 2.0 * stdev)))
+    calibrated = platt_calibrate(raw)
+    d = decide(calibrated, price, "veto", confidence=confidence)
+    kelly = kelly_fraction(calibrated, price)
+    cost = _spend.spent_today() - cost_before
+
+    row = {
+        "created_at": int(time.time()), "source": "live", "market_id": market_id,
+        "question": market["question"], "target_label": bet_side, "market_price": float(price),
+        "brain_prob_raw": float(raw), "brain_prob": float(calibrated), "confidence": float(confidence),
+        "edge": float(d["edge"]), "verdict": d["verdict"], "act": 1 if d["act"] else 0,
+        "kelly_fraction": float(kelly), "ensemble_n": len(forecasts), "prob_stdev": float(stdev),
+        "evidence": brief[:1200], "take": take,
+        "models_json": json.dumps({"forecast": config.BRAIN_FORECAST_MODEL, "mode": "live"}),
+        "cost_usd": float(cost), "alert_id": alert.get("alert_id"),
+    }
+    _insert_forecast(database, row)
+    log.info("[Brain] LIVE vet | %.45s | %s P=%.2f vs px=%.2f edge=%+.2f conf=%.2f %s%s | $%.3f",
+             market["question"], bet_side, calibrated, price, d["edge"], confidence,
+             d["verdict"], " ACT" if d["act"] else "", cost)
+    return {
+        "ok": True, "verdict": d["verdict"], "act": bool(d["act"]),
+        "confidence": float(confidence), "edge": float(d["edge"]),
+        "brain_prob": float(calibrated), "market_price": float(price), "take": take,
+    }
+
+
+# ===========================================================================
 # Market sources
 # ===========================================================================
 
@@ -760,7 +843,7 @@ def grade_resolved_forecasts() -> int:
     rows = db.execute(
         "SELECT bf.id, bf.brain_prob, bf.market_price, ao.resolution_status "
         "FROM brain_forecasts bf JOIN alert_outcomes ao ON bf.alert_id = ao.alert_id "
-        "WHERE bf.source = 'veto' AND bf.resolved_outcome IS NULL "
+        "WHERE bf.source IN ('veto', 'live') AND bf.resolved_outcome IS NULL "
         "  AND ao.resolution_status IN ('resolved_won', 'resolved_lost')"
     ).fetchall()
     n = 0
@@ -810,6 +893,50 @@ def calibration_report() -> str:
 
 
 # ===========================================================================
+# Audience decision digest — keeps V1 Poly alive between bets
+# ===========================================================================
+
+def _recent_brain_decisions(since_ts: int, limit: int = 14) -> list:
+    """Recent brain decisions (live vets + scanner ideas) for the audience digest."""
+    import database
+    rows = database.get_db().execute(
+        "SELECT question, target_label, verdict, act, edge, confidence, take, source, created_at "
+        "FROM brain_forecasts WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
+        (since_ts, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def format_brain_digest(rows) -> "str | None":
+    """Readable AUDIENCE summary (V1 Poly) of what the brain blessed and what it passed on,
+    with its reasons — gives the channel life during quiet, alert-less stretches. None when
+    there's nothing new to say."""
+    if not rows:
+        return None
+    blessed = [r for r in rows if r["verdict"] == "CONFIRM" and r["act"]]
+    passed = [r for r in rows if not (r["verdict"] == "CONFIRM" and r["act"])]
+    lines = ["🧠 <b>THE BRAIN — what I've been chewing on</b>", ""]
+    if blessed:
+        lines.append(f"✅ <b>Liked {len(blessed)}</b> enough to want extra weight on:")
+        for r in blessed[:5]:
+            lines.append(f"• <b>{html.escape(str(r['target_label'])[:34])}</b> — "
+                         f"{html.escape(str(r['question'])[:64])}")
+            if r.get("take"):
+                lines.append(f"  <i>{html.escape(str(r['take'])[:170])}</i>")
+        lines.append("")
+    if passed:
+        lines.append(f"🤔 <b>Looked at {len(passed)}, stayed flat</b> — not convinced:")
+        for r in passed[:6]:
+            lines.append(f"• <b>{html.escape(str(r['question'])[:64])}</b>")
+            if r.get("take"):
+                lines.append(f"  <i>{html.escape(str(r['take'])[:170])}</i>")
+        lines.append("")
+    lines.append("<i>just the brain thinking out loud — blessed calls get more weight on the "
+                 "book, the rest ride normal. shadow opinions, not promises.</i>")
+    return "\n".join(lines)
+
+
+# ===========================================================================
 # The loop — shadow, ops-routed, cost-capped
 # ===========================================================================
 
@@ -819,7 +946,7 @@ async def brain_loop(dry_run: bool = False) -> None:
     the hard daily spend cap), and post a daily calibration report to ops. No-ops
     cleanly when the brain is disabled (no key / BRAIN_ENABLED=false)."""
     import httpx
-    from alerter import make_research_sender
+    from alerter import make_research_sender, make_audience_sender
 
     if not _enabled():
         log.info("[Brain] disabled (BRAIN_ENABLED=%s, api_key=%s) — loop idle.",
@@ -828,11 +955,15 @@ async def brain_loop(dry_run: bool = False) -> None:
         while True:
             await asyncio.sleep(3600)
 
-    log.info("[Brain] STARTED — shadow=%s cap=$%.2f/day models=%s/%s effort=%s ensemble=%d",
+    log.info("[Brain] STARTED — shadow=%s cap=$%.2f/day models=%s/%s effort=%s ensemble=%d "
+             "(trader alerts vetted in real time via /api/brain/vet)",
              config.BRAIN_SHADOW, config.BRAIN_DAILY_USD_CAP, config.BRAIN_TRIAGE_MODEL,
              config.BRAIN_FORECAST_MODEL, config.BRAIN_EFFORT, config.BRAIN_ENSEMBLE_N)
     sender = make_research_sender()
+    audience = make_audience_sender()
     last_report_day = None
+    last_digest_ts = time.time()  # don't dump history on first boot
+    digest_interval = max(1800.0, config.BRAIN_DIGEST_HOURS * 3600)
 
     async with httpx.AsyncClient() as http_client:
         while True:
@@ -842,18 +973,29 @@ async def brain_loop(dry_run: bool = False) -> None:
                 if graded:
                     log.info("[Brain] graded %d newly-resolved forecasts", graded)
 
-                # Veto/confirm layer first (cheap, clean grading), then the scanner.
+                # SCANNER only — the trader's own alerts are now vetted in REAL TIME at trade
+                # time (vet_alert via /api/brain/vet), so the slow hourly veto source is retired.
+                # The scanner is the brain's independent idea generator (and fills the digest
+                # during quiet, alert-less stretches).
                 done = 0
-                for cand in await _veto_candidates():
-                    if done >= config.BRAIN_MAX_PER_CYCLE or not _spend.can_afford(config.BRAIN_EST_FORECAST_USD):
-                        break
-                    if await forecast_market(cand, None if dry_run else sender, http_client, "veto"):
-                        done += 1
                 for cand in await _scanner_candidates(http_client):
                     if done >= config.BRAIN_MAX_PER_CYCLE or not _spend.can_afford(config.BRAIN_EST_FORECAST_USD):
                         break
                     if await forecast_market(cand, None if dry_run else sender, http_client, "scanner"):
                         done += 1
+
+                # Audience decision digest — readable summary of recent brain calls to V1 Poly.
+                now_ts = time.time()
+                if now_ts - last_digest_ts >= digest_interval:
+                    decisions = _recent_brain_decisions(int(last_digest_ts))
+                    last_digest_ts = now_ts
+                    text = format_brain_digest(decisions)
+                    if text:
+                        if dry_run or audience is None:
+                            log.info("[Brain] audience digest:\n%s", text)
+                        else:
+                            await audience.send_message(text, http_client)
+                            log.info("[Brain] posted audience digest (%d decisions)", len(decisions))
 
                 # Daily calibration report to ops.
                 now = datetime.utcnow()
@@ -865,7 +1007,7 @@ async def brain_loop(dry_run: bool = False) -> None:
                     else:
                         await sender.send_message(text, http_client)
 
-                log.info("[Brain] cycle done — %d forecast(s), $%.3f/$%.2f spent today",
+                log.info("[Brain] cycle done — %d scanner forecast(s), $%.3f/$%.2f spent today",
                          done, _spend.spent_today(), config.BRAIN_DAILY_USD_CAP)
             except Exception as exc:
                 log.exception("[Brain] cycle error: %s", exc)
