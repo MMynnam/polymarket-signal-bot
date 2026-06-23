@@ -1606,6 +1606,32 @@ def get_open_positions_for_api() -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_brain_confirmations(since_ts: int, min_confidence: float = 0.0) -> list[dict]:
+    """High-conviction brain CONFIRM forecasts since a timestamp — the conviction signal
+    the remote trader uses to size a bet up when its own research agrees with an insider
+    alert. Returns the latest CONFIRM per (market_id, target_label), newest first."""
+    rows = get_db().execute(
+        """
+        SELECT market_id, target_label, brain_prob, market_price, edge,
+               confidence, take, alert_id, created_at
+        FROM brain_forecasts
+        WHERE verdict = 'CONFIRM' AND act = 1
+          AND confidence >= ? AND created_at >= ?
+        ORDER BY created_at DESC
+        """,
+        (min_confidence, since_ts),
+    ).fetchall()
+    seen: set = set()
+    out: list[dict] = []
+    for r in rows:
+        key = (r["market_id"], r["target_label"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(r))
+    return out
+
+
 def get_pending_trades_with_resolution() -> list[dict]:
     """
     Return filled trade_executions still pending resolution, joined with the

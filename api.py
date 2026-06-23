@@ -197,6 +197,23 @@ def get_open_positions(_key: None = Depends(_verify_api_key)):
         raise HTTPException(status_code=500, detail="Database error")
 
 
+@app.get("/api/brain/confirmations")
+def get_brain_confirmations(
+    since: Optional[int] = None,
+    min_confidence: float = 0.0,
+    _key: None = Depends(_verify_api_key),
+):
+    """High-conviction brain CONFIRM forecasts (the conviction signal the trader uses to
+    size up a bet its own research agrees with). Latest CONFIRM per (market_id, side)."""
+    if since is None:
+        since = int(time.time()) - 18 * 3600
+    try:
+        return database.get_brain_confirmations(since_ts=since, min_confidence=min_confidence)
+    except Exception as exc:
+        log.error("[API] get_brain_confirmations failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
 @app.get("/api/stats/vault")
 def get_vault_stats(_key: None = Depends(_verify_api_key)):
     """Return vault sweep history: count, total USDC swept, last sweep timestamp."""

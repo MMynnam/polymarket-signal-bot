@@ -68,6 +68,29 @@ GEOBLOCK_PAUSE_SECONDS: int = int(os.getenv("GEOBLOCK_PAUSE_SECONDS", "1800"))
 TRADING_CB_WINDOW_HOURS: float = float(os.getenv("TRADING_CB_WINDOW_HOURS", "6"))
 TRADING_CB_DRAWDOWN_PCT: float = float(os.getenv("TRADING_CB_DRAWDOWN_PCT", "0.15"))
 TRADING_MIN_SCORE: int = int(os.getenv("TRADING_MIN_SCORE", "65"))
+
+# --- Brain conviction size-up (2026-06-23) ---------------------------------
+# When the shadow LLM "brain" (Railway) has INDEPENDENTLY confirmed this exact
+# market+side with high conviction, size the trade up toward BRAIN_SIZEUP_MAX_USDC
+# — putting more weight on the bets the brain's own research agrees with, and
+# posting its rationale on the betslip. This is a confluence signal (insider alert
+# AND the brain's researched view land on the same side). SAFE BY DESIGN:
+#   • OFF by default — arm with BRAIN_SIZEUP_ENABLED=true (fly secret).
+#   • Only ever sizes the SINGLE initial trade (no follow-on top-ups → normal
+#     one-execution-per-alert accounting / resolution / P&L; nothing orphaned).
+#   • Never exceeds free cash above the sweep reserve (can't turn a fundable base
+#     trade into a skip), and is bounded per day.
+#   • Every rail still runs on the bigger size (slippage gate, reserve gate,
+#     daily-loss stop, magnitude circuit breaker, vig gate).
+# The brain is unvalidated (forward Brier vs market still accumulating), so this
+# is deliberately capped and gated — it adds weight, not leverage.
+BRAIN_SIZEUP_ENABLED: bool = os.getenv("BRAIN_SIZEUP_ENABLED", "false").lower() in ("true", "1", "yes")
+BRAIN_SIZEUP_MAX_USDC: float = float(os.getenv("BRAIN_SIZEUP_MAX_USDC", "15.0"))
+BRAIN_SIZEUP_MIN_CONFIDENCE: float = float(os.getenv("BRAIN_SIZEUP_MIN_CONFIDENCE", "0.75"))
+BRAIN_SIZEUP_MIN_EDGE: float = float(os.getenv("BRAIN_SIZEUP_MIN_EDGE", "0.12"))
+BRAIN_SIZEUP_MAX_PER_DAY: int = int(os.getenv("BRAIN_SIZEUP_MAX_PER_DAY", "5"))
+BRAIN_CONFIRM_POLL_SECONDS: int = int(os.getenv("BRAIN_CONFIRM_POLL_SECONDS", "300"))
+BRAIN_CONFIRM_LOOKBACK_HOURS: float = float(os.getenv("BRAIN_CONFIRM_LOOKBACK_HOURS", "18"))
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -274,6 +297,14 @@ _held_positions: set[tuple[str, str]] = set()  # (market_id, bet_side); per-mark
 # _held_positions at every seed/add/discard site.
 _held_side_px: dict[str, dict[str, float]] = {}
 _held_positions_seeded: bool = False  # False until startup seed succeeds
+
+# Brain conviction size-up state. _brain_confirmations: (market_id, side) ->
+# {confidence, edge, brain_prob, market_price, take} from /api/brain/confirmations,
+# refreshed every BRAIN_CONFIRM_POLL_SECONDS. Daily counter bounds sized-up bets.
+_brain_confirmations: dict[tuple[str, str], dict] = {}
+_last_brain_confirm_poll: float = 0.0
+_brain_sizeups_today: int = 0
+_brain_sizeup_day: str = ""
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -1896,10 +1927,12 @@ def _build_slip_text(
     fill_price: float,
     size: float,
     bet_no: Optional[int] = None,
+    brain_take: Optional[str] = None,
 ) -> str:
     """Pure betslip card (feed v2). One bet = one slip: number, odds word, the line,
     stake → payout, one rotating banter line. No score, no bank line, no link clutter
-    (the market link rides as an inline button)."""
+    (the market link rides as an inline button). When the brain sized this bet up, its
+    rationale rides on the slip — bigger bet + the reasoning, in the channel it's taken."""
     import html as _html
 
     profit_if_win = (size / fill_price) - size if fill_price and fill_price > 0 else 0.0
@@ -1910,12 +1943,14 @@ def _build_slip_text(
     banter   = _pick_line(_SLIP_BANTER.get(key) or _SLIP_BANTER["mystery"], seed)
     price_c  = f"{fill_price*100:.0f}¢" if fill_price and fill_price > 0 else "?¢"
     no_bit   = f" #{bet_no}" if bet_no else ""
+    brain_line = (f"\n\n🧠 <b>brain conviction — sized up</b>\n<i>{_html.escape(str(brain_take)[:240])}</i>"
+                  if brain_take else "")
 
     return (
         f"🎟 <b>BET{no_bit}</b> · {word}\n"
         f"<b>{safe_side}</b> — {safe_q}\n\n"
         f"{price_c} · ${size:.2f} riding to win <b>${profit_if_win:.2f}</b>\n"
-        f"<i>{banter}</i>"
+        f"<i>{banter}</i>{brain_line}"
     )
 
 
@@ -1933,14 +1968,15 @@ async def _notify_trade_filled(
     score_breakdown_json: Optional[str] = None,
     alert_id: str = "",
     bet_no: Optional[int] = None,
+    brain_take: Optional[str] = None,
 ) -> None:
     # AUDIENCE betslip — feed v2. SILENT push (notification discipline: anticipation is
     # browsable, results buzz). The slip's message_id is remembered so the settle threads
     # under it as a reply and each bet reads as one self-contained card.
     # (score / slippage / alert_created_at / score_breakdown_json kept in the signature
     # for callers + ops parity, intentionally unused here — the score is dead, long live
-    # the price.)
-    text = _build_slip_text(market_q, bet_side, fill_price, size, bet_no)
+    # the price.) brain_take, when present, adds the brain's conviction rationale.
+    text = _build_slip_text(market_q, bet_side, fill_price, size, bet_no, brain_take=brain_take)
     buttons = [("⚡ watch it live", str(market_url))] if market_url else None
     msg_id = await _send_telegram(http_client, text, silent=True, buttons=buttons)
     _remember_slip(alert_id, msg_id)
@@ -2496,7 +2532,7 @@ async def _execute_trade(
     from py_clob_client_v2.order_utils.model.side import Side
     from py_clob_client_v2.exceptions import PolyException
 
-    global _session_avg_bet, _cached_usdc_balance
+    global _session_avg_bet, _cached_usdc_balance, _brain_sizeups_today
 
     alert_id    = alert["alert_id"]
     market_id   = alert["market_id"]
@@ -2557,6 +2593,17 @@ async def _execute_trade(
         return
 
     bet_size = await _calculate_bet_size(http_client, stats, score=score)
+
+    # Brain conviction size-up: bump toward the cap when the brain has INDEPENDENTLY
+    # confirmed this exact market+side with high conviction (a confluence signal). Clamped
+    # to free cash above the sweep reserve so the reserve gate below can't reject it; None
+    # unless a qualifying CONFIRM exists. Reuses every downstream rail on the bigger size.
+    _avail_for_sizeup = (_cached_usdc_balance - _sweep_reserve_usdc()) if _cached_usdc_balance >= 0 else -1.0
+    bet_size, _brain_conf = _apply_brain_sizeup(bet_size, market_id, bet_side, _avail_for_sizeup)
+    if _brain_conf:
+        log.info("[Brain] conviction size-up: %s %s/%s → $%.2f (conf %.2f edge %+.2f)",
+                 alert_id[:12], market_id[:16], bet_side, bet_size,
+                 _brain_conf["confidence"], _brain_conf["edge"])
 
     # Reserve gate: keep the operating floor (and any in-flight sweep) unbet so the vault
     # sweep's cash survives the 1h timelock instead of being re-bet and self-cancelling.
@@ -2820,6 +2867,10 @@ async def _execute_trade(
                 bet_no = None
         except Exception:
             bet_no = None
+        # Brain conviction: count the sized-up bet (bounds the per-day cap) and carry the
+        # brain's rationale onto the betslip — the bet AND its reasoning land together.
+        if _brain_conf:
+            _brain_sizeups_today += 1
         await _notify_trade_filled(
             http_client, market_q, bet_side,
             fill_price or current_price or price_alert,
@@ -2828,6 +2879,7 @@ async def _execute_trade(
             score_breakdown_json=alert.get("score_breakdown_json"),
             alert_id=alert_id,
             bet_no=bet_no,
+            brain_take=(_brain_conf or {}).get("take") if _brain_conf else None,
         )
     elif status == "error" and _is_geoblock(error_msg):
         # Geoblock: trip a circuit-breaker so we stop hammering POST /order, and alert
@@ -2865,6 +2917,75 @@ def _opposite_side_vig(new_px, held_sides: dict, new_side: str,
         return False, 0.0
     worst = max(others)  # the held side that makes the tightest (most -EV) pair
     return (new_px + worst) > cap, new_px + worst
+
+
+# ---------------------------------------------------------------------------
+# Brain conviction size-up
+# ---------------------------------------------------------------------------
+
+def _utc_day() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _apply_brain_sizeup(base_size: float, market_id: str, bet_side: str,
+                        avail: float) -> tuple[float, Optional[dict]]:
+    """Pure decision. When the brain has INDEPENDENTLY confirmed this exact market+side
+    with high conviction (and the per-day cap isn't spent), return a size bumped toward
+    BRAIN_SIZEUP_MAX_USDC — never below base_size, never above the cash available above
+    the sweep reserve (so the reserve gate that follows can't reject the trade), never
+    above the cap. Otherwise base_size unchanged. Second element is the confirmation dict
+    (carrying the brain's take) when a size-up applies, else None. No side effects."""
+    if not BRAIN_SIZEUP_ENABLED:
+        return base_size, None
+    info = _brain_confirmations.get((market_id, bet_side))
+    if not info:
+        return base_size, None
+    if info.get("confidence", 0.0) < BRAIN_SIZEUP_MIN_CONFIDENCE:
+        return base_size, None
+    if abs(info.get("edge", 0.0)) < BRAIN_SIZEUP_MIN_EDGE:
+        return base_size, None
+    if _brain_sizeups_today >= BRAIN_SIZEUP_MAX_PER_DAY:
+        return base_size, None
+    ceiling = BRAIN_SIZEUP_MAX_USDC
+    if avail >= 0:
+        ceiling = min(ceiling, avail)
+    target = max(base_size, ceiling)
+    if target <= base_size + 1e-9:   # no headroom to actually size up
+        return base_size, None
+    return round(target, 2), info
+
+
+async def _poll_brain_confirmations(http_client: httpx.AsyncClient) -> None:
+    """Refresh the brain confirmation cache from the Railway API. Best-effort: on any
+    error the previous cache is kept (a missing endpoint just means no size-ups). Rolls
+    the per-day sized-up-bet counter at UTC midnight."""
+    global _brain_confirmations, _brain_sizeups_today, _brain_sizeup_day
+    today = _utc_day()
+    if today != _brain_sizeup_day:
+        _brain_sizeup_day = today
+        _brain_sizeups_today = 0
+    if not BRAIN_SIZEUP_ENABLED:
+        return
+    since = int(time.time() - BRAIN_CONFIRM_LOOKBACK_HOURS * 3600)
+    rows = await _api_get(http_client, "/api/brain/confirmations",
+                          params={"since": since, "min_confidence": BRAIN_SIZEUP_MIN_CONFIDENCE})
+    if not isinstance(rows, list):
+        return
+    cache: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        mid = r.get("market_id")
+        side = r.get("target_label")
+        if not mid or not side:
+            continue
+        cache[(mid, side)] = {
+            "confidence": float(r.get("confidence") or 0.0),
+            "edge": float(r.get("edge") or 0.0),
+            "brain_prob": float(r.get("brain_prob") or 0.0),
+            "market_price": float(r.get("market_price") or 0.0),
+            "take": (r.get("take") or "")[:300],
+        }
+    _brain_confirmations = cache
+    log.info("[Brain] confirmation cache refreshed: %d high-conviction CONFIRM(s)", len(cache))
 
 
 async def _seed_held_positions(http_client: httpx.AsyncClient) -> None:
@@ -3115,7 +3236,7 @@ async def _check_and_redeem(http_client: httpx.AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling, _current_tier, _cb_pnl_history, _cached_usdc_balance, _session_avg_bet, _held_positions, _held_positions_seeded
+    global _wallet_address, _last_resolution_check, _last_redemption_check, _last_positions_summary, _sweep_state, _sweep_paused_at, _sweep_intended_amount, _sweep_last_date, _current_max_positions, _legacy_max_positions_ceiling, _current_tier, _cb_pnl_history, _cached_usdc_balance, _session_avg_bet, _held_positions, _held_positions_seeded, _last_brain_confirm_poll
 
     if not RAILWAY_API_URL:
         log.critical("RAILWAY_API_URL is not set — exiting")
@@ -3242,6 +3363,12 @@ async def main() -> None:
                 if now - _last_resolution_check >= _RESOLUTION_POLL_INTERVAL:
                     await _check_pending_resolutions(http_client)
                     _last_resolution_check = now
+
+                # Brain confirmation poll — refresh the conviction cache that drives the
+                # capped size-up. No-op when BRAIN_SIZEUP_ENABLED is off.
+                if now - _last_brain_confirm_poll >= BRAIN_CONFIRM_POLL_SECONDS:
+                    await _poll_brain_confirmations(http_client)
+                    _last_brain_confirm_poll = now
 
                 # Vault sweep — runs every cycle. In idle state the function returns
                 # immediately unless it's the configured daily sweep hour and the
