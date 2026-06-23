@@ -93,6 +93,32 @@ def test_unknown_balance_allows_cap():
     print("  [ok] unknown balance (-1) → cap allowed (reserve gate still runs after)")
 
 
+def _arm_veto(enabled=True):
+    tr.BRAIN_VETO_SKIP_ENABLED = enabled
+    tr.BRAIN_VETO_MIN_CONFIDENCE = 0.50
+    tr.BRAIN_VETO_MIN_EDGE = 0.10
+
+
+def test_veto_skip_decision():
+    _arm_veto(True)
+    # strong veto: VETO, confident, side overpriced by >= 10pp → skip
+    strong = {"verdict": "VETO", "confidence": 0.60, "edge": -0.15}
+    assert tr._brain_skip_veto(strong) is True
+    # not a veto → never skips
+    assert tr._brain_skip_veto({"verdict": "CONFIRM", "confidence": 0.9, "edge": 0.3}) is False
+    assert tr._brain_skip_veto({"verdict": "NEUTRAL", "confidence": 0.9, "edge": -0.2}) is False
+    # weak veto: low confidence → don't skip (like the real #1059 at conf 0.45)
+    assert tr._brain_skip_veto({"verdict": "VETO", "confidence": 0.45, "edge": -0.15}) is False
+    # thin edge → don't skip
+    assert tr._brain_skip_veto({"verdict": "VETO", "confidence": 0.8, "edge": -0.05}) is False
+    # None / disabled
+    assert tr._brain_skip_veto(None) is False
+    _arm_veto(False)
+    assert tr._brain_skip_veto(strong) is False
+    _arm_veto(True)
+    print("  [ok] veto-skip: only a confident, strong-edge VETO skips; CONFIRM/NEUTRAL/weak don't")
+
+
 def test_betslip_renders_brain_verdict_on_every_vetted_slip():
     # Un-vetted bet → no brain line at all.
     plain = tr._build_slip_text("Knicks make playoffs?", "Yes", 0.40, 2.0, bet_no=7)
@@ -127,5 +153,6 @@ if __name__ == "__main__":
     test_clamped_to_available_cash()
     test_daily_cap_blocks_further_sizeups()
     test_unknown_balance_allows_cap()
+    test_veto_skip_decision()
     test_betslip_renders_brain_verdict_on_every_vetted_slip()
     print("all brain-sizeup tests passed")

@@ -96,6 +96,15 @@ BRAIN_CONFIRM_LOOKBACK_HOURS: float = float(os.getenv("BRAIN_CONFIRM_LOOKBACK_HO
 # When off, falls back to the polled confirmation cache (which rarely matches fresh alerts).
 BRAIN_REALTIME_VET_ENABLED: bool = os.getenv("BRAIN_REALTIME_VET_ENABLED", "false").lower() in ("true", "1", "yes")
 BRAIN_VET_TIMEOUT_S: float = float(os.getenv("BRAIN_VET_TIMEOUT_S", "90"))
+# Brain VETO skip (operator chose "skip high-conviction vetoes" 2026-06-23): when the real-time
+# vet strongly DISAGREES with a bet, skip it entirely — the brain gets veto power over the signal.
+# Bars are LOWER than the size-up's (0.75): declining is the safe direction — you avoid a bet, you
+# don't add money. NOTE: the fast no-web vet is humble, so strong vetoes (and thus skips) are
+# uncommon on same-day sports; lower the bars or enable BRAIN_VET_WEB_SEARCH to make it veto more.
+# The brain's veto is GRADED on resolution (via alert_outcomes), so we learn if its skips were right.
+BRAIN_VETO_SKIP_ENABLED: bool = os.getenv("BRAIN_VETO_SKIP_ENABLED", "false").lower() in ("true", "1", "yes")
+BRAIN_VETO_MIN_CONFIDENCE: float = float(os.getenv("BRAIN_VETO_MIN_CONFIDENCE", "0.50"))
+BRAIN_VETO_MIN_EDGE: float = float(os.getenv("BRAIN_VETO_MIN_EDGE", "0.10"))
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -2629,6 +2638,18 @@ async def _execute_trade(
     _brain_verdict = await _brain_vet_realtime(http_client, alert)
     if _brain_verdict is None:
         _brain_verdict = _brain_confirmations.get((market_id, bet_side))  # cache fallback
+
+    # Brain VETO: if it strongly disagrees, the brain overrules the signal — skip the bet entirely
+    # (operator-chosen). The verdict is already logged Railway-side for grading; we just don't trade.
+    if _brain_skip_veto(_brain_verdict):
+        log.info("[Brain] VETO skip: %s %s/%s — brain %.0f%% vs mkt %.0f%% conf=%.2f edge=%+.2f",
+                 alert_id[:12], market_id[:16], bet_side,
+                 (_brain_verdict.get("brain_prob") or 0.0) * 100,
+                 (_brain_verdict.get("market_price") or 0.0) * 100,
+                 _brain_verdict.get("confidence") or 0.0, _brain_verdict.get("edge") or 0.0)
+        await _notify_brain_veto_skip(http_client, alert, _brain_verdict)
+        return
+
     bet_size, _brain_conf = _apply_brain_sizeup(bet_size, _brain_verdict, _avail_for_sizeup)
     if _brain_conf:
         log.info("[Brain] conviction size-up: %s %s/%s → $%.2f (conf %.2f edge %+.2f)",
@@ -2984,6 +3005,45 @@ def _apply_brain_sizeup(base_size: float, info: Optional[dict],
     if target <= base_size + 1e-9:   # no headroom to actually size up
         return base_size, None
     return round(target, 2), info
+
+
+def _brain_skip_veto(info: Optional[dict]) -> bool:
+    """Pure decision. True when the brain's verdict is a strong-enough VETO to SKIP the bet
+    entirely: a VETO whose confidence clears BRAIN_VETO_MIN_CONFIDENCE and whose edge is at
+    least BRAIN_VETO_MIN_EDGE against the bet (brain_prob that far BELOW the market price).
+    No side effects."""
+    if not BRAIN_VETO_SKIP_ENABLED or not info:
+        return False
+    if info.get("verdict") != "VETO":
+        return False
+    if info.get("confidence", 0.0) < BRAIN_VETO_MIN_CONFIDENCE:
+        return False
+    # edge = brain_prob − market_price; a real veto is strongly negative (the side is overpriced).
+    if info.get("edge", 0.0) > -BRAIN_VETO_MIN_EDGE:
+        return False
+    return True
+
+
+async def _notify_brain_veto_skip(http_client: httpx.AsyncClient, alert: dict, verdict: dict) -> None:
+    """AUDIENCE card (V1 Poly): the brain overruled the signal and sat a bet out. Rare by design
+    (only strong vetoes), so it reads as a moment, not noise."""
+    import html as _html
+    q = _html.escape(str(alert.get("market_question") or "")[:90])
+    side = _html.escape(str(alert.get("bet_side") or ""))
+    take = _html.escape(str(verdict.get("take") or "")[:220])
+    try:
+        reads = (f"the brain reads it <b>{float(verdict['brain_prob'])*100:.0f}%</b> vs the "
+                 f"market's <b>{float(verdict['market_price'])*100:.0f}%</b>")
+    except Exception:
+        reads = "the brain strongly disagrees"
+    text = (
+        f"🧠 <b>BRAIN OVERRULE — sat this one out</b>\n\n"
+        f"<b>{side}</b> — {q}\n\n"
+        f"The signal flagged it, but {reads} — so the brain vetoed the bet.\n"
+        + (f"<i>{take}</i>\n" if take else "")
+        + "<i>the brain's call · no position taken.</i>"
+    )
+    await _send_telegram(http_client, text, silent=True)
 
 
 async def _brain_vet_realtime(http_client: httpx.AsyncClient, alert: dict) -> Optional[dict]:
