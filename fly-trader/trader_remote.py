@@ -105,6 +105,14 @@ BRAIN_VET_TIMEOUT_S: float = float(os.getenv("BRAIN_VET_TIMEOUT_S", "90"))
 BRAIN_VETO_SKIP_ENABLED: bool = os.getenv("BRAIN_VETO_SKIP_ENABLED", "false").lower() in ("true", "1", "yes")
 BRAIN_VETO_MIN_CONFIDENCE: float = float(os.getenv("BRAIN_VETO_MIN_CONFIDENCE", "0.50"))
 BRAIN_VETO_MIN_EDGE: float = float(os.getenv("BRAIN_VETO_MIN_EDGE", "0.10"))
+# Brain Picks: the brain's OWN research-driven trades (synthetic alerts with alert_id 'brain_…').
+# These bypass the insider-specific gates (soccer filter, real-time vet — it IS the brain's pick),
+# trade at a fixed tiny DISCOVERY stake, and are bounded per day. Gated separately so the brain's
+# new thin-market strategy can be armed/killed independent of insider trading. All risk rails
+# (reserve, daily-loss, circuit breaker, position cap) still apply.
+BRAIN_PICK_TRADING_ENABLED: bool = os.getenv("BRAIN_PICK_TRADING_ENABLED", "false").lower() in ("true", "1", "yes")
+BRAIN_PICK_SIZE_USDC: float = float(os.getenv("BRAIN_PICK_SIZE_USDC", "1.0"))
+BRAIN_PICK_MAX_PER_DAY: int = int(os.getenv("BRAIN_PICK_MAX_PER_DAY", "8"))
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -319,6 +327,8 @@ _brain_confirmations: dict[tuple[str, str], dict] = {}
 _last_brain_confirm_poll: float = 0.0
 _brain_sizeups_today: int = 0
 _brain_sizeup_day: str = ""
+_brain_picks_today: int = 0
+_brain_pick_day: str = ""
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -1943,6 +1953,7 @@ def _build_slip_text(
     bet_no: Optional[int] = None,
     brain_verdict: Optional[dict] = None,
     brain_sized_up: bool = False,
+    is_brain_pick: bool = False,
 ) -> str:
     """Pure betslip card (feed v2). One bet = one slip: number, odds word, the line,
     stake → payout, one rotating banter line. No score, no bank line, no link clutter
@@ -1969,18 +1980,22 @@ def _build_slip_text(
             odds_bit = f" — its read {float(brain_verdict['brain_prob'])*100:.0f}% vs market {float(brain_verdict['market_price'])*100:.0f}%"
         except Exception:
             pass
-        if brain_sized_up:
+        if is_brain_pick or v == "PICK":
+            head = f"🧠 <b>the brain's own edge</b>{odds_bit}"
+        elif brain_sized_up:
             head = "🧠 <b>BRAIN CONVICTION — sized up</b>"
         elif v == "CONFIRM":
             head = f"🧠 <b>brain agrees</b>{odds_bit}"
         elif v == "VETO":
             head = f"🧠 <b>brain leans the other way</b>{odds_bit} · riding the signal anyway"
-        else:  # NEUTRAL / anything else
-            head = f"🧠 <b>brain sees a coin-flip</b>{odds_bit} · no edge to add"
+        else:  # NEUTRAL / anything else — no edge, parking at the market price
+            head = f"🧠 <b>brain's with the market</b>{odds_bit} · no edge to add"
         brain_line = f"\n\n{head}" + (f"\n<i>{take}</i>" if take else "")
 
+    header = (f"🧠 <b>BRAIN PICK{no_bit}</b> · {word}" if is_brain_pick
+              else f"🎟 <b>BET{no_bit}</b> · {word}")
     return (
-        f"🎟 <b>BET{no_bit}</b> · {word}\n"
+        f"{header}\n"
         f"<b>{safe_side}</b> — {safe_q}\n\n"
         f"{price_c} · ${size:.2f} riding to win <b>${profit_if_win:.2f}</b>\n"
         f"<i>{banter}</i>{brain_line}"
@@ -2003,15 +2018,17 @@ async def _notify_trade_filled(
     bet_no: Optional[int] = None,
     brain_verdict: Optional[dict] = None,
     brain_sized_up: bool = False,
+    is_brain_pick: bool = False,
 ) -> None:
     # AUDIENCE betslip — feed v2. SILENT push (notification discipline: anticipation is
     # browsable, results buzz). The slip's message_id is remembered so the settle threads
     # under it as a reply and each bet reads as one self-contained card.
     # (score / slippage / alert_created_at / score_breakdown_json kept in the signature
     # for callers + ops parity, intentionally unused here — the score is dead, long live
-    # the price.) brain_verdict, when present, shows the brain's read (agree/coin-flip/disagree).
+    # the price.) brain_verdict shows the brain's read; is_brain_pick flags its OWN trade.
     text = _build_slip_text(market_q, bet_side, fill_price, size, bet_no,
-                            brain_verdict=brain_verdict, brain_sized_up=brain_sized_up)
+                            brain_verdict=brain_verdict, brain_sized_up=brain_sized_up,
+                            is_brain_pick=is_brain_pick)
     buttons = [("⚡ watch it live", str(market_url))] if market_url else None
     msg_id = await _send_telegram(http_client, text, silent=True, buttons=buttons)
     _remember_slip(alert_id, msg_id)
@@ -2567,7 +2584,7 @@ async def _execute_trade(
     from py_clob_client_v2.order_utils.model.side import Side
     from py_clob_client_v2.exceptions import PolyException
 
-    global _session_avg_bet, _cached_usdc_balance, _brain_sizeups_today
+    global _session_avg_bet, _cached_usdc_balance, _brain_sizeups_today, _brain_picks_today, _brain_pick_day
 
     alert_id    = alert["alert_id"]
     market_id   = alert["market_id"]
@@ -2576,6 +2593,9 @@ async def _execute_trade(
     price_alert = float(alert["bet_price_at_alert"])
     score       = int(alert["score"])
     token_id    = alert.get("clob_token_id")
+    # Brain Pick: the brain's OWN research-driven trade (not an insider copy). It bypasses the
+    # insider-specific gates (soccer filter, real-time vet) and trades at a fixed discovery stake.
+    _is_brain_pick = str(alert_id).startswith("brain_")
     _slug       = alert.get("market_slug")
     market_url  = f"https://polymarket.com/event/{_slug}" if _slug else None
 
@@ -2627,34 +2647,55 @@ async def _execute_trade(
     if _alert_skip_cache.get(alert_id, 0) > time.time():
         return
 
-    bet_size = await _calculate_bet_size(http_client, stats, score=score)
+    _brain_verdict = None
+    _brain_conf = None
+    if _is_brain_pick:
+        # The brain's OWN pick: gate, per-day cap, fixed discovery stake. No vet/size-up/veto —
+        # this IS the brain's researched conviction; vetting it would be circular.
+        _bp_day = _utc_day()
+        if _bp_day != _brain_pick_day:
+            _brain_pick_day = _bp_day
+            _brain_picks_today = 0
+        if not BRAIN_PICK_TRADING_ENABLED:
+            log.info("[Brain] pick %s — brain-pick trading disabled; recording skip", alert_id[:20])
+            await _record_brain_pick_skip(http_client, alert, "brain-pick trading disabled")
+            return
+        if _brain_picks_today >= BRAIN_PICK_MAX_PER_DAY:
+            log.info("[Brain] pick %s — daily pick cap reached (%d)", alert_id[:20], BRAIN_PICK_MAX_PER_DAY)
+            await _record_brain_pick_skip(http_client, alert, "daily brain-pick cap reached")
+            return
+        bet_size = BRAIN_PICK_SIZE_USDC
+        log.info("[Brain] PICK trade: %.40s buy %s @ %.2f size $%.2f",
+                 market_q, bet_side, price_alert, bet_size)
+    else:
+        bet_size = await _calculate_bet_size(http_client, stats, score=score)
 
-    # Brain conviction size-up: the brain vets this alert IN REAL TIME (synchronous ~20-40s
-    # call) so it can actually weigh in before the position is taken; falls back to the polled
-    # confirmation cache if real-time vetting is off/unavailable. On a high-conviction CONFIRM
-    # the bet is bumped toward the cap, clamped to free cash above the sweep reserve so the
-    # reserve gate below can't reject it. Every downstream rail still runs on the bigger size.
-    _avail_for_sizeup = (_cached_usdc_balance - _sweep_reserve_usdc()) if _cached_usdc_balance >= 0 else -1.0
-    _brain_verdict = await _brain_vet_realtime(http_client, alert)
-    if _brain_verdict is None:
-        _brain_verdict = _brain_confirmations.get((market_id, bet_side))  # cache fallback
+        # Brain conviction size-up: the brain vets this alert IN REAL TIME (synchronous ~20-40s
+        # call) so it can actually weigh in before the position is taken; falls back to the polled
+        # confirmation cache if real-time vetting is off/unavailable. On a high-conviction CONFIRM
+        # the bet is bumped toward the cap, clamped to free cash above the sweep reserve so the
+        # reserve gate below can't reject it. Every downstream rail still runs on the bigger size.
+        _avail_for_sizeup = (_cached_usdc_balance - _sweep_reserve_usdc()) if _cached_usdc_balance >= 0 else -1.0
+        _brain_verdict = await _brain_vet_realtime(http_client, alert)
+        if _brain_verdict is None:
+            _brain_verdict = _brain_confirmations.get((market_id, bet_side))  # cache fallback
 
-    # Brain VETO: if it strongly disagrees, the brain overrules the signal — skip the bet entirely
-    # (operator-chosen). The verdict is already logged Railway-side for grading; we just don't trade.
-    if _brain_skip_veto(_brain_verdict):
-        log.info("[Brain] VETO skip: %s %s/%s — brain %.0f%% vs mkt %.0f%% conf=%.2f edge=%+.2f",
-                 alert_id[:12], market_id[:16], bet_side,
-                 (_brain_verdict.get("brain_prob") or 0.0) * 100,
-                 (_brain_verdict.get("market_price") or 0.0) * 100,
-                 _brain_verdict.get("confidence") or 0.0, _brain_verdict.get("edge") or 0.0)
-        await _notify_brain_veto_skip(http_client, alert, _brain_verdict)
-        return
+        # Brain VETO: if it strongly disagrees, the brain overrules the signal — skip the bet entirely
+        # (operator-chosen). The verdict is already logged Railway-side for grading; we just don't trade.
+        if _brain_skip_veto(_brain_verdict):
+            log.info("[Brain] VETO skip: %s %s/%s — brain %.0f%% vs mkt %.0f%% conf=%.2f edge=%+.2f",
+                     alert_id[:12], market_id[:16], bet_side,
+                     (_brain_verdict.get("brain_prob") or 0.0) * 100,
+                     (_brain_verdict.get("market_price") or 0.0) * 100,
+                     _brain_verdict.get("confidence") or 0.0, _brain_verdict.get("edge") or 0.0)
+            await _notify_brain_veto_skip(http_client, alert, _brain_verdict)
+            return
 
-    bet_size, _brain_conf = _apply_brain_sizeup(bet_size, _brain_verdict, _avail_for_sizeup)
-    if _brain_conf:
-        log.info("[Brain] conviction size-up: %s %s/%s → $%.2f (conf %.2f edge %+.2f)",
-                 alert_id[:12], market_id[:16], bet_side, bet_size,
-                 _brain_conf["confidence"], _brain_conf["edge"])
+        bet_size, _brain_conf = _apply_brain_sizeup(bet_size, _brain_verdict, _avail_for_sizeup)
+        if _brain_conf:
+            log.info("[Brain] conviction size-up: %s %s/%s → $%.2f (conf %.2f edge %+.2f)",
+                     alert_id[:12], market_id[:16], bet_side, bet_size,
+                     _brain_conf["confidence"], _brain_conf["edge"])
 
     # Reserve gate: keep the operating floor (and any in-flight sweep) unbet so the vault
     # sweep's cash survives the 1h timelock instead of being re-bet and self-cancelling.
@@ -2919,10 +2960,12 @@ async def _execute_trade(
         except Exception:
             bet_no = None
         # Brain: count the sized-up bet (bounds the per-day cap) and carry the brain's read
-        # onto the betslip — whether it agreed, saw a coin-flip, or disagreed, its verdict +
-        # reasoning land with the bet so the brain is visible on every position it vetted.
-        if _brain_conf:
+        # onto the betslip. For a Brain Pick, count it + surface its own research edge.
+        if _is_brain_pick:
+            _brain_picks_today += 1
+        elif _brain_conf:
             _brain_sizeups_today += 1
+        _slip_verdict = _brain_pick_slip_info(alert) if _is_brain_pick else _brain_verdict
         await _notify_trade_filled(
             http_client, market_q, bet_side,
             fill_price or current_price or price_alert,
@@ -2931,8 +2974,9 @@ async def _execute_trade(
             score_breakdown_json=alert.get("score_breakdown_json"),
             alert_id=alert_id,
             bet_no=bet_no,
-            brain_verdict=_brain_verdict,
+            brain_verdict=_slip_verdict,
             brain_sized_up=bool(_brain_conf),
+            is_brain_pick=_is_brain_pick,
         )
     elif status == "error" and _is_geoblock(error_msg):
         # Geoblock: trip a circuit-breaker so we stop hammering POST /order, and alert
@@ -3044,6 +3088,39 @@ async def _notify_brain_veto_skip(http_client: httpx.AsyncClient, alert: dict, v
         + "<i>the brain's call · no position taken.</i>"
     )
     await _send_telegram(http_client, text, silent=True)
+
+
+def _brain_pick_slip_info(alert: dict) -> Optional[dict]:
+    """Build the betslip 'verdict' for a Brain Pick from its stored research (score_breakdown_json):
+    the brain's prob on the side it bought, the entry price, the edge, and the take."""
+    try:
+        b = json.loads(alert.get("score_breakdown_json") or "{}")
+    except Exception:
+        b = {}
+    return {
+        "verdict": "PICK",
+        "take": b.get("take") or "",
+        "brain_prob": float(b.get("brain_prob") or 0.0),
+        "market_price": float(alert.get("bet_price_at_alert") or 0.0),
+        "edge": float(b.get("edge") or 0.0),
+    }
+
+
+async def _record_brain_pick_skip(http_client: httpx.AsyncClient, alert: dict, reason: str) -> None:
+    """Record a 'skipped' trade_execution for a Brain Pick we won't take (gate off / daily cap),
+    so it drops out of the tradeable feed instead of re-appearing every cycle. No audience noise."""
+    try:
+        await _api_post(http_client, "/api/trades", {
+            "alert_id": alert.get("alert_id", ""),
+            "market_id": alert.get("market_id", ""),
+            "market_question": alert.get("market_question") or "",
+            "clob_token_id": alert.get("clob_token_id") or "UNKNOWN",
+            "bet_side": alert.get("bet_side", ""),
+            "bet_price_intended": float(alert.get("bet_price_at_alert") or 0.0),
+            "size_usdc": 0.0, "status": "skipped", "error_message": reason,
+        })
+    except Exception as exc:
+        log.debug("[Brain] pick skip-record failed: %s", exc)
 
 
 async def _brain_vet_realtime(http_client: httpx.AsyncClient, alert: dict) -> Optional[dict]:

@@ -589,6 +589,14 @@ async def forecast_market(market: dict, sender, http_client, source: str):
             await sender.send_message(_format_call(row), http_client)
         except Exception as exc:
             log.warning("[Brain] ops post failed: %s", exc)
+
+    # BRAIN PICK: if this scanner forecast is a high-conviction tradeable edge on a thin/obscure
+    # market, emit it as a token-safe synthetic alert the trader can take at discovery stakes.
+    if source == "scanner" and config.BRAIN_PICK_ENABLED:
+        try:
+            _emit_brain_pick(market, calibrated, confidence, take)
+        except Exception as exc:
+            log.warning("[Brain] pick emit error: %s", exc)
     return row
 
 
@@ -806,9 +814,13 @@ def _scanner_market(m: dict, now: datetime):
 
     outcomes = _jl(m.get("outcomes"))
     prices = _jl(m.get("outcomePrices"))
+    tokens = _jl(m.get("clobTokenIds"))
     if not (isinstance(outcomes, list) and isinstance(prices, list)) or len(outcomes) != 2 or len(prices) != 2:
         return None  # binary markets only
+    # Brain Picks require resolvable token ids parallel to outcomes (token-safe side selection).
+    tradeable = isinstance(tokens, list) and len(tokens) == 2 and all(tokens)
     p0 = _parse_float(prices[0])
+    p1 = _parse_float(prices[1])
     if p0 is None or not (config.BRAIN_SCAN_MIN_PRICE <= p0 <= config.BRAIN_SCAN_MAX_PRICE):
         return None
 
@@ -837,7 +849,86 @@ def _scanner_market(m: dict, now: datetime):
         "category": m.get("category") or "unknown",
         "hours_to_close": hours,
         "_volume": vol,
+        # Brain Pick fields (token-safe trading): the outcome labels, their prices, the
+        # parallel CLOB token ids, end date, neg_risk + slug, and the raw market for upsert.
+        "tradeable": tradeable,
+        "outcomes": [str(outcomes[0]), str(outcomes[1])],
+        "prices": [p0, p1 if p1 is not None else (1.0 - p0)],
+        "clob_token_ids": [str(tokens[0]), str(tokens[1])] if tradeable else None,
+        "end_date": end_raw,
+        "neg_risk": bool(m.get("negRisk")) if m.get("negRisk") is not None else None,
+        "slug": m.get("_event_slug") or m.get("slug"),
+        "raw": m,
     }
+
+
+# ===========================================================================
+# Brain Picks — the brain's own research-driven trades on thin/obscure markets
+# ===========================================================================
+
+def _brain_pick_side(market: dict, brain_prob: float):
+    """Pure, token-SAFE buy-side selection. brain_prob is the calibrated P(outcomes[0]).
+    Returns the side the brain thinks is underpriced — the outcome label, its parallel CLOB
+    token id, its current price, and the brain's edge on THAT side (>= the other side's edge).
+    Returns None if the market isn't tradeable (no token ids). The outcome↔token mapping is
+    by index (both come parallel from the same Gamma market), so the side is never inverted."""
+    if not market.get("tradeable"):
+        return None
+    outcomes = market.get("outcomes") or []
+    prices = market.get("prices") or []
+    tokens = market.get("clob_token_ids") or []
+    if len(outcomes) != 2 or len(prices) != 2 or len(tokens) != 2:
+        return None
+    p0, p1 = float(prices[0]), float(prices[1])
+    edge0 = brain_prob - p0              # >0 ⇒ outcomes[0] underpriced
+    edge1 = (1.0 - brain_prob) - p1      # >0 ⇒ outcomes[1] underpriced
+    idx, edge = (0, edge0) if edge0 >= edge1 else (1, edge1)
+    return {
+        "buy_side": str(outcomes[idx]),
+        "buy_token": str(tokens[idx]),
+        "buy_price": float(prices[idx]),
+        "edge": float(edge),
+        "brain_prob_side": float(brain_prob if idx == 0 else 1.0 - brain_prob),
+    }
+
+
+def _emit_brain_pick(market: dict, calibrated: float, confidence: float, take: str) -> bool:
+    """If the scanner forecast is a high-conviction tradeable edge, write it as a synthetic
+    alert_outcomes row (a Brain Pick) so the trader takes it via the PROVEN token-safe path
+    (resolve_token_id_for_side + the normal order/resolution machinery). Returns True if emitted."""
+    import database
+    pick = _brain_pick_side(market, calibrated)
+    if not pick:
+        return False
+    if pick["edge"] < config.BRAIN_PICK_MIN_EDGE or confidence < config.BRAIN_PICK_MIN_CONFIDENCE:
+        return False
+    ts = int(time.time())
+    alert_id = f"brain_{market['market_id']}_{ts}"
+    # Ensure the market is in `markets` so resolve_token_id_for_side has clob_token_ids + outcomes.
+    raw = dict(market.get("raw") or {})
+    raw.setdefault("outcomes", market["outcomes"])
+    if market.get("neg_risk") is not None:
+        raw.setdefault("negRisk", market["neg_risk"])
+    if market.get("slug"):
+        raw.setdefault("_event_slug", market["slug"])
+    database.upsert_market(
+        condition_id=market["market_id"], title=market["question"],
+        clob_token_ids=market["clob_token_ids"], end_date=market.get("end_date"),
+        raw_json=raw, active=True,
+    )
+    database.insert_alert_outcome(
+        alert_id=alert_id, market_id=market["market_id"], market_question=market["question"],
+        wallet_address="brain", score=config.BRAIN_PICK_SCORE,
+        score_breakdown_json=json.dumps({"source": "brain_pick", "edge": round(pick["edge"], 4),
+                                         "confidence": round(confidence, 3),
+                                         "brain_prob": round(pick["brain_prob_side"], 4),
+                                         "take": (take or "")[:300]}),
+        bet_side=pick["buy_side"], bet_price_at_alert=pick["buy_price"], bet_size_usd=0.0,
+        market_category="brain", hours_to_close_at_alert=market.get("hours_to_close"),
+    )
+    log.info("[Brain] PICK emitted: %.45s | buy %s @ %.2f | edge=%+.2f conf=%.2f",
+             market["question"], pick["buy_side"], pick["buy_price"], pick["edge"], confidence)
+    return True
 
 
 # ===========================================================================

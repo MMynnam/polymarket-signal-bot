@@ -113,6 +113,33 @@ def test_spend_tracker_cap_and_cost():
     print("  [ok] spend tracker: correct per-model cost, web-search cost, cap enforcement")
 
 
+def _mkt(outcomes, prices, tokens, tradeable=True):
+    return {"tradeable": tradeable, "outcomes": outcomes, "prices": prices, "clob_token_ids": tokens}
+
+
+def test_brain_pick_side_buys_the_underpriced_side_with_correct_token():
+    YES, NO = "Yes", "No"
+    T0, T1 = "tokenYES", "tokenNO"
+    # outcomes[0] underpriced: brain 70% vs price 50% → buy Yes (token0)
+    p = brain._brain_pick_side(_mkt([YES, NO], [0.50, 0.50], [T0, T1]), 0.70)
+    assert p["buy_side"] == YES and p["buy_token"] == T0 and abs(p["buy_price"] - 0.50) < 1e-9
+    assert abs(p["edge"] - 0.20) < 1e-9 and abs(p["brain_prob_side"] - 0.70) < 1e-9
+    # outcomes[1] underpriced: brain 30% on Yes → buy No (token1), edge on No side
+    p = brain._brain_pick_side(_mkt([YES, NO], [0.50, 0.50], [T0, T1]), 0.30)
+    assert p["buy_side"] == NO and p["buy_token"] == T1
+    assert abs(p["edge"] - 0.20) < 1e-9 and abs(p["brain_prob_side"] - 0.70) < 1e-9
+    # asymmetric prices: brain 40% on Yes, prices [0.55,0.45] → No is underpriced (0.60 vs 0.45)
+    p = brain._brain_pick_side(_mkt([YES, NO], [0.55, 0.45], [T0, T1]), 0.40)
+    assert p["buy_side"] == NO and p["buy_token"] == T1 and abs(p["buy_price"] - 0.45) < 1e-9
+    assert abs(p["edge"] - 0.15) < 1e-9
+    # token order must follow the chosen side, never default to token[0] (the historic bug)
+    p = brain._brain_pick_side(_mkt(["Up", "Down"], [0.20, 0.80], ["tA", "tB"]), 0.10)
+    assert p["buy_side"] == "Down" and p["buy_token"] == "tB"   # Down underpriced (0.90 vs 0.80)
+    # not tradeable (no token ids) → None
+    assert brain._brain_pick_side(_mkt([YES, NO], [0.5, 0.5], [T0, T1], tradeable=False), 0.7) is None
+    print("  [ok] brain pick: buys the underpriced side with the index-correct token (no side bug)")
+
+
 def test_clamp_guards_bad_model_output():
     assert brain._clamp(1.4) == 1.0
     assert brain._clamp(-0.2) == 0.0
@@ -128,5 +155,6 @@ if __name__ == "__main__":
     test_decide_verdicts()
     test_brier_and_aggregate()
     test_spend_tracker_cap_and_cost()
+    test_brain_pick_side_buys_the_underpriced_side_with_correct_token()
     test_clamp_guards_bad_model_output()
     print("all brain tests passed")

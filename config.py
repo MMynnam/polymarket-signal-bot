@@ -444,6 +444,20 @@ BRAIN_DIGEST_HOURS: float = float(os.getenv("BRAIN_DIGEST_HOURS", "4"))
 # market price (~8s, ~$0.02). The hourly SCANNER still web-researches its independent ideas, where
 # latency doesn't matter. Set true to web-research each vet (accepting the latency/cost/timeout risk).
 BRAIN_VET_WEB_SEARCH: bool = os.getenv("BRAIN_VET_WEB_SEARCH", "false").lower() in ("true", "1", "yes")
+
+# --- Brain Picks: the brain's OWN research-driven trades on thin/obscure markets ---
+# The real unlock. The scanner web-researches thin/obscure markets (where LLM forecasting
+# genuinely beats the price, per AIA Forecaster) and, when it finds a high-conviction edge,
+# emits a token-SAFE synthetic alert the trader can take at DISCOVERY stakes. This is a NEW
+# strategy, separate from the no-edge insider-sports path. Unvalidated → tiny stakes + high bar
+# + gated; graded forward like any pick. Set BRAIN_PICK_ENABLED to have the scanner emit picks.
+BRAIN_PICK_ENABLED: bool = os.getenv("BRAIN_PICK_ENABLED", "false").lower() in ("true", "1", "yes")
+# Minimum CALIBRATED edge (brain's prob − price, on the side it would buy) to emit a pick.
+BRAIN_PICK_MIN_EDGE: float = float(os.getenv("BRAIN_PICK_MIN_EDGE", "0.08"))
+# Minimum confidence (web-researched, so it can clear a real bar — unlike the humble no-web vet).
+BRAIN_PICK_MIN_CONFIDENCE: float = float(os.getenv("BRAIN_PICK_MIN_CONFIDENCE", "0.60"))
+# Score stamped on the synthetic alert so it clears the trader's min-score + premium-tier gates.
+BRAIN_PICK_SCORE: int = int(os.getenv("BRAIN_PICK_SCORE", "90"))
 # If the ensemble's stdev exceeds this, spend one supervisor call to reconcile.
 BRAIN_RECONCILE_STD: float = float(os.getenv("BRAIN_RECONCILE_STD", "0.15"))
 # Platt/log-odds extremization coefficient (√3≈1.73 counteracts LLM hedging toward 0.5).
