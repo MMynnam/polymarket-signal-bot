@@ -385,6 +385,9 @@ _held_event_exposure: dict = {}
 # In-process; a restart just resets the baselines to entry (worst case: one repeat card).
 _sweat_last_px: dict = {}
 _last_sweat_check: float = 0.0
+# Tokens whose orderbook is GONE (market ended, awaiting redemption) — 404 forever; stop
+# re-polling them every sweat cycle. Cleared on restart.
+_sweat_dead_tokens: set = set()
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -2075,12 +2078,15 @@ async def _check_sweat_cards(clob_client, http_client: httpx.AsyncClient) -> Non
             token = p.get("clob_token_id")
             entry = p.get("bet_price_filled") or p.get("bet_price_intended")
             aid = p.get("alert_id") or ""
-            if not token or not entry or not aid:
+            if not token or not entry or not aid or token in _sweat_dead_tokens:
                 continue
             try:
                 resp = await asyncio.to_thread(clob_client.get_price, token, "BUY")
                 cur = float(resp.get("price") if isinstance(resp, dict) else resp)
-            except Exception:
+            except Exception as exc:
+                # Book gone (market ended, awaiting resolution) → never poll this token again.
+                if "orderbook" in str(exc).lower() or "404" in str(exc):
+                    _sweat_dead_tokens.add(token)
                 continue
             direction = _sweat_trigger(entry, cur, _sweat_last_px.get(aid))
             if not direction:

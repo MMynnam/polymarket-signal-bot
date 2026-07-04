@@ -1043,6 +1043,10 @@ async def _scanner_candidates(http_client) -> list:
     out = []
     for event in data if isinstance(data, list) else []:
         for m in event.get("markets") or []:
+            # Gamma carries the slug on the EVENT object, not the market — inject it so
+            # sibling markets of one match group into a single research bucket.
+            if not m.get("_event_slug"):
+                m["_event_slug"] = event.get("slug") or ""
             cand = _scanner_market(m, now)
             if cand:
                 out.append(cand)
