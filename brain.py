@@ -268,9 +268,32 @@ def _billing_paused() -> bool:
     return time.time() < _billing_pause_until
 
 
+async def _send_billing_alert() -> None:
+    """One ops Telegram alert when the API runs out of credits — previously this only hit the
+    Railway logs and the operator found out days later by accident."""
+    try:
+        import httpx
+        from alerter import make_research_sender
+        sender = make_research_sender()
+        if sender is None:
+            return
+        text = (
+            "🧠⛽ <b>BRAIN OUT OF API CREDITS</b>\n\n"
+            "All brain calls are paused (auto-retry every "
+            f"{config.BRAIN_BILLING_COOLDOWN_S // 3600}h — resumes by itself once credits land).\n"
+            "Until then: no picks, no vets, no digests — the trader keeps trading at base size.\n"
+            "💳 Top up at console.anthropic.com → Plans &amp; Billing."
+        )
+        async with httpx.AsyncClient() as client:
+            await sender.send_message(text, client)
+        log.info("[Brain] posted out-of-credits ops alert")
+    except Exception as exc:
+        log.warning("[Brain] billing alert send failed: %s", exc)
+
+
 def _note_billing_error(exc) -> bool:
-    """If exc is the out-of-credits billing error, arm the cooldown (log once). Returns True
-    when it was a billing error so callers can bail without retrying."""
+    """If exc is the out-of-credits billing error, arm the cooldown (log + ops-alert once).
+    Returns True when it was a billing error so callers can bail without retrying."""
     global _billing_pause_until
     msg = str(exc).lower()
     if "credit balance is too low" not in msg and "billing" not in msg:
@@ -278,6 +301,10 @@ def _note_billing_error(exc) -> bool:
     if not _billing_paused():
         log.warning("[Brain] API credits EXHAUSTED — pausing all brain calls for %dh "
                     "(top up Anthropic credits to resume)", config.BRAIN_BILLING_COOLDOWN_S // 3600)
+        try:
+            asyncio.get_running_loop().create_task(_send_billing_alert())
+        except RuntimeError:
+            pass  # no running loop (sync/test context) — log-only fallback
     _billing_pause_until = time.time() + config.BRAIN_BILLING_COOLDOWN_S
     return True
 
@@ -1276,10 +1303,17 @@ def calibration_report() -> str:
         return (f"{label}: <b>{a['n']}</b> graded · brain <b>{a['brain']:.4f}</b> vs "
                 f"market <b>{a['market']:.4f}</b> {mark} (Δ {delta:+.4f})")
 
+    # Daily cost discipline line: what did today's thinking cost, against the hard cap?
+    day_ago = int(time.time()) - 86400
+    spent_24h = db.execute(
+        "SELECT SUM(cost_usd) c FROM brain_forecasts WHERE created_at >= ?", (day_ago,)
+    ).fetchone()["c"] or 0.0
+
     return (
         f"{head}\n\n"
         f"🔬 {_line('<b>PICKS</b> (researched, real $)', picks)}\n"
-        f"💬 {_line('vets (no-web commentary)', vets)}\n\n"
+        f"💬 {_line('vets (no-web commentary)', vets)}\n"
+        f"💸 spend last 24h: ≈<b>${spent_24h:.2f}</b> (cap ${config.BRAIN_DAILY_USD_CAP:.2f}/day)\n\n"
         f"<i>{total} forecasts logged · lower Brier = better calibrated. The PICKS line is the "
         f"graduation gate — a durable ✅ there over weeks earns bigger stakes.</i>"
     )
@@ -1299,6 +1333,61 @@ def _mean_ci(values: list) -> tuple:
         return (m, m, m)
     half = 1.96 * statistics.stdev(values) / math.sqrt(n)
     return (m, m - half, m + half)
+
+
+def brain_economics() -> dict:
+    """Is the brain PAYING FOR ITSELF? API spend (≈ from per-forecast cost attribution) vs
+    the picks' realized P&L, 7-day and lifetime, plus the whole book's 7-day P&L for context.
+    This is the operator's budget governor: BRAIN_DAILY_USD_CAP does not rise until picks
+    out-earn the spend, sustainably."""
+    import database
+    db = database.get_db()
+    wk = int(time.time()) - 7 * 86400
+
+    def _spend_since(ts):
+        r = db.execute("SELECT SUM(cost_usd) c FROM brain_forecasts WHERE created_at >= ?",
+                       (ts,)).fetchone()
+        return float(r["c"] or 0.0)
+
+    def _pick_pnl_since(ts):
+        r = db.execute(
+            "SELECT SUM(pnl) p, COUNT(*) n FROM trade_executions "
+            "WHERE alert_id LIKE 'brain_%' AND status IN ('filled','partial') "
+            "  AND resolution_status IN ('won','lost') AND resolved_at >= ?", (ts,)).fetchone()
+        return float(r["p"] or 0.0), int(r["n"] or 0)
+
+    book7 = db.execute(
+        "SELECT SUM(pnl) p FROM trade_executions "
+        "WHERE status IN ('filled','partial') AND resolution_status IN ('won','lost') "
+        "  AND resolved_at >= ?", (wk,)).fetchone()
+    pick7, pick7_n = _pick_pnl_since(wk)
+    pick_all, pick_all_n = _pick_pnl_since(0)
+    return {
+        "spend_7d": _spend_since(wk), "spend_all": _spend_since(0),
+        "pick_pnl_7d": pick7, "pick_n_7d": pick7_n,
+        "pick_pnl_all": pick_all, "pick_n_all": pick_all_n,
+        "book_pnl_7d": float(book7["p"] or 0.0),
+    }
+
+
+def _economics_section(e: dict) -> str:
+    """Render the brain-economics block (shared by the weekly scoreboard)."""
+    self_funding = e["pick_pnl_7d"] > e["spend_7d"] > 0
+    if self_funding:
+        verdict = "✅ <b>the brain is paying for itself</b> — earning more than it burns."
+    elif e["spend_7d"] <= 0:
+        verdict = "😴 no spend this week (brain idle/paused)."
+    else:
+        verdict = ("⏳ <b>not yet self-funding</b> — budget stays capped at "
+                   f"${config.BRAIN_DAILY_USD_CAP:.2f}/day until picks out-earn the spend.")
+    return (
+        f"💸 <b>BRAIN ECONOMICS</b> (does the thinking pay for itself?)\n"
+        f"  API spend: ≈<b>${e['spend_7d']:.2f}</b> 7d · ≈${e['spend_all']:.2f} lifetime\n"
+        f"  pick P&amp;L: <b>${e['pick_pnl_7d']:+.2f}</b> 7d ({e['pick_n_7d']} settled) · "
+        f"${e['pick_pnl_all']:+.2f} lifetime ({e['pick_n_all']})\n"
+        f"  whole book 7d: ${e['book_pnl_7d']:+.2f}\n"
+        f"  {verdict}"
+    )
 
 
 def scaling_scoreboard() -> str:
@@ -1354,6 +1443,7 @@ def scaling_scoreboard() -> str:
         f"💵 ROI <b>{roi_m*100:+.1f}%</b> (95% CI {roi_lo*100:+.1f}%..{roi_hi*100:+.1f}%)\n"
         f"🧮 PICKS Brier: {cal_bit}\n"
         f"⚙️ execution: {partial_pct:.0f}% partial fills\n\n"
+        f"{_economics_section(brain_economics())}\n\n"
         f"<b>STAGE 1 GATE</b> (all ✅ → raise stakes + bankroll):\n"
         f"  {_g(gate_n)} n≥40 graded ({n_g}/40)\n"
         f"  {_g(gate_roi)} ROI 95% CI floor &gt; 0\n"
