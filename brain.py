@@ -836,8 +836,10 @@ async def _scanner_candidates(http_client) -> list:
             cand = _scanner_market(m, now)
             if cand:
                 out.append(cand)
-    # Cheapest-first by volume so the long tail (thin/obscure) gets the budget.
-    out.sort(key=lambda c: c["_volume"])
+    # Soonest-to-resolve first (volume as tiebreak): every one of the picks' first 7 wins was a
+    # short-dated market, and fast resolution means fast capital turnover, fast grading, and a
+    # fast path to the statistical proof that unlocks bigger stakes. (Was cheapest-volume-first.)
+    out.sort(key=lambda c: (c["hours_to_close"] or 1e9, c["_volume"]))
     return out[: config.BRAIN_MAX_PER_CYCLE]
 
 
