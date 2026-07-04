@@ -110,6 +110,13 @@ BRAIN_VETO_MIN_EDGE: float = float(os.getenv("BRAIN_VETO_MIN_EDGE", "0.10"))
 # trade at a fixed tiny DISCOVERY stake, and are bounded per day. Gated separately so the brain's
 # new thin-market strategy can be armed/killed independent of insider trading. All risk rails
 # (reserve, daily-loss, circuit breaker, position cap) still apply.
+# Live dashboard (2026-07-04, "re-imagine the Telegram UI"): ONE pinned audience message,
+# edited in place every DASHBOARD_UPDATE_SECONDS — bank, vault, open book, today's record,
+# brain activity. Gives V1 Poly a heartbeat even when the insider stream is quiet (diagnosed:
+# between World Cup rounds 13/14 alerts were dedup repeats → 28h of channel silence).
+DASHBOARD_ENABLED: bool = os.getenv("DASHBOARD_ENABLED", "true").lower() in ("true", "1", "yes")
+DASHBOARD_UPDATE_SECONDS: int = int(os.getenv("DASHBOARD_UPDATE_SECONDS", "600"))
+
 BRAIN_PICK_TRADING_ENABLED: bool = os.getenv("BRAIN_PICK_TRADING_ENABLED", "false").lower() in ("true", "1", "yes")
 # Conviction-scaled pick stakes (2026-07-04): the picks went 7-0 (+34% ROI) at $1 flat — the
 # only strategy in this bot's history with a winning record. Stake now scales with the brain's
@@ -336,6 +343,12 @@ _brain_sizeups_today: int = 0
 _brain_sizeup_day: str = ""
 _brain_picks_today: int = 0
 _brain_pick_day: str = ""
+
+# Live dashboard state: the pinned message we edit in place. In-process only — on restart
+# we post a fresh dashboard and re-pin (the old one just stops updating; Telegram replaces
+# the pin).
+_dash_msg_id: Optional[int] = None
+_last_dash_update: float = 0.0
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -1814,6 +1827,106 @@ async def _send_telegram(
             log.warning("[Telegram] Send error: %s", exc)
             return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Live dashboard — one pinned audience message, edited in place
+# ---------------------------------------------------------------------------
+
+async def _tg_call(http_client: httpx.AsyncClient, method: str, payload: dict) -> Optional[dict]:
+    """Single best-effort Telegram Bot API call. Returns the result dict or None."""
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+    try:
+        resp = await http_client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}", json=payload, timeout=15)
+        if resp.is_success:
+            return resp.json().get("result")
+        return None
+    except Exception:
+        return None
+
+
+def _build_dashboard_text(*, bank: float, vault: float, open_n: int, cap: int, tier: str,
+                          today_w: int, today_l: int, today_pnl: float,
+                          picks_today: int, sizeups_today: int, ts_utc: str) -> str:
+    """Pure dashboard card. One glance = the whole state of the operation. Edited in place,
+    so it always carries a fresh timestamp (also defeats Telegram's 'not modified' rejection)."""
+    total = today_w + today_l
+    dots = ("🟩" * today_w + "🟥" * today_l) if 0 < total <= 12 else ""
+    if today_pnl > 0:
+        day_word = "up"
+    elif today_pnl < 0:
+        day_word = "down"
+    else:
+        day_word = "flat"
+    record_bit = f"<b>{today_w}W-{today_l}L</b> · {day_word} <b>${abs(today_pnl):.2f}</b>" if total else "<i>no settles yet</i>"
+    brain_bit = []
+    if picks_today:
+        brain_bit.append(f"{picks_today} pick{'s' if picks_today != 1 else ''}")
+    if sizeups_today:
+        brain_bit.append(f"{sizeups_today} size-up{'s' if sizeups_today != 1 else ''}")
+    brain_line = f"\n🧠 brain today: {', '.join(brain_bit)}" if brain_bit else ""
+    vault_bit = f" · 🏛 vault <b>${vault:.2f}</b>" if vault >= 0 else ""
+    return (
+        f"📟 <b>V1 POLY — LIVE BOOK</b>\n"
+        f"💰 bank <b>${bank:.2f}</b>{vault_bit}\n"
+        f"🎫 <b>{open_n}</b> open positions ({tier} {open_n}/{cap})\n"
+        f"📅 today: {record_bit} {dots}"
+        f"{brain_line}\n"
+        f"<i>auto-updates · last {ts_utc} UTC</i>"
+    )
+
+
+async def _update_dashboard(http_client: httpx.AsyncClient, stats: dict) -> None:
+    """Refresh the pinned live dashboard (rate-limited). First run posts + pins; afterwards
+    edits in place. All failures are silent-best-effort — the dashboard must never interfere
+    with trading."""
+    global _dash_msg_id, _last_dash_update
+    if not DASHBOARD_ENABLED or not TELEGRAM_CHAT_ID:
+        return
+    now = time.time()
+    if now - _last_dash_update < DASHBOARD_UPDATE_SECONDS:
+        return
+    _last_dash_update = now
+    try:
+        # Today's record from resolutions since UTC midnight (prospective only).
+        midnight = int(time.mktime(time.strptime(time.strftime("%Y-%m-%d", time.gmtime()), "%Y-%m-%d")))
+        resolved = await _api_get(http_client, "/api/trades/resolved-recent",
+                                  params={"since": midnight}) or []
+        today_w = sum(1 for r in resolved if r.get("resolution_status") == "won")
+        today_l = sum(1 for r in resolved if r.get("resolution_status") == "lost")
+        today_pnl = sum(float(r.get("pnl") or 0.0) for r in resolved)
+        open_n = int(stats.get("open_positions", 0))
+        cap = min(_current_max_positions or TRADING_NORMAL_POSITIONS_MAX, TRADING_NORMAL_POSITIONS_MAX) \
+            if _current_tier == "normal" else TRADING_PREMIUM_POSITIONS_MAX
+        text = _build_dashboard_text(
+            bank=max(_cached_usdc_balance, 0.0), vault=_cached_vault_balance,
+            open_n=open_n, cap=cap, tier=_current_tier,
+            today_w=today_w, today_l=today_l, today_pnl=today_pnl,
+            picks_today=_brain_picks_today, sizeups_today=_brain_sizeups_today,
+            ts_utc=time.strftime("%H:%M", time.gmtime()),
+        )
+        if _dash_msg_id is None:
+            result = await _tg_call(http_client, "sendMessage", {
+                "chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML",
+                "disable_notification": True, "link_preview_options": {"is_disabled": True}})
+            if result and result.get("message_id"):
+                _dash_msg_id = int(result["message_id"])
+                await _tg_call(http_client, "pinChatMessage", {
+                    "chat_id": TELEGRAM_CHAT_ID, "message_id": _dash_msg_id,
+                    "disable_notification": True})
+                log.info("[Dashboard] posted + pinned live dashboard (msg %s)", _dash_msg_id)
+        else:
+            edited = await _tg_call(http_client, "editMessageText", {
+                "chat_id": TELEGRAM_CHAT_ID, "message_id": _dash_msg_id, "text": text,
+                "parse_mode": "HTML", "link_preview_options": {"is_disabled": True}})
+            if edited is None:
+                # Message deleted or edit window closed — repost next tick.
+                log.info("[Dashboard] edit failed — will repost a fresh dashboard")
+                _dash_msg_id = None
+    except Exception as exc:
+        log.debug("[Dashboard] update error (non-fatal): %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -3678,6 +3791,9 @@ async def main() -> None:
                     log.info("[Trader] Tier transition: %s → %s", _current_tier, _tier_now)
                     await _notify_tier_transition(http_client, _tier_now, _open_now)
                     _current_tier = _tier_now
+
+                # Live dashboard: refresh the pinned audience card (rate-limited internally).
+                await _update_dashboard(http_client, stats)
 
                 block_reason = await _check_risk_limits(stats, http_client=http_client)
                 if block_reason:

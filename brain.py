@@ -237,9 +237,11 @@ class SpendTracker:
         cr = getattr(usage, "cache_read_input_tokens", 0) or 0
         return (it * pin + ot * pout + cc * pin * 1.25 + cr * pin * 0.10) / 1e6
 
-    def record_usage(self, model: str, usage) -> float:
+    def record_usage(self, model: str, usage, batch: bool = False) -> float:
         self._roll()
         cost = self.usage_cost(model, usage)
+        if batch:
+            cost *= 0.5  # Batches API: 50% discount on all token usage
         self._spent += cost
         return cost
 
@@ -327,10 +329,8 @@ def _count_web_searches(resp) -> int:
 # Claude pipeline stages
 # ===========================================================================
 
-async def _triage(market: dict):
-    """Cheap Haiku gate: is this market worth spending research budget on?
-    Returns the parsed dict or None on error/refusal."""
-    client = _get_client()
+def _triage_params(market: dict) -> dict:
+    """Complete Messages-API kwargs for one triage call (shared by sync + batch paths)."""
     sys = (
         "You are a triage filter for a prediction-market forecasting bot with a research "
         "budget. You decide whether a market is WORTH a full research forecast. Lean toward "
@@ -350,14 +350,21 @@ async def _triage(market: dict):
         f"Closes in: {market.get('hours_to_close', 0):.0f}h\n\n"
         "Worth researching?"
     )
+    return {
+        "model": config.BRAIN_TRIAGE_MODEL,
+        "max_tokens": 400,
+        "system": sys,
+        "messages": [{"role": "user", "content": user}],
+        "output_config": _output_config(_TRIAGE_SCHEMA, config.BRAIN_TRIAGE_MODEL),
+    }
+
+
+async def _triage(market: dict):
+    """Cheap Haiku gate: is this market worth spending research budget on?
+    Returns the parsed dict or None on error/refusal."""
+    client = _get_client()
     try:
-        resp = await client.messages.create(
-            model=config.BRAIN_TRIAGE_MODEL,
-            max_tokens=400,
-            system=sys,
-            messages=[{"role": "user", "content": user}],
-            output_config={"format": {"type": "json_schema", "schema": _TRIAGE_SCHEMA}},
-        )
+        resp = await client.messages.create(**_triage_params(market))
     except Exception as exc:
         if not _note_billing_error(exc):
             log.warning("[Brain] triage call failed: %s", exc)
@@ -371,11 +378,9 @@ async def _triage(market: dict):
         return None
 
 
-async def _research(market: dict):
-    """Sonnet + server-side web search → free-form evidence brief (with citations).
-    Handles the server-tool pause_turn loop. Returns (brief, n_web_searches) or
-    (None, 0). NO structured output here — web search citations forbid it."""
-    client = _get_client()
+def _research_params(market: dict) -> dict:
+    """Complete Messages-API kwargs for one research call (web search, free-form — shared by
+    sync + batch paths). NO structured output here — web-search citations forbid it."""
     sys = (
         "You are a forecasting research analyst. Given a prediction-market question, "
         "search the web for the most relevant CURRENT evidence: recent news, base rates, "
@@ -391,24 +396,31 @@ async def _research(market: dict):
         f"Closes in: {market.get('hours_to_close', 0):.0f}h\n\n"
         "Research this and write the evidence brief."
     )
-    messages = [{"role": "user", "content": user}]
-    tools = [{"type": "web_search_20260209", "name": "web_search"}]
+    return {
+        "model": config.BRAIN_FORECAST_MODEL,
+        "max_tokens": 3000,
+        "system": sys,
+        "messages": [{"role": "user", "content": user}],
+        "tools": [{"type": "web_search_20260209", "name": "web_search"}],
+        "output_config": _output_config(None, config.BRAIN_FORECAST_MODEL),
+    }
+
+
+async def _research(market: dict):
+    """Sonnet + server-side web search → free-form evidence brief (with citations).
+    Handles the server-tool pause_turn loop. Returns (brief, n_web_searches) or (None, 0)."""
+    client = _get_client()
+    params = _research_params(market)
+    messages = params["messages"]
     n_search = 0
     resp = None
     try:
         for _ in range(5):  # cap server-tool continuations
-            resp = await client.messages.create(
-                model=config.BRAIN_FORECAST_MODEL,
-                max_tokens=3000,
-                system=sys,
-                messages=messages,
-                tools=tools,
-                output_config={"effort": config.BRAIN_EFFORT},
-            )
+            resp = await client.messages.create(**{**params, "messages": messages})
             _spend.record_usage(config.BRAIN_FORECAST_MODEL, resp.usage)
             n_search += _count_web_searches(resp)
             if resp.stop_reason == "pause_turn":
-                messages.append({"role": "assistant", "content": resp.content})
+                messages = messages + [{"role": "assistant", "content": resp.content}]
                 continue
             break
     except Exception as exc:
@@ -422,11 +434,25 @@ async def _research(market: dict):
     return (brief or None), n_search
 
 
-async def _forecast_once(market: dict, brief: str, run_idx: int, model: str = None):
-    """One structured forecast run (no tools). Model defaults to the Sonnet forecast model;
-    the real-time vet passes the cheap Haiku vet model. Returns a dict or None."""
+def _parse_forecast_msg(msg):
+    """Parse one forecast response message into the ensemble dict (shared sync + batch)."""
+    if msg is None or msg.stop_reason == "refusal":
+        return None
+    try:
+        d = json.loads(_first_text(msg))
+    except Exception:
+        return None
+    return {
+        "probability": _clamp(d.get("probability")),
+        "confidence": _clamp(d.get("confidence")),
+        "factors": d.get("key_factors", [])[:4],
+        "take": (d.get("take") or "").strip()[:280],
+    }
+
+
+def _forecast_params(market: dict, brief: str, run_idx: int, model: str = None) -> dict:
+    """Complete Messages-API kwargs for one forecast run (shared by sync + batch paths)."""
     model = model or config.BRAIN_FORECAST_MODEL
-    client = _get_client()
     sys = (
         "You are the brain of a scrappy Polymarket bot whose friends watch its calls on "
         "Telegram. You have a personality: a sharp, witty prediction-market analyst — confident "
@@ -446,31 +472,28 @@ async def _forecast_once(market: dict, brief: str, run_idx: int, model: str = No
         f"Research brief:\n{brief}\n\n"
         f"Analytical pass #{run_idx + 1}: weigh the evidence from your own angle and give your probability."
     )
+    return {
+        "model": model,
+        "max_tokens": 700,
+        "system": sys,
+        "messages": [{"role": "user", "content": user}],
+        "output_config": _output_config(_FORECAST_SCHEMA, model),
+    }
+
+
+async def _forecast_once(market: dict, brief: str, run_idx: int, model: str = None):
+    """One structured forecast run (no tools). Model defaults to the Sonnet forecast model;
+    the real-time vet passes the cheap Haiku vet model. Returns a dict or None."""
+    model = model or config.BRAIN_FORECAST_MODEL
+    client = _get_client()
     try:
-        resp = await client.messages.create(
-            model=model,
-            max_tokens=700,
-            system=sys,
-            messages=[{"role": "user", "content": user}],
-            output_config=_output_config(_FORECAST_SCHEMA, model),
-        )
+        resp = await client.messages.create(**_forecast_params(market, brief, run_idx, model))
     except Exception as exc:
         if not _note_billing_error(exc):
             log.warning("[Brain] forecast call failed: %s", exc)
         return None
     _spend.record_usage(model, resp.usage)
-    if resp.stop_reason == "refusal":
-        return None
-    try:
-        d = json.loads(_first_text(resp))
-    except Exception:
-        return None
-    return {
-        "probability": _clamp(d.get("probability")),
-        "confidence": _clamp(d.get("confidence")),
-        "factors": d.get("key_factors", [])[:4],
-        "take": (d.get("take") or "").strip()[:280],
-    }
+    return _parse_forecast_msg(resp)
 
 
 async def _reconcile(market: dict, brief: str, forecasts: list):
@@ -515,6 +538,131 @@ async def _reconcile(market: dict, brief: str, forecasts: list):
     except Exception:
         return None
     return {"probability": _clamp(d.get("probability")), "confidence": _clamp(d.get("confidence"))}
+
+
+# ===========================================================================
+# Batch API scanner — same pipeline at a 50% token discount
+# ===========================================================================
+
+async def _batch_run(reqs: list) -> dict:
+    """Submit [(custom_id, params), ...] as ONE Message Batch, poll to completion, return
+    {custom_id: message} for succeeded requests. The scanner is latency-insensitive, so the
+    50% batch discount is free money. Raises on submission failure (caller falls back)."""
+    from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+    from anthropic.types.messages.batch_create_params import Request
+
+    client = _get_client()
+    batch = await client.messages.batches.create(requests=[
+        Request(custom_id=cid, params=MessageCreateParamsNonStreaming(**params))
+        for cid, params in reqs
+    ])
+    t0 = time.monotonic()
+    while True:
+        b = await client.messages.batches.retrieve(batch.id)
+        if b.processing_status == "ended":
+            break
+        if time.monotonic() - t0 > config.BRAIN_BATCH_TIMEOUT_S:
+            log.warning("[Brain] batch %s timed out after %ds — cancelling",
+                        batch.id, config.BRAIN_BATCH_TIMEOUT_S)
+            try:
+                await client.messages.batches.cancel(batch.id)
+            except Exception:
+                pass
+            break
+        await asyncio.sleep(config.BRAIN_BATCH_POLL_SECONDS)
+    out = {}
+    results = client.messages.batches.results(batch.id)
+    if hasattr(results, "__await__"):
+        results = await results
+    async for entry in results:
+        if entry.result.type == "succeeded":
+            out[entry.custom_id] = entry.result.message
+    return out
+
+
+async def _scan_cycle_batched(candidates: list, sender, http_client) -> int:
+    """One scanner cycle through the Batches API: triage batch → research batch → forecast
+    batch → finalize locally. Per-market cost is attributed from each message's usage at the
+    50% batch rate. Returns the number of markets fully forecast."""
+    cands = [c for c in candidates if not _recently_forecast(c["market_id"])]
+    cands = cands[: max(1, config.BRAIN_BATCH_MARKETS)]
+    if not cands or _billing_paused():
+        return 0
+    if not _spend.can_afford(config.BRAIN_EST_FORECAST_USD * 0.5):
+        log.info("[Brain] daily budget exhausted ($%.2f spent) — skipping batch cycle",
+                 _spend.spent_today())
+        return 0
+    mcost: dict = {c["market_id"]: 0.0 for c in cands}
+
+    # Stage 1 — triage (Haiku, cheap, all candidates in one batch).
+    res = await _batch_run([(f"t{i}", _triage_params(c)) for i, c in enumerate(cands)])
+    keep = []
+    for i, c in enumerate(cands):
+        msg = res.get(f"t{i}")
+        ok = False
+        if msg is not None:
+            mcost[c["market_id"]] += _spend.record_usage(config.BRAIN_TRIAGE_MODEL, msg.usage, batch=True)
+            if msg.stop_reason != "refusal":
+                try:
+                    ok = bool(json.loads(_first_text(msg)).get("worth_forecasting"))
+                except Exception:
+                    ok = False
+        if ok:
+            keep.append(c)
+        else:
+            log.info("[Brain] batch triage declined %.40s", c["question"])
+    if not keep:
+        return 0
+
+    # Budget guard: shrink the research fan-out to what the remaining budget covers.
+    est_each = config.BRAIN_EST_FORECAST_USD * 0.5   # batch rate
+    afford = max(1, int(_spend.remaining() / max(est_each, 0.01)))
+    keep = keep[:afford]
+
+    # Stage 2 — research (Sonnet + web search, free-form). pause_turn results still carry
+    # their accumulated text; an empty brief just drops the market this cycle.
+    res = await _batch_run([(f"r{i}", _research_params(c)) for i, c in enumerate(keep)])
+    briefs: dict = {}
+    for i, c in enumerate(keep):
+        msg = res.get(f"r{i}")
+        if msg is None:
+            continue
+        mcost[c["market_id"]] += _spend.record_usage(config.BRAIN_FORECAST_MODEL, msg.usage, batch=True)
+        mcost[c["market_id"]] += _spend.record_web_searches(_count_web_searches(msg))
+        if msg.stop_reason == "refusal":
+            continue
+        brief = _first_text(msg).strip()
+        if brief:
+            briefs[c["market_id"]] = brief
+
+    # Stage 3 — forecast ensemble (structured, no tools) for every researched market.
+    reqs = []
+    for i, c in enumerate(keep):
+        if c["market_id"] not in briefs:
+            continue
+        for j in range(max(1, config.BRAIN_ENSEMBLE_N)):
+            reqs.append((f"f{i}_{j}", _forecast_params(c, briefs[c["market_id"]], j)))
+    if not reqs:
+        return 0
+    res = await _batch_run(reqs)
+    done = 0
+    for i, c in enumerate(keep):
+        if c["market_id"] not in briefs:
+            continue
+        forecasts = []
+        for j in range(max(1, config.BRAIN_ENSEMBLE_N)):
+            msg = res.get(f"f{i}_{j}")
+            if msg is None:
+                continue
+            mcost[c["market_id"]] += _spend.record_usage(config.BRAIN_FORECAST_MODEL, msg.usage, batch=True)
+            f = _parse_forecast_msg(msg)
+            if f:
+                forecasts.append(f)
+        if forecasts:
+            await _finalize_forecast(c, briefs[c["market_id"]], forecasts, "scanner",
+                                     sender, http_client, mcost[c["market_id"]])
+            done += 1
+    return done
 
 
 # ===========================================================================
@@ -572,12 +720,25 @@ async def forecast_market(market: dict, sender, http_client, source: str):
     if not forecasts:
         return None
 
+    cost = _spend.spent_today() - cost_before
+    return await _finalize_forecast(market, brief, forecasts, source, sender, http_client, cost)
+
+
+async def _finalize_forecast(market: dict, brief: str, forecasts: list, source: str,
+                             sender, http_client, cost: float):
+    """Shared tail of the pipeline (sequential AND batched paths): aggregate the ensemble,
+    reconcile-if-divergent, calibrate, decide, persist, post high-conviction calls to ops,
+    and emit a Brain Pick when the bar clears. Returns the row dict."""
+    import database
+
     probs = [f["probability"] for f in forecasts]
     raw = statistics.fmean(probs)
     stdev = statistics.pstdev(probs) if len(probs) > 1 else 0.0
     mean_conf = statistics.fmean(f["confidence"] for f in forecasts)
 
     # Reconcile only when the runs disagree a lot (cost-efficient supervisor step).
+    # (Runs synchronously even in batch mode — it's rare and budget-gated; its cost lands in
+    # the daily total but not this row's cost_usd, which is fine for an attribution field.)
     if stdev > config.BRAIN_RECONCILE_STD and len(forecasts) > 1 and _spend.can_afford(0.0):
         rec = await _reconcile(market, brief, forecasts)
         if rec:
@@ -595,7 +756,6 @@ async def forecast_market(market: dict, sender, http_client, source: str):
     price = market["market_price"]
     d = decide(calibrated, price, source, confidence=confidence)
     kelly = kelly_fraction(calibrated, price)
-    cost = _spend.spent_today() - cost_before
 
     row = {
         "created_at": int(time.time()),
@@ -840,7 +1000,8 @@ async def _scanner_candidates(http_client) -> list:
     # short-dated market, and fast resolution means fast capital turnover, fast grading, and a
     # fast path to the statistical proof that unlocks bigger stakes. (Was cheapest-volume-first.)
     out.sort(key=lambda c: (c["hours_to_close"] or 1e9, c["_volume"]))
-    return out[: config.BRAIN_MAX_PER_CYCLE]
+    return out[: max(config.BRAIN_MAX_PER_CYCLE, config.BRAIN_BATCH_MARKETS
+                     if config.BRAIN_BATCH_ENABLED else 0)]
 
 
 def _scanner_market(m: dict, now: datetime):
@@ -1130,10 +1291,12 @@ async def brain_loop(dry_run: bool = False) -> None:
         while True:
             await asyncio.sleep(3600)
 
-    log.info("[Brain] STARTED — shadow=%s cap=$%.2f/day models=%s/%s effort=%s ensemble=%d "
-             "(trader alerts vetted in real time via /api/brain/vet)",
+    log.info("[Brain] STARTED — shadow=%s cap=$%.2f/day models=%s/%s vet=%s effort=%s ensemble=%d "
+             "batch=%s (trader alerts vetted in real time via /api/brain/vet)",
              config.BRAIN_SHADOW, config.BRAIN_DAILY_USD_CAP, config.BRAIN_TRIAGE_MODEL,
-             config.BRAIN_FORECAST_MODEL, config.BRAIN_EFFORT, config.BRAIN_ENSEMBLE_N)
+             config.BRAIN_FORECAST_MODEL, config.BRAIN_VET_MODEL, config.BRAIN_EFFORT,
+             config.BRAIN_ENSEMBLE_N,
+             f"on({config.BRAIN_BATCH_MARKETS}/cycle, 50%% off)" if config.BRAIN_BATCH_ENABLED else "off")
     sender = make_research_sender()
     audience = make_audience_sender()
     last_report_day = None
@@ -1151,13 +1314,25 @@ async def brain_loop(dry_run: bool = False) -> None:
                 # SCANNER only — the trader's own alerts are now vetted in REAL TIME at trade
                 # time (vet_alert via /api/brain/vet), so the slow hourly veto source is retired.
                 # The scanner is the brain's independent idea generator (and fills the digest
-                # during quiet, alert-less stretches).
+                # during quiet, alert-less stretches). Batched path first (50% discount, ~2x
+                # markets per dollar); any batch failure falls back to the sequential pipeline.
                 done = 0
-                for cand in await _scanner_candidates(http_client):
-                    if done >= config.BRAIN_MAX_PER_CYCLE or not _spend.can_afford(config.BRAIN_EST_FORECAST_USD):
-                        break
-                    if await forecast_market(cand, None if dry_run else sender, http_client, "scanner"):
-                        done += 1
+                batched_ok = False
+                candidates = await _scanner_candidates(http_client)
+                if config.BRAIN_BATCH_ENABLED and candidates and not _billing_paused():
+                    try:
+                        done = await _scan_cycle_batched(
+                            candidates, None if dry_run else sender, http_client)
+                        batched_ok = True   # ran to completion (0 forecasts ≠ failure)
+                    except Exception as exc:
+                        if not _note_billing_error(exc):
+                            log.warning("[Brain] batch scan failed (%s) — sequential fallback", exc)
+                if not batched_ok and not _billing_paused():
+                    for cand in candidates:
+                        if done >= config.BRAIN_MAX_PER_CYCLE or not _spend.can_afford(config.BRAIN_EST_FORECAST_USD):
+                            break
+                        if await forecast_market(cand, None if dry_run else sender, http_client, "scanner"):
+                            done += 1
 
                 # Audience decision digest — readable summary of recent brain calls to V1 Poly.
                 now_ts = time.time()

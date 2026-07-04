@@ -482,6 +482,14 @@ BRAIN_KELLY_CAP: float = float(os.getenv("BRAIN_KELLY_CAP", "0.25"))            
 # markets across the whole day so evening markets get looked at too.
 BRAIN_SCAN_INTERVAL_SECONDS: int = int(os.getenv("BRAIN_SCAN_INTERVAL_SECONDS", "7200"))
 BRAIN_MAX_PER_CYCLE: int = int(os.getenv("BRAIN_MAX_PER_CYCLE", "2"))
+# Batch API scanner (2026-07-04): the scanner runs through the Batches API at a 50% token
+# discount — it has zero latency sensitivity (2h cycles; batches typically clear in minutes to
+# ~1h), so the same $1.25/day researches ~2x the markets (~7-8/day vs ~4). Falls back to the
+# sequential path automatically if a batch fails.
+BRAIN_BATCH_ENABLED: bool = os.getenv("BRAIN_BATCH_ENABLED", "true").lower() in ("true", "1", "yes")
+BRAIN_BATCH_MARKETS: int = int(os.getenv("BRAIN_BATCH_MARKETS", "4"))       # candidates per batched cycle
+BRAIN_BATCH_POLL_SECONDS: int = int(os.getenv("BRAIN_BATCH_POLL_SECONDS", "20"))
+BRAIN_BATCH_TIMEOUT_S: int = int(os.getenv("BRAIN_BATCH_TIMEOUT_S", "2700"))  # 45 min < the 2h cycle
 BRAIN_REFORECAST_HOURS: float = float(os.getenv("BRAIN_REFORECAST_HOURS", "72"))  # don't re-forecast a market within this window
 
 # Scanner (long-tail mispricing hunt) market filters.
