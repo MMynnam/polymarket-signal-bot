@@ -140,6 +140,26 @@ def test_brain_pick_side_buys_the_underpriced_side_with_correct_token():
     print("  [ok] brain pick: buys the underpriced side with the index-correct token (no side bug)")
 
 
+def test_billing_breaker_and_output_config():
+    import time as _t
+    # billing error arms the cooldown; unrelated errors don't
+    brain._billing_pause_until = 0.0
+    assert brain._note_billing_error(Exception("Your credit balance is too low to access the Anthropic API")) is True
+    assert brain._billing_paused() is True
+    brain._billing_pause_until = 0.0
+    assert brain._note_billing_error(Exception("connection reset by peer")) is False
+    assert brain._billing_paused() is False
+    # cooldown expires
+    brain._billing_pause_until = _t.time() - 1
+    assert brain._billing_paused() is False
+    # output_config: effort only on non-Haiku models; format always when schema given
+    c = brain._output_config({"type": "object"}, "claude-haiku-4-5")
+    assert "format" in c and "effort" not in c        # Haiku rejects the effort param
+    c = brain._output_config({"type": "object"}, "claude-sonnet-4-6")
+    assert "format" in c and "effort" in c
+    print("  [ok] billing breaker arms only on credit errors; Haiku calls omit effort")
+
+
 def test_clamp_guards_bad_model_output():
     assert brain._clamp(1.4) == 1.0
     assert brain._clamp(-0.2) == 0.0
@@ -156,5 +176,6 @@ if __name__ == "__main__":
     test_brier_and_aggregate()
     test_spend_tracker_cap_and_cost()
     test_brain_pick_side_buys_the_underpriced_side_with_correct_token()
+    test_billing_breaker_and_output_config()
     test_clamp_guards_bad_model_output()
     print("all brain tests passed")

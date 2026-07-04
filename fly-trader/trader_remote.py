@@ -111,7 +111,14 @@ BRAIN_VETO_MIN_EDGE: float = float(os.getenv("BRAIN_VETO_MIN_EDGE", "0.10"))
 # new thin-market strategy can be armed/killed independent of insider trading. All risk rails
 # (reserve, daily-loss, circuit breaker, position cap) still apply.
 BRAIN_PICK_TRADING_ENABLED: bool = os.getenv("BRAIN_PICK_TRADING_ENABLED", "false").lower() in ("true", "1", "yes")
-BRAIN_PICK_SIZE_USDC: float = float(os.getenv("BRAIN_PICK_SIZE_USDC", "1.0"))
+# Conviction-scaled pick stakes (2026-07-04): the picks went 7-0 (+34% ROI) at $1 flat — the
+# only strategy in this bot's history with a winning record. Stake now scales with the brain's
+# researched edge: base + SLOPE × (edge − 0.08), capped. At the 0.08 min edge → $2; at 0.28 → $5.
+# Cap matches the $5 single-position rail. Still discovery-scale; a durable ✅ on the PICKS
+# calibration line earns the next raise.
+BRAIN_PICK_SIZE_USDC: float = float(os.getenv("BRAIN_PICK_SIZE_USDC", "2.0"))
+BRAIN_PICK_MAX_SIZE_USDC: float = float(os.getenv("BRAIN_PICK_MAX_SIZE_USDC", "5.0"))
+BRAIN_PICK_EDGE_SLOPE: float = float(os.getenv("BRAIN_PICK_EDGE_SLOPE", "15.0"))
 BRAIN_PICK_MAX_PER_DAY: int = int(os.getenv("BRAIN_PICK_MAX_PER_DAY", "8"))
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
@@ -2664,9 +2671,14 @@ async def _execute_trade(
             log.info("[Brain] pick %s — daily pick cap reached (%d)", alert_id[:20], BRAIN_PICK_MAX_PER_DAY)
             await _record_brain_pick_skip(http_client, alert, "daily brain-pick cap reached")
             return
-        bet_size = BRAIN_PICK_SIZE_USDC
-        log.info("[Brain] PICK trade: %.40s buy %s @ %.2f size $%.2f",
-                 market_q, bet_side, price_alert, bet_size)
+        # Conviction-scaled stake from the pick's researched edge (stored in the breakdown).
+        try:
+            _pick_edge = float(json.loads(alert.get("score_breakdown_json") or "{}").get("edge") or 0.0)
+        except Exception:
+            _pick_edge = 0.0
+        bet_size = _brain_pick_stake(_pick_edge)
+        log.info("[Brain] PICK trade: %.40s buy %s @ %.2f edge=%+.2f size $%.2f",
+                 market_q, bet_side, price_alert, _pick_edge, bet_size)
     else:
         bet_size = await _calculate_bet_size(http_client, stats, score=score)
 
@@ -3088,6 +3100,23 @@ async def _notify_brain_veto_skip(http_client: httpx.AsyncClient, alert: dict, v
         + "<i>the brain's call · no position taken.</i>"
     )
     await _send_telegram(http_client, text, silent=True)
+
+
+def _brain_pick_stake(edge: float, base: float = None, slope: float = None,
+                      cap: float = None) -> float:
+    """Pure conviction-scaled stake for a Brain Pick: base + slope × (edge − 0.08), clamped to
+    [base, cap]. A bigger researched edge earns a bigger (still capped) position."""
+    if base is None:
+        base = BRAIN_PICK_SIZE_USDC
+    if slope is None:
+        slope = BRAIN_PICK_EDGE_SLOPE
+    if cap is None:
+        cap = BRAIN_PICK_MAX_SIZE_USDC
+    try:
+        e = max(0.0, float(edge) - 0.08)
+    except (TypeError, ValueError):
+        e = 0.0
+    return round(max(base, min(cap, base + slope * e)), 2)
 
 
 def _brain_pick_slip_info(alert: dict) -> Optional[dict]:

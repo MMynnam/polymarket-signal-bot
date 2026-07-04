@@ -255,6 +255,41 @@ class SpendTracker:
 _spend = SpendTracker(config.BRAIN_DAILY_USD_CAP)
 _client = None  # lazily-created AsyncAnthropic
 
+# Billing circuit-breaker: when the Anthropic account runs out of credits, every call 400s.
+# Without this the brain hammers failed requests every cycle (observed 2026-07-04) and would
+# instantly re-burn fresh credits on low-value triage. On a billing error we pause ALL brain
+# API activity for BRAIN_BILLING_COOLDOWN_S, then probe again.
+_billing_pause_until: float = 0.0
+
+
+def _billing_paused() -> bool:
+    return time.time() < _billing_pause_until
+
+
+def _note_billing_error(exc) -> bool:
+    """If exc is the out-of-credits billing error, arm the cooldown (log once). Returns True
+    when it was a billing error so callers can bail without retrying."""
+    global _billing_pause_until
+    msg = str(exc).lower()
+    if "credit balance is too low" not in msg and "billing" not in msg:
+        return False
+    if not _billing_paused():
+        log.warning("[Brain] API credits EXHAUSTED — pausing all brain calls for %dh "
+                    "(top up Anthropic credits to resume)", config.BRAIN_BILLING_COOLDOWN_S // 3600)
+    _billing_pause_until = time.time() + config.BRAIN_BILLING_COOLDOWN_S
+    return True
+
+
+def _output_config(schema: dict = None, model: str = None) -> dict:
+    """output_config for a call: structured format always (when given); effort only on models
+    that support it (Haiku 4.5 rejects the effort param)."""
+    cfg = {}
+    if schema is not None:
+        cfg["format"] = {"type": "json_schema", "schema": schema}
+    if not (model or config.BRAIN_FORECAST_MODEL).startswith("claude-haiku"):
+        cfg["effort"] = config.BRAIN_EFFORT
+    return cfg
+
 
 def _enabled() -> bool:
     """The brain runs only with an explicit opt-in AND an API key AND the SDK."""
@@ -324,7 +359,8 @@ async def _triage(market: dict):
             output_config={"format": {"type": "json_schema", "schema": _TRIAGE_SCHEMA}},
         )
     except Exception as exc:
-        log.warning("[Brain] triage call failed: %s", exc)
+        if not _note_billing_error(exc):
+            log.warning("[Brain] triage call failed: %s", exc)
         return None
     _spend.record_usage(config.BRAIN_TRIAGE_MODEL, resp.usage)
     if resp.stop_reason == "refusal":
@@ -376,7 +412,8 @@ async def _research(market: dict):
                 continue
             break
     except Exception as exc:
-        log.warning("[Brain] research call failed: %s", exc)
+        if not _note_billing_error(exc):
+            log.warning("[Brain] research call failed: %s", exc)
         return None, n_search
     _spend.record_web_searches(n_search)
     if resp is None or resp.stop_reason == "refusal":
@@ -385,8 +422,10 @@ async def _research(market: dict):
     return (brief or None), n_search
 
 
-async def _forecast_once(market: dict, brief: str, run_idx: int):
-    """One structured forecast run (Sonnet, no tools). Returns a dict or None."""
+async def _forecast_once(market: dict, brief: str, run_idx: int, model: str = None):
+    """One structured forecast run (no tools). Model defaults to the Sonnet forecast model;
+    the real-time vet passes the cheap Haiku vet model. Returns a dict or None."""
+    model = model or config.BRAIN_FORECAST_MODEL
     client = _get_client()
     sys = (
         "You are the brain of a scrappy Polymarket bot whose friends watch its calls on "
@@ -409,17 +448,17 @@ async def _forecast_once(market: dict, brief: str, run_idx: int):
     )
     try:
         resp = await client.messages.create(
-            model=config.BRAIN_FORECAST_MODEL,
+            model=model,
             max_tokens=700,
             system=sys,
             messages=[{"role": "user", "content": user}],
-            output_config={"effort": config.BRAIN_EFFORT,
-                           "format": {"type": "json_schema", "schema": _FORECAST_SCHEMA}},
+            output_config=_output_config(_FORECAST_SCHEMA, model),
         )
     except Exception as exc:
-        log.warning("[Brain] forecast call failed: %s", exc)
+        if not _note_billing_error(exc):
+            log.warning("[Brain] forecast call failed: %s", exc)
         return None
-    _spend.record_usage(config.BRAIN_FORECAST_MODEL, resp.usage)
+    _spend.record_usage(model, resp.usage)
     if resp.stop_reason == "refusal":
         return None
     try:
@@ -465,7 +504,8 @@ async def _reconcile(market: dict, brief: str, forecasts: list):
                            "format": {"type": "json_schema", "schema": _RECONCILE_SCHEMA}},
         )
     except Exception as exc:
-        log.warning("[Brain] reconcile call failed: %s", exc)
+        if not _note_billing_error(exc):
+            log.warning("[Brain] reconcile call failed: %s", exc)
         return None
     _spend.record_usage(config.BRAIN_FORECAST_MODEL, resp.usage)
     if resp.stop_reason == "refusal":
@@ -501,6 +541,8 @@ async def forecast_market(market: dict, sender, http_client, source: str):
 
     if _recently_forecast(market["market_id"]):
         return None
+    if _billing_paused():
+        return None  # API credits exhausted — cooldown armed, don't hammer failed calls
     if not _spend.can_afford(config.BRAIN_EST_FORECAST_USD):
         log.info("[Brain] daily budget exhausted ($%.2f spent) — skipping", _spend.spent_today())
         return None
@@ -646,6 +688,8 @@ async def vet_alert(alert: dict) -> dict:
     import database
     if not _enabled():
         return {"ok": False, "reason": "brain disabled"}
+    if _billing_paused():
+        return {"ok": False, "reason": "api credits exhausted", "verdict": "BUDGET"}
     market_id = alert.get("market_id")
     bet_side = alert.get("bet_side")
     try:
@@ -686,7 +730,9 @@ async def vet_alert(alert: dict) -> dict:
     for i in range(max(1, config.BRAIN_VET_ENSEMBLE_N)):
         if not _spend.can_afford(0.0):
             break
-        f = await _forecast_once(market, brief, i)
+        # Vets run on the cheap Haiku model (~$0.001/vet) — they're commentary + rare gates;
+        # Sonnet is reserved for the scanner where real research (and money) rides.
+        f = await _forecast_once(market, brief, i, model=config.BRAIN_VET_MODEL)
         if f:
             forecasts.append(f)
     if not forecasts:
@@ -926,6 +972,17 @@ def _emit_brain_pick(market: dict, calibrated: float, confidence: float, take: s
         bet_side=pick["buy_side"], bet_price_at_alert=pick["buy_price"], bet_size_usd=0.0,
         market_category="brain", hours_to_close_at_alert=market.get("hours_to_close"),
     )
+    # Link the scanner's brain_forecasts row to this pick's alert so it GRADES on resolution
+    # (pre-2026-07-04 scanner rows never graded — the calibration report was blind to the one
+    # strategy that was actually winning).
+    db = database.get_db()
+    db.execute(
+        "UPDATE brain_forecasts SET alert_id = ? WHERE id = ("
+        "  SELECT id FROM brain_forecasts WHERE market_id = ? AND source = 'scanner' "
+        "  AND alert_id IS NULL ORDER BY created_at DESC LIMIT 1)",
+        (alert_id, market["market_id"]),
+    )
+    db.commit()
     log.info("[Brain] PICK emitted: %.45s | buy %s @ %.2f | edge=%+.2f conf=%.2f",
              market["question"], pick["buy_side"], pick["buy_price"], pick["edge"], confidence)
     return True
@@ -942,14 +999,20 @@ def grade_resolved_forecasts() -> int:
     import database
     db = database.get_db()
     rows = db.execute(
-        "SELECT bf.id, bf.brain_prob, bf.market_price, ao.resolution_status "
+        "SELECT bf.id, bf.brain_prob, bf.market_price, bf.target_label, "
+        "       ao.bet_side, ao.resolution_status "
         "FROM brain_forecasts bf JOIN alert_outcomes ao ON bf.alert_id = ao.alert_id "
-        "WHERE bf.source IN ('veto', 'live') AND bf.resolved_outcome IS NULL "
+        "WHERE bf.source IN ('veto', 'live', 'scanner') AND bf.resolved_outcome IS NULL "
         "  AND ao.resolution_status IN ('resolved_won', 'resolved_lost')"
     ).fetchall()
     n = 0
     for r in rows:
-        outcome = 1 if r["resolution_status"] == "resolved_won" else 0  # target = insider's side
+        # Did the ALERT's side win? For veto/live rows target_label == bet_side (identity).
+        # Scanner rows forecast P(outcomes[0]) but the linked pick may have bought the OTHER
+        # side — flip the outcome so the Brier grades the probability actually stored.
+        outcome = 1 if r["resolution_status"] == "resolved_won" else 0
+        if (r["target_label"] or "").strip().lower() != (r["bet_side"] or "").strip().lower():
+            outcome = 1 - outcome
         db.execute(
             "UPDATE brain_forecasts SET resolved_outcome = ?, resolved_at = ?, "
             "brier_brain = ?, brier_market = ? WHERE id = ?",
@@ -970,26 +1033,35 @@ def calibration_report() -> str:
     market here over weeks of out-of-sample resolutions."""
     import database
     db = database.get_db()
-    graded = db.execute(
-        "SELECT brain_prob, market_price, resolved_outcome FROM brain_forecasts "
-        "WHERE resolved_outcome IS NOT NULL"
-    ).fetchall()
-    agg = aggregate_brier((g["brain_prob"], g["market_price"], g["resolved_outcome"]) for g in graded)
+
+    def _agg(where: str):
+        rows = db.execute(
+            f"SELECT brain_prob, market_price, resolved_outcome FROM brain_forecasts "
+            f"WHERE resolved_outcome IS NOT NULL AND {where}"
+        ).fetchall()
+        return aggregate_brier((g["brain_prob"], g["market_price"], g["resolved_outcome"]) for g in rows)
+
+    # The scoreboard that matters: the RESEARCHED scanner/pick forecasts (real money rides on
+    # these) vs the no-web trade-time vets (commentary — expected to roughly track the market).
+    picks = _agg("source = 'scanner'")
+    vets = _agg("source IN ('veto', 'live')")
     total = db.execute("SELECT COUNT(*) FROM brain_forecasts").fetchone()[0]
-    pending = total - agg["n"]
-    head = "🧠 <b>BRAIN CALIBRATION</b> <i>(shadow — paper only, no money at risk)</i>"
-    if agg["n"] < 20:
-        return (f"{head}\n\n📋 {total} forecasts logged · {agg['n']} graded · {pending} awaiting resolution.\n"
-                f"<i>Need ≥20 graded for an honest Brier read. Logging, not yet judging.</i>")
-    delta = agg["market"] - agg["brain"]   # positive ⇒ brain better than market
-    beating = "✅ beating the market" if delta > 0 else "❌ not beating the market"
+    head = "🧠 <b>BRAIN CALIBRATION</b>"
+
+    def _line(label, a):
+        if a["n"] == 0:
+            return f"{label}: <i>none graded yet</i>"
+        delta = a["market"] - a["brain"]
+        mark = "✅" if delta > 0 else "❌"
+        return (f"{label}: <b>{a['n']}</b> graded · brain <b>{a['brain']:.4f}</b> vs "
+                f"market <b>{a['market']:.4f}</b> {mark} (Δ {delta:+.4f})")
+
     return (
         f"{head}\n\n"
-        f"📊 <b>{agg['n']}</b> graded forecasts\n"
-        f"Brier — brain <b>{agg['brain']:.4f}</b> vs market <b>{agg['market']:.4f}</b> "
-        f"(Δ {delta:+.4f})\n"
-        f"<b>{beating}</b> · lower Brier = better calibrated.\n"
-        f"<i>{pending} still pending. Graduation needs a durable brain&lt;market over weeks — not yet.</i>"
+        f"🔬 {_line('<b>PICKS</b> (researched, real $)', picks)}\n"
+        f"💬 {_line('vets (no-web commentary)', vets)}\n\n"
+        f"<i>{total} forecasts logged · lower Brier = better calibrated. The PICKS line is the "
+        f"graduation gate — a durable ✅ there over weeks earns bigger stakes.</i>"
     )
 
 

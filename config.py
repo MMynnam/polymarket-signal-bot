@@ -424,17 +424,25 @@ BRAIN_EFFORT: str = os.getenv("BRAIN_EFFORT", "low")
 
 # Hard daily spend cap (USD). Token + web-search cost is tracked per call; once the
 # cap is hit, the brain stops making calls until UTC-midnight rollover.
-# Raised 1.00→3.00 for real-time vetting: each trade-time vet costs ~$0.05-0.10, so $1 only
-# covered ~10-14 trades/day before degrading to base-size. $3 covers ~40. Env-overridable.
-BRAIN_DAILY_USD_CAP: float = float(os.getenv("BRAIN_DAILY_USD_CAP", "3.00"))
+# 2026-07-04 cost audit: 10 days of live data showed ~$2.2/day (~$66/mo) — 90% of it scanner web
+# research ($0.31/forecast), while 297 Haiku-cheap vets cost $2.12 TOTAL. Operator hit their API
+# credit cap. New budget: $1.25/day ≈ $35/mo ceiling → ~3-4 researched markets/day (the picks'
+# 7-0 record was built on ~6/day, so this keeps the winning strategy alive at half the burn).
+BRAIN_DAILY_USD_CAP: float = float(os.getenv("BRAIN_DAILY_USD_CAP", "1.25"))
 # Conservative pre-check estimate of one full forecast's cost (triage+research+ensemble).
 BRAIN_EST_FORECAST_USD: float = float(os.getenv("BRAIN_EST_FORECAST_USD", "0.05"))
 
 # Ensemble: N independent forecast runs → mean → (reconcile if they disagree) → calibrate.
 BRAIN_ENSEMBLE_N: int = int(os.getenv("BRAIN_ENSEMBLE_N", "3"))
 # Real-time vet (the trader calls /api/brain/vet at trade time): a SMALLER ensemble so the
-# verdict comes back fast enough to actually size the position (~20-40s vs the full pipeline).
-BRAIN_VET_ENSEMBLE_N: int = int(os.getenv("BRAIN_VET_ENSEMBLE_N", "2"))
+# verdict comes back fast enough to actually size the position. Cost audit 2026-07-04: vets are
+# commentary + rarely gate anything, so they run on Haiku (5x cheaper than Sonnet) with a single
+# run — ~$0.001/vet, effectively free. Sonnet stays on the scanner where the money rides.
+BRAIN_VET_ENSEMBLE_N: int = int(os.getenv("BRAIN_VET_ENSEMBLE_N", "1"))
+BRAIN_VET_MODEL: str = os.getenv("BRAIN_VET_MODEL", "claude-haiku-4-5")
+# Billing circuit-breaker: when the Anthropic account is OUT OF CREDITS (400 billing error),
+# pause ALL brain API calls for this long instead of hammering failed requests every cycle.
+BRAIN_BILLING_COOLDOWN_S: int = int(os.getenv("BRAIN_BILLING_COOLDOWN_S", "14400"))  # 4h
 # Audience decision digest (to V1 Poly): how often the brain broadcasts a readable summary of
 # what it blessed / passed on, keeping the channel alive between bets.
 BRAIN_DIGEST_HOURS: float = float(os.getenv("BRAIN_DIGEST_HOURS", "4"))
@@ -470,9 +478,11 @@ BRAIN_MIN_CONFIDENCE: float = float(os.getenv("BRAIN_MIN_CONFIDENCE", "0.55"))
 BRAIN_KELLY_CAP: float = float(os.getenv("BRAIN_KELLY_CAP", "0.25"))             # quarter-Kelly ceiling
 
 # Loop cadence + per-cycle caps (also bounded by the daily spend cap).
-BRAIN_SCAN_INTERVAL_SECONDS: int = int(os.getenv("BRAIN_SCAN_INTERVAL_SECONDS", "3600"))
-BRAIN_MAX_PER_CYCLE: int = int(os.getenv("BRAIN_MAX_PER_CYCLE", "6"))
-BRAIN_REFORECAST_HOURS: float = float(os.getenv("BRAIN_REFORECAST_HOURS", "24"))  # don't re-forecast a market within this window
+# 2026-07-04: 1h/6-per-cycle burned the cap by mid-day; 2h/2-per-cycle spreads ~4 researched
+# markets across the whole day so evening markets get looked at too.
+BRAIN_SCAN_INTERVAL_SECONDS: int = int(os.getenv("BRAIN_SCAN_INTERVAL_SECONDS", "7200"))
+BRAIN_MAX_PER_CYCLE: int = int(os.getenv("BRAIN_MAX_PER_CYCLE", "2"))
+BRAIN_REFORECAST_HOURS: float = float(os.getenv("BRAIN_REFORECAST_HOURS", "72"))  # don't re-forecast a market within this window
 
 # Scanner (long-tail mispricing hunt) market filters.
 BRAIN_SCAN_MIN_PRICE: float = float(os.getenv("BRAIN_SCAN_MIN_PRICE", "0.12"))

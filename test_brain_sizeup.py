@@ -119,6 +119,19 @@ def test_veto_skip_decision():
     print("  [ok] veto-skip: only a confident, strong-edge VETO skips; CONFIRM/NEUTRAL/weak don't")
 
 
+def test_brain_pick_stake_scales_with_edge():
+    tr.BRAIN_PICK_SIZE_USDC = 2.0
+    tr.BRAIN_PICK_MAX_SIZE_USDC = 5.0
+    tr.BRAIN_PICK_EDGE_SLOPE = 15.0
+    assert tr._brain_pick_stake(0.08) == 2.0          # min edge → base
+    assert tr._brain_pick_stake(0.18) == 3.5          # 2 + 15×0.10
+    assert tr._brain_pick_stake(0.28) == 5.0          # hits the cap
+    assert tr._brain_pick_stake(0.60) == 5.0          # cap binds
+    assert tr._brain_pick_stake(0.00) == 2.0          # below min edge → base, never less
+    assert tr._brain_pick_stake(None) == 2.0          # malformed → base
+    print("  [ok] pick stake: base at min edge, scales with conviction, hard $5 cap")
+
+
 def test_betslip_renders_brain_verdict_on_every_vetted_slip():
     # Un-vetted bet → no brain line at all.
     plain = tr._build_slip_text("Knicks make playoffs?", "Yes", 0.40, 2.0, bet_no=7)
@@ -154,5 +167,6 @@ if __name__ == "__main__":
     test_daily_cap_blocks_further_sizeups()
     test_unknown_balance_allows_cap()
     test_veto_skip_decision()
+    test_brain_pick_stake_scales_with_edge()
     test_betslip_renders_brain_verdict_on_every_vetted_slip()
     print("all brain-sizeup tests passed")
