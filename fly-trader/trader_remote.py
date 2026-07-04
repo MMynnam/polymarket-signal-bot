@@ -117,6 +117,20 @@ BRAIN_VETO_MIN_EDGE: float = float(os.getenv("BRAIN_VETO_MIN_EDGE", "0.10"))
 DASHBOARD_ENABLED: bool = os.getenv("DASHBOARD_ENABLED", "true").lower() in ("true", "1", "yes")
 DASHBOARD_UPDATE_SECONDS: int = int(os.getenv("DASHBOARD_UPDATE_SECONDS", "600"))
 
+# --- Pre-scaling rails (2026-07-04) -----------------------------------------
+# Event-correlation cap: N legs on the same match (O/U 1.5 AND 3.5 AND the spread AND the
+# exact score…) is ONE bet wearing N hats — a single weird game wipes the day. Cap total $
+# exposure per UNDERLYING EVENT (derivative markets grouped by normalized event slug).
+EVENT_EXPOSURE_CAP_ENABLED: bool = os.getenv("EVENT_EXPOSURE_CAP_ENABLED", "true").lower() in ("true", "1", "yes")
+EVENT_MAX_EXPOSURE_USDC: float = float(os.getenv("EVENT_MAX_EXPOSURE_USDC", "8.0"))
+# Depth-aware sizing: before placing a sized bet (brain pick / conviction size-up), read the
+# CLOB order book and cap the stake at DEPTH_MAX_FRACTION of the visible ask depth within
+# DEPTH_PRICE_TOL of our price — never be a whale on a thin book (you'd pay away the edge
+# as market impact). The enabler for Stage-1/2 stake raises.
+DEPTH_SIZING_ENABLED: bool = os.getenv("DEPTH_SIZING_ENABLED", "true").lower() in ("true", "1", "yes")
+DEPTH_MAX_FRACTION: float = float(os.getenv("DEPTH_MAX_FRACTION", "0.15"))
+DEPTH_PRICE_TOL: float = float(os.getenv("DEPTH_PRICE_TOL", "0.02"))
+
 BRAIN_PICK_TRADING_ENABLED: bool = os.getenv("BRAIN_PICK_TRADING_ENABLED", "false").lower() in ("true", "1", "yes")
 # Conviction-scaled pick stakes (2026-07-04): the picks went 7-0 (+34% ROI) at $1 flat — the
 # only strategy in this bot's history with a winning record. Stake now scales with the brain's
@@ -349,6 +363,11 @@ _brain_pick_day: str = ""
 # the pin).
 _dash_msg_id: Optional[int] = None
 _last_dash_update: float = 0.0
+
+# Event-correlation exposure: normalized event key -> open $ exposure across all that event's
+# derivative markets. Seeded from /api/positions/open, incremented on fills. Kept in lockstep
+# with _held_positions at the seed/fill sites.
+_held_event_exposure: dict = {}
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -2822,6 +2841,40 @@ async def _execute_trade(
                      alert_id[:12], market_id[:16], bet_side, bet_size,
                      _brain_conf["confidence"], _brain_conf["edge"])
 
+    # Event-correlation cap: N legs on the same match are ONE correlated bet — refuse to pile
+    # more $ onto an underlying event than EVENT_MAX_EXPOSURE_USDC across all its derivatives.
+    _ev_key = _event_key(_slug, market_id)
+    if EVENT_EXPOSURE_CAP_ENABLED:
+        _over, _ev_cur = _event_over_cap(_ev_key, bet_size, _held_event_exposure)
+        if _over:
+            log.info("[EventCap] Skipping %s — event '%s' already carries $%.2f "
+                     "(+$%.2f would breach the $%.2f cap)",
+                     alert_id[:12], _ev_key[:40], _ev_cur, bet_size, EVENT_MAX_EXPOSURE_USDC)
+            if _is_brain_pick:
+                await _record_brain_pick_skip(http_client, alert, "event exposure cap")
+            else:
+                await _notify_skip(http_client, alert, "event exposure cap")
+            return
+
+    # Depth-aware sizing for SIZED bets (brain picks + conviction size-ups): never take more
+    # than DEPTH_MAX_FRACTION of the visible book — market impact eats the edge. Base-size
+    # insider bets skip the check ($2 is noise on any book we trade).
+    if DEPTH_SIZING_ENABLED and (_is_brain_pick or _brain_conf) and bet_size > TRADING_BET_SIZE_USDC:
+        _capped = await _fetch_depth_cap(clob_client, token_id, price_alert, bet_size)
+        if _capped is not None:
+            if _capped < 0.5:  # book too thin to take ANY meaningful position
+                log.info("[Depth] Skipping %s — book too thin ($%.2f available at %d%% fraction)",
+                         alert_id[:12], _capped, int(DEPTH_MAX_FRACTION * 100))
+                if _is_brain_pick:
+                    await _record_brain_pick_skip(http_client, alert, "book too thin")
+                else:
+                    await _notify_skip(http_client, alert, "book too thin for the sized bet")
+                return
+            if _capped < bet_size:
+                log.info("[Depth] Trimming %s: $%.2f → $%.2f (%d%% of visible depth)",
+                         alert_id[:12], bet_size, _capped, int(DEPTH_MAX_FRACTION * 100))
+                bet_size = _capped
+
     # Reserve gate: keep the operating floor (and any in-flight sweep) unbet so the vault
     # sweep's cash survives the 1h timelock instead of being re-bet and self-cancelling.
     # _cached_usdc_balance is kept fresh (decremented on each fill, refreshed each redeem
@@ -3069,12 +3122,15 @@ async def _execute_trade(
             # gate sees cash leave in real time (corrected on the next redeem-cycle read).
             if _cached_usdc_balance >= 0:
                 _cached_usdc_balance = max(0.0, _cached_usdc_balance - filled_size)
-        # Track held position for per-market/side dedup + opposite-side vig gate.
+        # Track held position for per-market/side dedup + opposite-side vig gate,
+        # and the event-correlation exposure map for the per-event cap.
         if market_id and bet_side:
             _held_positions.add((market_id, bet_side))
             _entry_px = fill_price or current_price or price_alert
             if _entry_px:
                 _held_side_px.setdefault(market_id, {})[bet_side] = float(_entry_px)
+            if filled_size > 0:
+                _held_event_exposure[_ev_key] = _held_event_exposure.get(_ev_key, 0.0) + filled_size
             log.debug("[Dedup] Added (%s, %s) to _held_positions", market_id[:16], bet_side)
         # Running slip number for the feed: lifetime filled bets (settled + open) + this
         # one. Presentation-only; omitted gracefully if the stats payload lacks the keys.
@@ -3139,6 +3195,81 @@ def _opposite_side_vig(new_px, held_sides: dict, new_side: str,
         return False, 0.0
     worst = max(others)  # the held side that makes the tightest (most -EV) pair
     return (new_px + worst) > cap, new_px + worst
+
+
+# ---------------------------------------------------------------------------
+# Pre-scaling rails: event-correlation cap + depth-aware sizing (pure logic)
+# ---------------------------------------------------------------------------
+
+# Polymarket splits one underlying event across several "event" slugs; strip the known
+# derivative suffixes so all legs of the same match share one exposure bucket.
+_EVENT_SLUG_SUFFIXES = ("-more-markets", "-exact-score", "-halftime-result",
+                        "-first-half", "-second-half")
+
+
+def _event_key(market_slug, market_id: str) -> str:
+    """Normalized grouping key for the underlying event. No slug → the market stands alone
+    (fail-safe: under-grouping weakens the cap but never wrongly blocks a trade)."""
+    slug = (market_slug or "").strip().lower()
+    if not slug:
+        return market_id or "?"
+    for suf in _EVENT_SLUG_SUFFIXES:
+        if slug.endswith(suf):
+            slug = slug[: -len(suf)]
+            break
+    return slug
+
+
+def _event_over_cap(event_key: str, add_usdc: float, exposure: dict,
+                    cap: float = None) -> tuple[bool, float]:
+    """Pure decision: would adding add_usdc to this event's open exposure breach the cap?
+    Returns (over, current_exposure)."""
+    if cap is None:
+        cap = EVENT_MAX_EXPOSURE_USDC
+    cur = float(exposure.get(event_key, 0.0))
+    return (cur + add_usdc) > cap, cur
+
+
+def _depth_capped_size(asks, ref_price: float, desired_usdc: float,
+                       tol: float = None, frac: float = None) -> float:
+    """Pure sizing: cap desired_usdc at frac × the visible ask-side dollar depth priced within
+    ref_price + tol. asks: [(price, size_shares), ...] in any order; malformed rows skipped.
+    Returns the capped stake (never above desired). Empty/unreadable book → 0.0 (caller
+    decides whether that means skip or proceed-unchecked)."""
+    if tol is None:
+        tol = DEPTH_PRICE_TOL
+    if frac is None:
+        frac = DEPTH_MAX_FRACTION
+    depth_usd = 0.0
+    for row in asks or []:
+        try:
+            if isinstance(row, dict):
+                p, s = float(row.get("price")), float(row.get("size"))
+            elif isinstance(row, (list, tuple)):
+                p, s = float(row[0]), float(row[1])
+            else:
+                p, s = float(getattr(row, "price")), float(getattr(row, "size"))
+        except (TypeError, ValueError, AttributeError, IndexError):
+            continue
+        if 0.0 < p <= ref_price + tol:
+            depth_usd += p * s
+    return round(min(desired_usdc, frac * depth_usd), 2)
+
+
+async def _fetch_depth_cap(clob_client, token_id: str, ref_price: float,
+                           desired_usdc: float) -> Optional[float]:
+    """Read the order book and return the depth-capped stake, or None when the book can't be
+    read (caller proceeds unchecked — a read failure must not block trading)."""
+    try:
+        book = await asyncio.to_thread(clob_client.get_order_book, token_id)
+        asks = getattr(book, "asks", None) or (book.get("asks") if isinstance(book, dict) else None)
+        capped = _depth_capped_size(asks, ref_price, desired_usdc)
+        log.info("[Depth] token=%s… ref=%.2f desired=$%.2f → capped=$%.2f",
+                 str(token_id)[:12], ref_price, desired_usdc, capped)
+        return capped
+    except Exception as exc:
+        log.info("[Depth] order book unavailable (%s) — sizing unchecked", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -3349,7 +3480,7 @@ async def _seed_held_positions(http_client: httpx.AsyncClient) -> None:
     On persistent failure, dedup stays inactive (_held_positions_seeded=False)
     and a recurring WARNING is emitted each cycle until a restart recovers it.
     """
-    global _held_positions, _held_side_px, _held_positions_seeded
+    global _held_positions, _held_side_px, _held_positions_seeded, _held_event_exposure
     for attempt in range(5):
         try:
             positions = await _api_get(http_client, "/api/positions/open")
@@ -3360,11 +3491,16 @@ async def _seed_held_positions(http_client: httpx.AsyncClient) -> None:
                     if p.get("market_id") and p.get("bet_side")
                 }
                 _held_side_px = {}
+                _held_event_exposure = {}
                 for p in positions:
                     mid, side = p.get("market_id"), p.get("bet_side")
                     px = p.get("bet_price_filled") or p.get("bet_price_intended")
                     if mid and side and px:
                         _held_side_px.setdefault(mid, {})[side] = float(px)
+                    if mid:
+                        ek = _event_key(p.get("market_slug"), mid)
+                        _held_event_exposure[ek] = _held_event_exposure.get(ek, 0.0) \
+                            + float(p.get("size_usdc") or 0.0)
                 _held_positions_seeded = True
                 log.info(
                     "[Dedup] Seeded _held_positions: %d open positions",

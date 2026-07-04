@@ -1229,6 +1229,83 @@ def calibration_report() -> str:
 
 
 # ===========================================================================
+# Scaling scoreboard — the numbers that gate each capital raise
+# ===========================================================================
+
+def _mean_ci(values: list) -> tuple:
+    """(mean, lo, hi) 95% normal-approx CI. Honest degenerate cases for n<2."""
+    n = len(values)
+    if n == 0:
+        return (0.0, 0.0, 0.0)
+    m = statistics.fmean(values)
+    if n < 2:
+        return (m, m, m)
+    half = 1.96 * statistics.stdev(values) / math.sqrt(n)
+    return (m, m - half, m + half)
+
+
+def scaling_scoreboard() -> str:
+    """Weekly ops report: the four numbers a capital-raise decision needs — graded sample
+    size, ROI with CI, PICKS Brier vs market, and execution headroom — plus an explicit
+    Stage-1 gate checklist. This makes 'wire in the next $X?' a look at a card, not a vibe."""
+    import database
+    db = database.get_db()
+
+    placed = db.execute(
+        "SELECT COUNT(*) n, SUM(CASE WHEN status='partial' THEN 1 ELSE 0 END) partial, "
+        "MIN(created_at) first_ts FROM trade_executions "
+        "WHERE alert_id LIKE 'brain_%' AND status IN ('filled','partial')"
+    ).fetchone()
+    graded = db.execute(
+        "SELECT size_usdc, pnl, resolution_status FROM trade_executions "
+        "WHERE alert_id LIKE 'brain_%' AND status IN ('filled','partial') "
+        "  AND resolution_status IN ('won','lost')"
+    ).fetchall()
+    rois = [float(g["pnl"] or 0.0) / float(g["size_usdc"]) for g in graded if (g["size_usdc"] or 0) > 0]
+    wins = sum(1 for g in graded if g["resolution_status"] == "won")
+    losses = len(graded) - wins
+    roi_m, roi_lo, roi_hi = _mean_ci(rois)
+
+    cal = db.execute(
+        "SELECT AVG(brier_brain) bb, AVG(brier_market) bm, COUNT(*) n FROM brain_forecasts "
+        "WHERE source='scanner' AND resolved_outcome IS NOT NULL"
+    ).fetchone()
+    brier_ok = cal["n"] and cal["bb"] is not None and cal["bm"] is not None and cal["bb"] < cal["bm"]
+
+    n_placed = placed["n"] or 0
+    days = max(1.0, (time.time() - (placed["first_ts"] or time.time())) / 86400.0)
+    per_day = n_placed / days
+    partial_pct = 100.0 * (placed["partial"] or 0) / n_placed if n_placed else 0.0
+
+    n_g = len(graded)
+    gate_n = n_g >= 40
+    gate_roi = n_g >= 10 and roi_lo > 0
+    gate_brier = bool(brier_ok and (cal["n"] or 0) >= 20)
+    gates_met = sum([gate_n, gate_roi, gate_brier])
+
+    def _g(ok):
+        return "✅" if ok else "❌"
+
+    cal_bit = (f"brain <b>{cal['bb']:.4f}</b> vs market <b>{cal['bm']:.4f}</b> (n={cal['n']})"
+               if cal["n"] else "<i>none graded yet</i>")
+    verdict = ("<b>STAGE 1 UNLOCKED</b> — evidence supports the first capital raise."
+               if gates_met == 3 else
+               f"keep running Stage 0 — {gates_met}/3 gates met, evidence accumulating.")
+    return (
+        "📈 <b>SCALING SCOREBOARD</b> — <i>Stage 0 (discovery)</i>\n\n"
+        f"🎯 picks: <b>{n_placed}</b> placed · <b>{n_g}</b> graded ({wins}W-{losses}L) · {per_day:.1f}/day\n"
+        f"💵 ROI <b>{roi_m*100:+.1f}%</b> (95% CI {roi_lo*100:+.1f}%..{roi_hi*100:+.1f}%)\n"
+        f"🧮 PICKS Brier: {cal_bit}\n"
+        f"⚙️ execution: {partial_pct:.0f}% partial fills\n\n"
+        f"<b>STAGE 1 GATE</b> (all ✅ → raise stakes + bankroll):\n"
+        f"  {_g(gate_n)} n≥40 graded ({n_g}/40)\n"
+        f"  {_g(gate_roi)} ROI 95% CI floor &gt; 0\n"
+        f"  {_g(gate_brier)} PICKS Brier beats market (n≥20)\n\n"
+        f"{verdict}"
+    )
+
+
+# ===========================================================================
 # Audience decision digest — keeps V1 Poly alive between bets
 # ===========================================================================
 
@@ -1300,6 +1377,7 @@ async def brain_loop(dry_run: bool = False) -> None:
     sender = make_research_sender()
     audience = make_audience_sender()
     last_report_day = None
+    last_scoreboard_day = None
     last_digest_ts = time.time()  # don't dump history on first boot
     digest_interval = max(1800.0, config.BRAIN_DIGEST_HOURS * 3600)
 
@@ -1354,6 +1432,17 @@ async def brain_loop(dry_run: bool = False) -> None:
                     text = calibration_report()
                     if dry_run or sender is None:
                         log.info("[Brain] calibration report:\n%s", text)
+                    else:
+                        await sender.send_message(text, http_client)
+
+                # Weekly scaling scoreboard to ops (Mondays, same hour) — the numbers that
+                # gate each capital raise on the Stage-0 → Stage-1 → Stage-2 ladder.
+                if (now.weekday() == 0 and now.hour == config.BRAIN_CAL_REPORT_HOUR_UTC
+                        and now.strftime("%Y-%m-%d") != last_scoreboard_day):
+                    last_scoreboard_day = now.strftime("%Y-%m-%d")
+                    text = scaling_scoreboard()
+                    if dry_run or sender is None:
+                        log.info("[Brain] scaling scoreboard:\n%s", text)
                     else:
                         await sender.send_message(text, http_client)
 

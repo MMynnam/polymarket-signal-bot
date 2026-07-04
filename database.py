@@ -1590,20 +1590,37 @@ def get_tradeable_alerts_for_api(
 
 
 def get_open_positions_for_api() -> list[dict]:
-    """Return filled, pending-resolution trades joined with score from alert_outcomes."""
+    """Return filled, pending-resolution trades joined with score from alert_outcomes.
+    Includes market_slug (from markets.raw_json) so the remote trader can group derivative
+    markets of the same underlying event for the correlation-exposure cap."""
     rows = get_db().execute(
         """
         SELECT te.alert_id, te.market_id, te.market_question,
                te.bet_side, te.bet_price_filled, te.bet_price_intended,
                te.size_usdc, te.created_at,
-               ao.score
+               ao.score,
+               m.raw_json
         FROM trade_executions te
         LEFT JOIN alert_outcomes ao ON te.alert_id = ao.alert_id
+        LEFT JOIN markets m ON te.market_id = m.condition_id
         WHERE te.status IN ('filled', 'partial') AND te.resolution_status = 'pending'
         ORDER BY te.created_at ASC
         """,
     ).fetchall()
-    return [dict(row) for row in rows]
+    out = []
+    for row in rows:
+        d = dict(row)
+        raw_str = d.pop("raw_json", None)
+        slug = None
+        if raw_str:
+            try:
+                raw = json.loads(raw_str)
+                slug = raw.get("_event_slug") or raw.get("slug") or None
+            except Exception:
+                pass
+        d["market_slug"] = slug
+        out.append(d)
+    return out
 
 
 def get_brain_confirmations(since_ts: int, min_confidence: float = 0.0) -> list[dict]:

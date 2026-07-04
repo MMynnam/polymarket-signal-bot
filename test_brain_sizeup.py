@@ -132,6 +132,48 @@ def test_brain_pick_stake_scales_with_edge():
     print("  [ok] pick stake: base at min edge, scales with conviction, hard $5 cap")
 
 
+def test_event_key_groups_derivative_markets():
+    # All legs of the same match share one exposure bucket…
+    base = tr._event_key("fifwc-eng-gha-2026-06-23", "0xA")
+    assert tr._event_key("fifwc-eng-gha-2026-06-23-more-markets", "0xB") == base
+    assert tr._event_key("fifwc-eng-gha-2026-06-23-exact-score", "0xC") == base
+    assert tr._event_key("fifwc-eng-gha-2026-06-23-halftime-result", "0xD") == base
+    # …different matches don't
+    assert tr._event_key("fifwc-pan-hrv-2026-06-23", "0xE") != base
+    # no slug → market stands alone (fail-safe, never wrongly groups)
+    assert tr._event_key(None, "0xF") == "0xF"
+    assert tr._event_key("", "0xG") == "0xG"
+    print("  [ok] event key: derivative suffixes collapse to one bucket; no slug = alone")
+
+
+def test_event_cap_decision():
+    tr.EVENT_MAX_EXPOSURE_USDC = 8.0
+    exp = {"fifwc-eng-gha": 6.50}
+    over, cur = tr._event_over_cap("fifwc-eng-gha", 2.00, exp)
+    assert over is True and cur == 6.50          # 6.50 + 2.00 > 8
+    over, _ = tr._event_over_cap("fifwc-eng-gha", 1.00, exp)
+    assert over is False                          # 7.50 <= 8
+    over, cur = tr._event_over_cap("unseen-event", 5.00, exp)
+    assert over is False and cur == 0.0           # new event starts at zero
+    print("  [ok] event cap: blocks the leg that would breach, allows under-cap adds")
+
+
+def test_depth_capped_size():
+    asks = [{"price": "0.50", "size": "40"},   # $20 within tolerance
+            {"price": "0.51", "size": "20"},   # $10.20 within tolerance
+            {"price": "0.60", "size": "500"},  # outside 0.50+0.02 → ignored
+            {"price": "bogus", "size": "x"}]   # malformed → skipped
+    # depth = 30.20; 15% → $4.53 cap
+    assert tr._depth_capped_size(asks, 0.50, 15.0, tol=0.02, frac=0.15) == 4.53
+    # desired below the cap → unchanged
+    assert tr._depth_capped_size(asks, 0.50, 2.0, tol=0.02, frac=0.15) == 2.0
+    # tuple rows work; empty book → 0
+    assert tr._depth_capped_size([(0.50, 40)], 0.50, 10.0, tol=0.02, frac=0.5) == 10.0
+    assert tr._depth_capped_size([], 0.50, 10.0) == 0.0
+    assert tr._depth_capped_size(None, 0.50, 10.0) == 0.0
+    print("  [ok] depth sizing: caps at fraction of in-tolerance depth, never raises size")
+
+
 def test_betslip_renders_brain_verdict_on_every_vetted_slip():
     # Un-vetted bet → no brain line at all.
     plain = tr._build_slip_text("Knicks make playoffs?", "Yes", 0.40, 2.0, bet_no=7)
@@ -168,5 +210,8 @@ if __name__ == "__main__":
     test_unknown_balance_allows_cap()
     test_veto_skip_decision()
     test_brain_pick_stake_scales_with_edge()
+    test_event_key_groups_derivative_markets()
+    test_event_cap_decision()
+    test_depth_capped_size()
     test_betslip_renders_brain_verdict_on_every_vetted_slip()
     print("all brain-sizeup tests passed")
