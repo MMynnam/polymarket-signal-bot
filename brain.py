@@ -378,22 +378,31 @@ async def _triage(market: dict):
         return None
 
 
-def _research_params(market: dict) -> dict:
+def _research_params(market: dict, siblings: list = None) -> dict:
     """Complete Messages-API kwargs for one research call (web search, free-form — shared by
-    sync + batch paths). NO structured output here — web-search citations forbid it."""
+    sync + batch paths). NO structured output here — web-search citations forbid it.
+    `siblings`: other derivative markets of the SAME event — the brief should carry the facts
+    that inform all of them (expected goals, form, lineups, likely scorelines, etc.)."""
     sys = (
         "You are a forecasting research analyst. Given a prediction-market question, "
         "search the web for the most relevant CURRENT evidence: recent news, base rates, "
         "scheduled events, expert views, and anything that bears on the outcome. Then write "
-        "a concise evidence brief (≈200 words): the key factors for and against the target "
-        "outcome, the most decisive facts, and your qualitative sense of likelihood. Do NOT "
+        "a concise evidence brief (≈250 words): the key factors for and against, the most "
+        "decisive facts, and your qualitative sense of likelihood. When related markets on "
+        "the same event are listed, make the brief rich enough to inform ALL of them "
+        "(totals, margins, both-sides dynamics — not just the headline question). Do NOT "
         "simply restate the market price — reason from the evidence. Note your uncertainty."
     )
+    sib_bit = ""
+    if siblings:
+        lines = "\n".join(f"- {m['question']}" for m in siblings[:6])
+        sib_bit = f"\nRelated markets on the SAME event (the brief must inform these too):\n{lines}\n"
     user = (
         f"Question: {market['question']}\n"
         f"Resolution detail: {market.get('description', '(none)')}\n"
         f"Target outcome to assess: '{market['target_label']}'\n"
-        f"Closes in: {market.get('hours_to_close', 0):.0f}h\n\n"
+        f"Closes in: {market.get('hours_to_close', 0):.0f}h\n"
+        f"{sib_bit}\n"
         "Research this and write the evidence brief."
     )
     return {
@@ -401,7 +410,8 @@ def _research_params(market: dict) -> dict:
         "max_tokens": 3000,
         "system": sys,
         "messages": [{"role": "user", "content": user}],
-        "tools": [{"type": "web_search_20260209", "name": "web_search"}],
+        "tools": [{"type": "web_search_20260209", "name": "web_search",
+                   "max_uses": max(1, config.BRAIN_RESEARCH_MAX_SEARCHES)}],
         "output_config": _output_config(None, config.BRAIN_FORECAST_MODEL),
     }
 
@@ -541,8 +551,37 @@ async def _reconcile(market: dict, brief: str, forecasts: list):
 
 
 # ===========================================================================
-# Batch API scanner — same pipeline at a 50% token discount
+# Batch API scanner — same pipeline at a 50% token discount, event-grouped
 # ===========================================================================
+
+# Mirror of the trader's event normalization: derivative "event" slugs collapse to one bucket.
+_EVENT_SLUG_SUFFIXES = ("-more-markets", "-exact-score", "-halftime-result",
+                        "-first-half", "-second-half")
+
+
+def _event_key_b(slug, market_id: str) -> str:
+    s = (slug or "").strip().lower()
+    if not s:
+        return market_id or "?"
+    for suf in _EVENT_SLUG_SUFFIXES:
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+            break
+    return s
+
+
+def _group_events(cands: list) -> list:
+    """Group scanner candidates by underlying event, preserving candidate order (which is
+    soonest-to-resolve first). Returns [(event_key, [markets...]), ...]."""
+    groups: dict = {}
+    order: list = []
+    for c in cands:
+        k = _event_key_b(c.get("slug"), c["market_id"])
+        if k not in groups:
+            groups[k] = []
+            order.append(k)
+        groups[k].append(c)
+    return [(k, groups[k]) for k in order]
 
 async def _batch_run(reqs: list) -> dict:
     """Submit [(custom_id, params), ...] as ONE Message Batch, poll to completion, return
@@ -581,87 +620,98 @@ async def _batch_run(reqs: list) -> dict:
 
 
 async def _scan_cycle_batched(candidates: list, sender, http_client) -> int:
-    """One scanner cycle through the Batches API: triage batch → research batch → forecast
-    batch → finalize locally. Per-market cost is attributed from each message's usage at the
-    50% batch rate. Returns the number of markets fully forecast."""
+    """One scanner cycle through the Batches API, EVENT-GROUPED: triage one representative
+    per event → research the EVENT once (brief written to inform all its derivative markets)
+    → forecast every sibling market against the shared brief → finalize each. One research
+    call now feeds up to BRAIN_EVENT_SIBLINGS forecastable markets (~3x picks per research
+    dollar); the trader's $8/event exposure cap bounds the resulting correlated picks.
+    Returns the number of markets fully forecast."""
     cands = [c for c in candidates if not _recently_forecast(c["market_id"])]
-    cands = cands[: max(1, config.BRAIN_BATCH_MARKETS)]
     if not cands or _billing_paused():
         return 0
     if not _spend.can_afford(config.BRAIN_EST_FORECAST_USD * 0.5):
         log.info("[Brain] daily budget exhausted ($%.2f spent) — skipping batch cycle",
                  _spend.spent_today())
         return 0
-    mcost: dict = {c["market_id"]: 0.0 for c in cands}
+    events = _group_events(cands)[: max(1, config.BRAIN_BATCH_MARKETS)]
+    events = [(k, ms[: max(1, config.BRAIN_EVENT_SIBLINGS)]) for k, ms in events]
+    mcost: dict = {}
+    for _, ms in events:
+        for c in ms:
+            mcost[c["market_id"]] = 0.0
 
-    # Stage 1 — triage (Haiku, cheap, all candidates in one batch).
-    res = await _batch_run([(f"t{i}", _triage_params(c)) for i, c in enumerate(cands)])
+    # Stage 1 — triage one REPRESENTATIVE market per event (Haiku, one batch).
+    res = await _batch_run([(f"t{i}", _triage_params(ms[0])) for i, (k, ms) in enumerate(events)])
     keep = []
-    for i, c in enumerate(cands):
+    for i, (k, ms) in enumerate(events):
+        rep = ms[0]
         msg = res.get(f"t{i}")
         ok = False
         if msg is not None:
-            mcost[c["market_id"]] += _spend.record_usage(config.BRAIN_TRIAGE_MODEL, msg.usage, batch=True)
+            mcost[rep["market_id"]] += _spend.record_usage(config.BRAIN_TRIAGE_MODEL, msg.usage, batch=True)
             if msg.stop_reason != "refusal":
                 try:
                     ok = bool(json.loads(_first_text(msg)).get("worth_forecasting"))
                 except Exception:
                     ok = False
         if ok:
-            keep.append(c)
+            keep.append((k, ms))
         else:
-            log.info("[Brain] batch triage declined %.40s", c["question"])
+            log.info("[Brain] batch triage declined event %.40s (%d markets)", rep["question"], len(ms))
     if not keep:
         return 0
 
     # Budget guard: shrink the research fan-out to what the remaining budget covers.
-    est_each = config.BRAIN_EST_FORECAST_USD * 0.5   # batch rate
+    est_each = config.BRAIN_EST_FORECAST_USD * 0.5   # batch rate, per event
     afford = max(1, int(_spend.remaining() / max(est_each, 0.01)))
     keep = keep[:afford]
 
-    # Stage 2 — research (Sonnet + web search, free-form). pause_turn results still carry
-    # their accumulated text; an empty brief just drops the market this cycle.
-    res = await _batch_run([(f"r{i}", _research_params(c)) for i, c in enumerate(keep)])
+    # Stage 2 — research each EVENT once (Sonnet + web search, brief covers the siblings).
+    res = await _batch_run([(f"r{i}", _research_params(ms[0], siblings=ms[1:]))
+                            for i, (k, ms) in enumerate(keep)])
     briefs: dict = {}
-    for i, c in enumerate(keep):
+    for i, (k, ms) in enumerate(keep):
+        rep = ms[0]
         msg = res.get(f"r{i}")
         if msg is None:
             continue
-        mcost[c["market_id"]] += _spend.record_usage(config.BRAIN_FORECAST_MODEL, msg.usage, batch=True)
-        mcost[c["market_id"]] += _spend.record_web_searches(_count_web_searches(msg))
+        mcost[rep["market_id"]] += _spend.record_usage(config.BRAIN_FORECAST_MODEL, msg.usage, batch=True)
+        mcost[rep["market_id"]] += _spend.record_web_searches(_count_web_searches(msg))
         if msg.stop_reason == "refusal":
             continue
         brief = _first_text(msg).strip()
         if brief:
-            briefs[c["market_id"]] = brief
+            briefs[k] = brief
 
-    # Stage 3 — forecast ensemble (structured, no tools) for every researched market.
+    # Stage 3 — forecast ensemble for EVERY sibling market of each researched event.
     reqs = []
-    for i, c in enumerate(keep):
-        if c["market_id"] not in briefs:
+    for i, (k, ms) in enumerate(keep):
+        if k not in briefs:
             continue
-        for j in range(max(1, config.BRAIN_ENSEMBLE_N)):
-            reqs.append((f"f{i}_{j}", _forecast_params(c, briefs[c["market_id"]], j)))
+        for j, c in enumerate(ms):
+            for r in range(max(1, config.BRAIN_ENSEMBLE_N)):
+                reqs.append((f"f{i}_{j}_{r}", _forecast_params(c, briefs[k], r)))
     if not reqs:
         return 0
     res = await _batch_run(reqs)
     done = 0
-    for i, c in enumerate(keep):
-        if c["market_id"] not in briefs:
+    for i, (k, ms) in enumerate(keep):
+        if k not in briefs:
             continue
-        forecasts = []
-        for j in range(max(1, config.BRAIN_ENSEMBLE_N)):
-            msg = res.get(f"f{i}_{j}")
-            if msg is None:
-                continue
-            mcost[c["market_id"]] += _spend.record_usage(config.BRAIN_FORECAST_MODEL, msg.usage, batch=True)
-            f = _parse_forecast_msg(msg)
-            if f:
-                forecasts.append(f)
-        if forecasts:
-            await _finalize_forecast(c, briefs[c["market_id"]], forecasts, "scanner",
-                                     sender, http_client, mcost[c["market_id"]])
-            done += 1
+        for j, c in enumerate(ms):
+            forecasts = []
+            for r in range(max(1, config.BRAIN_ENSEMBLE_N)):
+                msg = res.get(f"f{i}_{j}_{r}")
+                if msg is None:
+                    continue
+                mcost[c["market_id"]] += _spend.record_usage(config.BRAIN_FORECAST_MODEL, msg.usage, batch=True)
+                f = _parse_forecast_msg(msg)
+                if f:
+                    forecasts.append(f)
+            if forecasts:
+                await _finalize_forecast(c, briefs[k], forecasts, "scanner",
+                                         sender, http_client, mcost[c["market_id"]])
+                done += 1
     return done
 
 
@@ -1000,8 +1050,11 @@ async def _scanner_candidates(http_client) -> list:
     # short-dated market, and fast resolution means fast capital turnover, fast grading, and a
     # fast path to the statistical proof that unlocks bigger stakes. (Was cheapest-volume-first.)
     out.sort(key=lambda c: (c["hours_to_close"] or 1e9, c["_volume"]))
-    return out[: max(config.BRAIN_MAX_PER_CYCLE, config.BRAIN_BATCH_MARKETS
-                     if config.BRAIN_BATCH_ENABLED else 0)]
+    if config.BRAIN_BATCH_ENABLED:
+        # Wide set for the batched path: event grouping needs the SIBLING markets of the
+        # chosen events to still be present (they'd be cut by a tight per-market limit).
+        return out[: max(24, config.BRAIN_BATCH_MARKETS * config.BRAIN_EVENT_SIBLINGS * 3)]
+    return out[: config.BRAIN_MAX_PER_CYCLE]
 
 
 def _scanner_market(m: dict, now: datetime):

@@ -131,6 +131,16 @@ DEPTH_SIZING_ENABLED: bool = os.getenv("DEPTH_SIZING_ENABLED", "true").lower() i
 DEPTH_MAX_FRACTION: float = float(os.getenv("DEPTH_MAX_FRACTION", "0.15"))
 DEPTH_PRICE_TOL: float = float(os.getenv("DEPTH_PRICE_TOL", "0.02"))
 
+# Sweat cards (2026-07-04, UX): the dead time between betslip and settle is where audience
+# attention leaks away. Watch open positions' live prices; when one swings hard, post a
+# threaded update under its slip in the bot's voice ("41¢ → 58¢ — the market's coming
+# around"). Pure price reads — zero LLM cost. Re-alerts only after ANOTHER full move from
+# the last alerted price; globally capped per cycle so a book-wide swing can't storm the feed.
+SWEAT_CARDS_ENABLED: bool = os.getenv("SWEAT_CARDS_ENABLED", "true").lower() in ("true", "1", "yes")
+SWEAT_CHECK_SECONDS: int = int(os.getenv("SWEAT_CHECK_SECONDS", "900"))       # 15 min
+SWEAT_MOVE_THRESHOLD: float = float(os.getenv("SWEAT_MOVE_THRESHOLD", "0.15"))  # 15¢
+SWEAT_MAX_PER_CYCLE: int = int(os.getenv("SWEAT_MAX_PER_CYCLE", "3"))
+
 BRAIN_PICK_TRADING_ENABLED: bool = os.getenv("BRAIN_PICK_TRADING_ENABLED", "false").lower() in ("true", "1", "yes")
 # Conviction-scaled pick stakes (2026-07-04): the picks went 7-0 (+34% ROI) at $1 flat — the
 # only strategy in this bot's history with a winning record. Stake now scales with the brain's
@@ -140,7 +150,9 @@ BRAIN_PICK_TRADING_ENABLED: bool = os.getenv("BRAIN_PICK_TRADING_ENABLED", "fals
 BRAIN_PICK_SIZE_USDC: float = float(os.getenv("BRAIN_PICK_SIZE_USDC", "2.0"))
 BRAIN_PICK_MAX_SIZE_USDC: float = float(os.getenv("BRAIN_PICK_MAX_SIZE_USDC", "5.0"))
 BRAIN_PICK_EDGE_SLOPE: float = float(os.getenv("BRAIN_PICK_EDGE_SLOPE", "15.0"))
-BRAIN_PICK_MAX_PER_DAY: int = int(os.getenv("BRAIN_PICK_MAX_PER_DAY", "8"))
+# 8→10 (2026-07-04): event-grouped research raises pick flow to ~5-8/day; the $8/event cap,
+# depth sizing, reserve gate and daily-loss stop bound the added exposure.
+BRAIN_PICK_MAX_PER_DAY: int = int(os.getenv("BRAIN_PICK_MAX_PER_DAY", "10"))
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -368,6 +380,11 @@ _last_dash_update: float = 0.0
 # derivative markets. Seeded from /api/positions/open, incremented on fills. Kept in lockstep
 # with _held_positions at the seed/fill sites.
 _held_event_exposure: dict = {}
+
+# Sweat cards: alert_id -> price at last sweat alert (entry price until the first alert).
+# In-process; a restart just resets the baselines to entry (worst case: one repeat card).
+_sweat_last_px: dict = {}
+_last_sweat_check: float = 0.0
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -1866,9 +1883,32 @@ async def _tg_call(http_client: httpx.AsyncClient, method: str, payload: dict) -
         return None
 
 
+def _next_resolving(positions, now_ts: float) -> Optional[tuple]:
+    """Pure: (question, hours_until) of the soonest-resolving open position with a future
+    end_date, or None. Feeds the dashboard's appointment-viewing countdown line."""
+    best = None
+    for p in positions or []:
+        end_raw = p.get("end_date")
+        if not end_raw:
+            continue
+        try:
+            from datetime import datetime as _dt
+            end = _dt.fromisoformat(str(end_raw).replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+        if end <= now_ts:
+            continue
+        if best is None or end < best[1]:
+            best = (p.get("market_question") or "?", end)
+    if best is None:
+        return None
+    return (best[0], (best[1] - now_ts) / 3600.0)
+
+
 def _build_dashboard_text(*, bank: float, vault: float, open_n: int, cap: int, tier: str,
                           today_w: int, today_l: int, today_pnl: float,
-                          picks_today: int, sizeups_today: int, ts_utc: str) -> str:
+                          picks_today: int, sizeups_today: int, ts_utc: str,
+                          next_q: Optional[str] = None, next_h: Optional[float] = None) -> str:
     """Pure dashboard card. One glance = the whole state of the operation. Edited in place,
     so it always carries a fresh timestamp (also defeats Telegram's 'not modified' rejection)."""
     total = today_w + today_l
@@ -1887,12 +1927,18 @@ def _build_dashboard_text(*, bank: float, vault: float, open_n: int, cap: int, t
         brain_bit.append(f"{sizeups_today} size-up{'s' if sizeups_today != 1 else ''}")
     brain_line = f"\n🧠 brain today: {', '.join(brain_bit)}" if brain_bit else ""
     vault_bit = f" · 🏛 vault <b>${vault:.2f}</b>" if vault >= 0 else ""
+    next_line = ""
+    if next_q and next_h is not None:
+        import html as _html
+        when = f"~{next_h:.0f}h" if next_h >= 1.5 else f"~{max(1, int(next_h * 60))}min"
+        next_line = f"\n⏳ next result: {_html.escape(str(next_q)[:52])} in <b>{when}</b>"
     return (
         f"📟 <b>V1 POLY — LIVE BOOK</b>\n"
         f"💰 bank <b>${bank:.2f}</b>{vault_bit}\n"
         f"🎫 <b>{open_n}</b> open positions ({tier} {open_n}/{cap})\n"
         f"📅 today: {record_bit} {dots}"
-        f"{brain_line}\n"
+        f"{brain_line}"
+        f"{next_line}\n"
         f"<i>auto-updates · last {ts_utc} UTC</i>"
     )
 
@@ -1916,6 +1962,9 @@ async def _update_dashboard(http_client: httpx.AsyncClient, stats: dict) -> None
         today_w = sum(1 for r in resolved if r.get("resolution_status") == "won")
         today_l = sum(1 for r in resolved if r.get("resolution_status") == "lost")
         today_pnl = sum(float(r.get("pnl") or 0.0) for r in resolved)
+        # Appointment viewing: when does the next open position resolve?
+        _positions = await _api_get(http_client, "/api/positions/open")
+        _nxt = _next_resolving(_positions if isinstance(_positions, list) else [], now)
         open_n = int(stats.get("open_positions", 0))
         cap = min(_current_max_positions or TRADING_NORMAL_POSITIONS_MAX, TRADING_NORMAL_POSITIONS_MAX) \
             if _current_tier == "normal" else TRADING_PREMIUM_POSITIONS_MAX
@@ -1925,6 +1974,7 @@ async def _update_dashboard(http_client: httpx.AsyncClient, stats: dict) -> None
             today_w=today_w, today_l=today_l, today_pnl=today_pnl,
             picks_today=_brain_picks_today, sizeups_today=_brain_sizeups_today,
             ts_utc=time.strftime("%H:%M", time.gmtime()),
+            next_q=_nxt[0] if _nxt else None, next_h=_nxt[1] if _nxt else None,
         )
         if _dash_msg_id is None:
             result = await _tg_call(http_client, "sendMessage", {
@@ -1946,6 +1996,111 @@ async def _update_dashboard(http_client: httpx.AsyncClient, stats: dict) -> None
                 _dash_msg_id = None
     except Exception as exc:
         log.debug("[Dashboard] update error (non-fatal): %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Sweat cards — the middle of the story, threaded under the betslip
+# ---------------------------------------------------------------------------
+
+_SWEAT_RISING = [
+    "the market's coming around to our side. as it should.",
+    "someone big just agreed with us. welcome to the trade.",
+    "called it early, watching the price catch up.",
+    "this is the part where the bot pretends it never doubted.",
+    "the line is moving our way. act natural.",
+]
+_SWEAT_FALLING = [
+    "hostile territory. holding.",
+    "the market disagrees. the market has been wrong before.",
+    "sweating. this is the sweat. this is what we came for.",
+    "conviction is easy when you're winning. this is the other kind.",
+    "down but not out. the bot has seen worse. the bot has BEEN worse.",
+]
+
+
+def _sweat_trigger(entry_px, current_px, last_alert_px, threshold: float = None):
+    """Pure decision: has this position moved enough to earn a sweat card? Baseline is the
+    LAST alerted price (entry until the first alert), so each card requires a fresh full move
+    — no spam from a price oscillating around one level. Returns None or 'rising'/'falling'
+    relative to our side (we own the outcome: price up = winning)."""
+    if threshold is None:
+        threshold = SWEAT_MOVE_THRESHOLD
+    try:
+        base = float(last_alert_px if last_alert_px is not None else entry_px)
+        cur = float(current_px)
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 < base < 1.0 and 0.0 < cur < 1.0):
+        return None
+    if cur - base >= threshold:
+        return "rising"
+    if base - cur >= threshold:
+        return "falling"
+    return None
+
+
+def _build_sweat_text(market_q: str, bet_side: str, entry_px: float, current_px: float,
+                      size: float, direction: str, seed: int) -> str:
+    """Pure sweat card. Entry → now, live payout math, one line of house voice."""
+    import html as _html
+    arrow = "📈" if direction == "rising" else "📉"
+    line = _pick_line(_SWEAT_RISING if direction == "rising" else _SWEAT_FALLING, seed)
+    value_now = (size / entry_px) * current_px if entry_px > 0 else 0.0
+    swing = f"position worth <b>${value_now:.2f}</b> on ${size:.2f} staked" if size > 0 else ""
+    return (
+        f"{arrow} <b>LIVE</b> — {_html.escape(str(bet_side))} · {_html.escape(str(market_q)[:70])}\n"
+        f"{entry_px*100:.0f}¢ → <b>{current_px*100:.0f}¢</b> · {swing}\n"
+        f"<i>{line}</i>"
+    )
+
+
+async def _check_sweat_cards(clob_client, http_client: httpx.AsyncClient) -> None:
+    """Watch open positions for big price swings and thread updates under their betslips.
+    Best-effort by design; capped per cycle; zero LLM cost (CLOB price reads only)."""
+    global _last_sweat_check
+    if not SWEAT_CARDS_ENABLED:
+        return
+    now = time.time()
+    if now - _last_sweat_check < SWEAT_CHECK_SECONDS:
+        return
+    _last_sweat_check = now
+    try:
+        positions = await _api_get(http_client, "/api/positions/open")
+        if not isinstance(positions, list):
+            return
+        posted = 0
+        for p in positions:
+            if posted >= SWEAT_MAX_PER_CYCLE:
+                break
+            token = p.get("clob_token_id")
+            entry = p.get("bet_price_filled") or p.get("bet_price_intended")
+            aid = p.get("alert_id") or ""
+            if not token or not entry or not aid:
+                continue
+            try:
+                resp = await asyncio.to_thread(clob_client.get_price, token, "BUY")
+                cur = float(resp.get("price") if isinstance(resp, dict) else resp)
+            except Exception:
+                continue
+            direction = _sweat_trigger(entry, cur, _sweat_last_px.get(aid))
+            if not direction:
+                continue
+            _sweat_last_px[aid] = cur
+            text = _build_sweat_text(
+                p.get("market_question") or "", p.get("bet_side") or "",
+                float(entry), cur, float(p.get("size_usdc") or 0.0),
+                direction, seed=int(cur * 100) + len(aid),
+            )
+            await _send_telegram(http_client, text, silent=True,
+                                 reply_to=_slip_msgs.get(aid))
+            posted += 1
+            log.info("[Sweat] %s %s: %.2f → %.2f (%s)", aid[:12],
+                     (p.get("market_question") or "")[:30], float(entry), cur, direction)
+        if len(_sweat_last_px) > 400:   # bound the baseline map
+            for k in list(_sweat_last_px)[:200]:
+                _sweat_last_px.pop(k, None)
+    except Exception as exc:
+        log.debug("[Sweat] check error (non-fatal): %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -3930,6 +4085,10 @@ async def main() -> None:
 
                 # Live dashboard: refresh the pinned audience card (rate-limited internally).
                 await _update_dashboard(http_client, stats)
+
+                # Sweat cards: thread live price-swing updates under open betslips
+                # (rate-limited internally; zero LLM cost).
+                await _check_sweat_cards(clob_client, http_client)
 
                 block_reason = await _check_risk_limits(stats, http_client=http_client)
                 if block_reason:

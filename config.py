@@ -429,11 +429,15 @@ BRAIN_EFFORT: str = os.getenv("BRAIN_EFFORT", "low")
 # credit cap. New budget: $1.25/day ≈ $35/mo ceiling → ~3-4 researched markets/day (the picks'
 # 7-0 record was built on ~6/day, so this keeps the winning strategy alive at half the burn).
 BRAIN_DAILY_USD_CAP: float = float(os.getenv("BRAIN_DAILY_USD_CAP", "1.25"))
-# Conservative pre-check estimate of one full forecast's cost (triage+research+ensemble).
-BRAIN_EST_FORECAST_USD: float = float(os.getenv("BRAIN_EST_FORECAST_USD", "0.05"))
+# Conservative pre-check estimate of one full researched forecast's cost (triage + web
+# research + ensemble). Measured live 2026-07-04: ~$0.31 sequential, ~$0.16 at batch rates
+# (the batch path budgets with this × 0.5). The old $0.05 guess let cycles start on fumes.
+BRAIN_EST_FORECAST_USD: float = float(os.getenv("BRAIN_EST_FORECAST_USD", "0.30"))
 
 # Ensemble: N independent forecast runs → mean → (reconcile if they disagree) → calibrate.
-BRAIN_ENSEMBLE_N: int = int(os.getenv("BRAIN_ENSEMBLE_N", "3"))
+# 2 runs + reconcile-on-disagreement retains most of the ensemble value at 2/3 the cost
+# (2026-07-04 throughput push — the saved tokens buy more researched markets instead).
+BRAIN_ENSEMBLE_N: int = int(os.getenv("BRAIN_ENSEMBLE_N", "2"))
 # Real-time vet (the trader calls /api/brain/vet at trade time): a SMALLER ensemble so the
 # verdict comes back fast enough to actually size the position. Cost audit 2026-07-04: vets are
 # commentary + rarely gate anything, so they run on Haiku (5x cheaper than Sonnet) with a single
@@ -487,9 +491,18 @@ BRAIN_MAX_PER_CYCLE: int = int(os.getenv("BRAIN_MAX_PER_CYCLE", "2"))
 # ~1h), so the same $1.25/day researches ~2x the markets (~7-8/day vs ~4). Falls back to the
 # sequential path automatically if a batch fails.
 BRAIN_BATCH_ENABLED: bool = os.getenv("BRAIN_BATCH_ENABLED", "true").lower() in ("true", "1", "yes")
-BRAIN_BATCH_MARKETS: int = int(os.getenv("BRAIN_BATCH_MARKETS", "4"))       # candidates per batched cycle
+BRAIN_BATCH_MARKETS: int = int(os.getenv("BRAIN_BATCH_MARKETS", "2"))       # EVENTS per batched cycle
 BRAIN_BATCH_POLL_SECONDS: int = int(os.getenv("BRAIN_BATCH_POLL_SECONDS", "20"))
 BRAIN_BATCH_TIMEOUT_S: int = int(os.getenv("BRAIN_BATCH_TIMEOUT_S", "2700"))  # 45 min < the 2h cycle
+# Event-grouped research (2026-07-04, the throughput unlock): one match carries 4-6 tradeable
+# derivative markets (O/U lines, spread, BTTS, exact scores) that all share the SAME research.
+# The scanner now researches the EVENT once and forecasts up to BRAIN_EVENT_SIBLINGS sibling
+# markets against the shared brief — ~3x pick flow per research dollar. The $8/event exposure
+# cap (trader-side) keeps the resulting correlated picks bounded by construction.
+BRAIN_EVENT_SIBLINGS: int = int(os.getenv("BRAIN_EVENT_SIBLINGS", "4"))
+# Web searches per research call: 2 searches' worth of result context is plenty for an
+# evidence brief; unbounded search context was the hidden token cost of research calls.
+BRAIN_RESEARCH_MAX_SEARCHES: int = int(os.getenv("BRAIN_RESEARCH_MAX_SEARCHES", "2"))
 BRAIN_REFORECAST_HOURS: float = float(os.getenv("BRAIN_REFORECAST_HOURS", "72"))  # don't re-forecast a market within this window
 
 # Scanner (long-tail mispricing hunt) market filters.

@@ -140,6 +140,25 @@ def test_brain_pick_side_buys_the_underpriced_side_with_correct_token():
     print("  [ok] brain pick: buys the underpriced side with the index-correct token (no side bug)")
 
 
+def test_event_grouping_for_batched_scanner():
+    cands = [
+        {"market_id": "0xA", "slug": "fifwc-eng-gha-2026-06-23-more-markets", "question": "q1"},
+        {"market_id": "0xB", "slug": "fifwc-eng-gha-2026-06-23", "question": "q2"},
+        {"market_id": "0xC", "slug": "fifwc-pan-hrv-2026-06-23-exact-score", "question": "q3"},
+        {"market_id": "0xD", "slug": "fifwc-eng-gha-2026-06-23-halftime-result", "question": "q4"},
+        {"market_id": "0xE", "slug": None, "question": "q5"},
+    ]
+    groups = brain._group_events(cands)
+    keys = [k for k, _ in groups]
+    # 3 events: eng-gha (3 markets), pan-hrv (1), the slugless one alone
+    assert len(groups) == 3
+    assert keys[0] == "fifwc-eng-gha-2026-06-23" and len(groups[0][1]) == 3
+    assert [m["market_id"] for m in groups[0][1]] == ["0xA", "0xB", "0xD"]  # order preserved
+    assert keys[1] == "fifwc-pan-hrv-2026-06-23"
+    assert keys[2] == "0xE"   # no slug → market stands alone
+    print("  [ok] event grouping: siblings collapse per event, candidate order preserved")
+
+
 def test_billing_breaker_and_output_config():
     import time as _t
     # billing error arms the cooldown; unrelated errors don't
@@ -176,6 +195,7 @@ if __name__ == "__main__":
     test_brier_and_aggregate()
     test_spend_tracker_cap_and_cost()
     test_brain_pick_side_buys_the_underpriced_side_with_correct_token()
+    test_event_grouping_for_batched_scanner()
     test_billing_breaker_and_output_config()
     test_clamp_guards_bad_model_output()
     print("all brain tests passed")

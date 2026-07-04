@@ -1592,14 +1592,15 @@ def get_tradeable_alerts_for_api(
 def get_open_positions_for_api() -> list[dict]:
     """Return filled, pending-resolution trades joined with score from alert_outcomes.
     Includes market_slug (from markets.raw_json) so the remote trader can group derivative
-    markets of the same underlying event for the correlation-exposure cap."""
+    markets of the same underlying event for the correlation-exposure cap, plus
+    clob_token_id (sweat-card price watch) and end_date (dashboard countdown)."""
     rows = get_db().execute(
         """
         SELECT te.alert_id, te.market_id, te.market_question,
                te.bet_side, te.bet_price_filled, te.bet_price_intended,
-               te.size_usdc, te.created_at,
+               te.size_usdc, te.created_at, te.clob_token_id,
                ao.score,
-               m.raw_json
+               m.raw_json, m.end_date
         FROM trade_executions te
         LEFT JOIN alert_outcomes ao ON te.alert_id = ao.alert_id
         LEFT JOIN markets m ON te.market_id = m.condition_id

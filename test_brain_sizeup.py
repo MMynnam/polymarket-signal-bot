@@ -174,6 +174,47 @@ def test_depth_capped_size():
     print("  [ok] depth sizing: caps at fraction of in-tolerance depth, never raises size")
 
 
+def test_sweat_trigger():
+    tr.SWEAT_MOVE_THRESHOLD = 0.15
+    # first alert measures from ENTRY
+    assert tr._sweat_trigger(0.41, 0.58, None) == "rising"      # +17¢
+    assert tr._sweat_trigger(0.62, 0.40, None) == "falling"     # -22¢
+    assert tr._sweat_trigger(0.41, 0.50, None) is None          # +9¢ < threshold
+    # after an alert, baseline moves — needs ANOTHER full move (no oscillation spam)
+    assert tr._sweat_trigger(0.41, 0.60, 0.58) is None          # only +2¢ since last alert
+    assert tr._sweat_trigger(0.41, 0.74, 0.58) == "rising"      # +16¢ since last alert
+    assert tr._sweat_trigger(0.41, 0.42, 0.58) == "falling"     # -16¢ since last alert
+    # garbage in → no card
+    assert tr._sweat_trigger(None, 0.5, None) is None
+    assert tr._sweat_trigger(0.5, "x", None) is None
+    print("  [ok] sweat trigger: full move from last-alerted price, both directions, no spam")
+
+
+def test_sweat_card_text():
+    s = tr._build_sweat_text("England vs Ghana: O/U 3.5", "Over", 0.41, 0.58, 1.95, "rising", seed=3)
+    assert "41¢" in s and "58¢" in s and "📈" in s and "$2.76" in s   # (1.95/0.41)*0.58
+    s2 = tr._build_sweat_text("X <tag>", "No", 0.62, 0.40, 2.0, "falling", seed=1)
+    assert "📉" in s2 and "&lt;tag&gt;" in s2
+    print("  [ok] sweat card: entry→now, live position value, HTML-escaped")
+
+
+def test_next_resolving():
+    import time as _t
+    now = _t.time()
+    from datetime import datetime, timezone
+    def iso(hours):
+        return datetime.fromtimestamp(now + hours * 3600, tz=timezone.utc).isoformat()
+    ps = [{"market_question": "far", "end_date": iso(30)},
+          {"market_question": "soon", "end_date": iso(2)},
+          {"market_question": "past", "end_date": iso(-5)},
+          {"market_question": "none", "end_date": None}]
+    q, h = tr._next_resolving(ps, now)
+    assert q == "soon" and 1.9 < h < 2.1
+    assert tr._next_resolving([{"end_date": iso(-1)}], now) is None
+    assert tr._next_resolving([], now) is None
+    print("  [ok] next-resolving: soonest FUTURE end date wins; past/missing ignored")
+
+
 def test_betslip_renders_brain_verdict_on_every_vetted_slip():
     # Un-vetted bet → no brain line at all.
     plain = tr._build_slip_text("Knicks make playoffs?", "Yes", 0.40, 2.0, bet_no=7)
@@ -213,5 +254,8 @@ if __name__ == "__main__":
     test_event_key_groups_derivative_markets()
     test_event_cap_decision()
     test_depth_capped_size()
+    test_sweat_trigger()
+    test_sweat_card_text()
+    test_next_resolving()
     test_betslip_renders_brain_verdict_on_every_vetted_slip()
     print("all brain-sizeup tests passed")
