@@ -1077,15 +1077,35 @@ async def _scanner_candidates(http_client) -> list:
             cand = _scanner_market(m, now)
             if cand:
                 out.append(cand)
-    # Soonest-to-resolve first (volume as tiebreak): every one of the picks' first 7 wins was a
-    # short-dated market, and fast resolution means fast capital turnover, fast grading, and a
-    # fast path to the statistical proof that unlocks bigger stakes. (Was cheapest-volume-first.)
-    out.sort(key=lambda c: (c["hours_to_close"] or 1e9, c["_volume"]))
+    # v2 targeting (2026-07-09): NON-SPORTS first — 56 graded forecasts showed no edge over
+    # quant-priced sports-derivative books; scattered-information markets (politics,
+    # entertainment, crypto, one-offs) are where LLM research can actually out-forecast the
+    # price. Within each tier: soonest-to-resolve, volume tiebreak (fast grading, fast proof).
+    out.sort(key=lambda c: (
+        _looks_sports(c) if config.BRAIN_SCAN_DEPRIORITIZE_SPORTS else 0,
+        c["hours_to_close"] or 1e9,
+        c["_volume"],
+    ))
     if config.BRAIN_BATCH_ENABLED:
         # Wide set for the batched path: event grouping needs the SIBLING markets of the
         # chosen events to still be present (they'd be cut by a tight per-market limit).
         return out[: max(24, config.BRAIN_BATCH_MARKETS * config.BRAIN_EVENT_SIBLINGS * 3)]
     return out[: config.BRAIN_MAX_PER_CYCLE]
+
+
+_SPORTS_PATTERNS = (" vs. ", " vs ", "o/u ", "spread:", "exact score", "1st half", "2nd half",
+                    "both teams to score", "halftime", "win on 20", "end in a draw",
+                    "first inning", "game handicap")
+
+
+def _looks_sports(cand: dict) -> int:
+    """1 if the candidate smells like a sports/derivative market (deprioritized in v2), else 0.
+    Category first, question-pattern fallback (Gamma categories are often missing)."""
+    cat = (cand.get("category") or "").lower()
+    if any(w in cat for w in ("sport", "esport", "nba", "nfl", "soccer", "football", "mlb", "wnba")):
+        return 1
+    q = (cand.get("question") or "").lower()
+    return 1 if any(p in q for p in _SPORTS_PATTERNS) else 0
 
 
 def _scanner_market(m: dict, now: datetime):

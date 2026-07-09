@@ -472,9 +472,12 @@ BRAIN_PICK_MIN_CONFIDENCE: float = float(os.getenv("BRAIN_PICK_MIN_CONFIDENCE", 
 BRAIN_PICK_SCORE: int = int(os.getenv("BRAIN_PICK_SCORE", "90"))
 # If the ensemble's stdev exceeds this, spend one supervisor call to reconcile.
 BRAIN_RECONCILE_STD: float = float(os.getenv("BRAIN_RECONCILE_STD", "0.15"))
-# Platt/log-odds extremization coefficient (√3≈1.73 counteracts LLM hedging toward 0.5).
-# This is a literature PRIOR — re-fit from resolved forecasts once enough have graded.
-BRAIN_PLATT_COEF: float = float(os.getenv("BRAIN_PLATT_COEF", "1.73"))
+# Platt/log-odds calibration coefficient. HISTORY: launched at the literature prior √3≈1.73
+# ("extremize to counteract LLM hedging"). 2026-07-09 re-fit on OUR 56 graded forecasts found
+# the optimum at ~0.7-0.8 — this brain is OVERconfident, not a hedger, and extremizing it
+# manufactured phantom edges (the root cause of picks winning 77% of bets while losing money:
+# fake edges bought at full spread). <1 shrinks toward 0.5; re-fit again as the sample grows.
+BRAIN_PLATT_COEF: float = float(os.getenv("BRAIN_PLATT_COEF", "0.8"))
 
 # Decision thresholds (shadow: controls what gets flagged; live: would gate a trade).
 BRAIN_EDGE_THRESHOLD: float = float(os.getenv("BRAIN_EDGE_THRESHOLD", "0.10"))   # min |brain_prob − price|
@@ -500,9 +503,15 @@ BRAIN_BATCH_TIMEOUT_S: int = int(os.getenv("BRAIN_BATCH_TIMEOUT_S", "2700"))  # 
 # markets against the shared brief — ~3x pick flow per research dollar. The $8/event exposure
 # cap (trader-side) keeps the resulting correlated picks bounded by construction.
 BRAIN_EVENT_SIBLINGS: int = int(os.getenv("BRAIN_EVENT_SIBLINGS", "4"))
-# Web searches per research call: 2 searches' worth of result context is plenty for an
-# evidence brief; unbounded search context was the hidden token cost of research calls.
-BRAIN_RESEARCH_MAX_SEARCHES: int = int(os.getenv("BRAIN_RESEARCH_MAX_SEARCHES", "2"))
+# Web searches per research call. 2026-07-09 v2 re-aim: 2 shallow searches couldn't beat
+# quant-priced markets (56-forecast Brier read: brain ≈ market at best). v2 trades breadth
+# for depth — fewer researched events, 4 searches each.
+BRAIN_RESEARCH_MAX_SEARCHES: int = int(os.getenv("BRAIN_RESEARCH_MAX_SEARCHES", "4"))
+# Scanner targeting (v2): soccer-derivative books are priced by models even when thin —
+# our graded data shows no edge there. TRUE mispricing lives where information is scattered
+# (politics, entertainment, crypto, niche one-offs). Sports markets are deprioritized (not
+# excluded): non-sports candidates get the research budget first; sports fill leftovers.
+BRAIN_SCAN_DEPRIORITIZE_SPORTS: bool = os.getenv("BRAIN_SCAN_DEPRIORITIZE_SPORTS", "true").lower() in ("true", "1", "yes")
 BRAIN_REFORECAST_HOURS: float = float(os.getenv("BRAIN_REFORECAST_HOURS", "72"))  # don't re-forecast a market within this window
 
 # Scanner (long-tail mispricing hunt) market filters.
