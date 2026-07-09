@@ -370,6 +370,7 @@ def _triage_params(market: dict) -> dict:
         "reflexively pass on a researchable event just because it's a coin-flip-looking sport."
     )
     user = (
+        f"Today's date: {datetime.utcnow():%Y-%m-%d} (UTC).\n"
         f"Question: {market['question']}\n"
         f"Resolution detail: {market.get('description', '(none)')}\n"
         f"Current price (implied prob of '{market['target_label']}'): {market['market_price']:.2f}\n"
@@ -413,18 +414,24 @@ def _research_params(market: dict, siblings: list = None) -> dict:
     sys = (
         "You are a forecasting research analyst. Given a prediction-market question, "
         "search the web for the most relevant CURRENT evidence: recent news, base rates, "
-        "scheduled events, expert views, and anything that bears on the outcome. Then write "
-        "a concise evidence brief (≈250 words): the key factors for and against, the most "
-        "decisive facts, and your qualitative sense of likelihood. When related markets on "
-        "the same event are listed, make the brief rich enough to inform ALL of them "
-        "(totals, margins, both-sides dynamics — not just the headline question). Do NOT "
-        "simply restate the market price — reason from the evidence. Note your uncertainty."
+        "scheduled events, expert views, and anything that bears on the outcome. "
+        "CRITICAL for markets about a current price, level, or count (crypto/stock prices, "
+        "follower or post counts, polling numbers): your FIRST search must establish the "
+        "CURRENT value as of today — headlines lag reality, and a brief anchored on a "
+        "days-old move (a dip, a spike) is worse than no brief. State the current value and "
+        "its as-of time explicitly in the brief. Then write a concise evidence brief "
+        "(≈250 words): the key factors for and against, the most decisive facts, and your "
+        "qualitative sense of likelihood. When related markets on the same event are listed, "
+        "make the brief rich enough to inform ALL of them (totals, margins, both-sides "
+        "dynamics — not just the headline question). Do NOT simply restate the market "
+        "price — reason from the evidence. Note your uncertainty."
     )
     sib_bit = ""
     if siblings:
         lines = "\n".join(f"- {m['question']}" for m in siblings[:6])
         sib_bit = f"\nRelated markets on the SAME event (the brief must inform these too):\n{lines}\n"
     user = (
+        f"Today's date: {datetime.utcnow():%A, %B %d, %Y} (UTC).\n"
         f"Question: {market['question']}\n"
         f"Resolution detail: {market.get('description', '(none)')}\n"
         f"Target outcome to assess: '{market['target_label']}'\n"
@@ -503,6 +510,7 @@ def _forecast_params(market: dict, brief: str, run_idx: int, model: str = None) 
         "both in [0,1]."
     )
     user = (
+        f"Today's date: {datetime.utcnow():%A, %B %d, %Y} (UTC).\n"
         f"Market: {market['question']}\n"
         f"The probability you output is P('{market['target_label']}' occurs).\n"
         f"Current market price for this outcome: {market['market_price']:.2f}\n\n"
