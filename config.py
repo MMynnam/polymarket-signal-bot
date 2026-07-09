@@ -470,6 +470,11 @@ BRAIN_PICK_MIN_EDGE: float = float(os.getenv("BRAIN_PICK_MIN_EDGE", "0.08"))
 BRAIN_PICK_MIN_CONFIDENCE: float = float(os.getenv("BRAIN_PICK_MIN_CONFIDENCE", "0.60"))
 # Score stamped on the synthetic alert so it clears the trader's min-score + premium-tier gates.
 BRAIN_PICK_SCORE: int = int(os.getenv("BRAIN_PICK_SCORE", "90"))
+# Red-team gate (2026-07-10): before ANY pick emits, one adversarial pass argues the market's
+# side — stale facts (check dates), misread resolution rules, ignored base rates — and can kill
+# the trade. Targets the observed failure mode (the stale-headline BTC bet). Additive filter:
+# if the red team can't run (budget/error), the pick proceeds as before. ~$0.01-0.02 per candidate.
+BRAIN_RED_TEAM_ENABLED: bool = os.getenv("BRAIN_RED_TEAM_ENABLED", "true").lower() in ("true", "1", "yes")
 # If the ensemble's stdev exceeds this, spend one supervisor call to reconcile.
 BRAIN_RECONCILE_STD: float = float(os.getenv("BRAIN_RECONCILE_STD", "0.15"))
 # Platt/log-odds calibration coefficient. HISTORY: launched at the literature prior √3≈1.73

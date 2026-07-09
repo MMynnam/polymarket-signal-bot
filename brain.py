@@ -478,6 +478,49 @@ async def _research(market: dict):
     return (brief or None), n_search
 
 
+# Self-calibration memory: the brain's own graded record, fed back into every forecast so it
+# is no longer a cold start. Uses RAW probabilities (measures the model, not our calibration
+# layer). Cached hourly; silent until n>=20 graded.
+_memo_cache = {"ts": 0.0, "text": ""}
+
+
+def _calibration_memo() -> str:
+    import database
+    now = time.time()
+    if now - _memo_cache["ts"] < 3600:
+        return _memo_cache["text"]
+    text = ""
+    try:
+        rows = database.get_db().execute(
+            "SELECT brain_prob_raw p, resolved_outcome y FROM brain_forecasts "
+            "WHERE resolved_outcome IS NOT NULL"
+        ).fetchall()
+        if len(rows) >= 20:
+            n = len(rows)
+            bias = (sum(r["p"] for r in rows) - sum(r["y"] for r in rows)) / n * 100
+            if bias > 3:
+                read = "overconfident — shade toward the market"
+            elif bias < -3:
+                read = "underconfident — trust your reads more"
+            else:
+                read = "well centered"
+            bits = [f"Across {n} graded forecasts your raw probabilities run {bias:+.0f}pp vs "
+                    f"reality ({read})."]
+            hi = [r for r in rows if r["p"] >= 0.6]
+            lo = [r for r in rows if r["p"] <= 0.4]
+            if len(hi) >= 8:
+                bits.append(f"When you said ≥60%, it happened {100*sum(r['y'] for r in hi)/len(hi):.0f}% "
+                            f"of the time (n={len(hi)}).")
+            if len(lo) >= 8:
+                bits.append(f"When you said ≤40%, it happened {100*sum(r['y'] for r in lo)/len(lo):.0f}% "
+                            f"of the time (n={len(lo)}).")
+            text = "Your graded track record — use it to self-calibrate: " + " ".join(bits)
+    except Exception as exc:
+        log.debug("[Brain] calibration memo unavailable: %s", exc)
+    _memo_cache.update(ts=now, text=text)
+    return text
+
+
 def _parse_forecast_msg(msg):
     """Parse one forecast response message into the ensemble dict (shared sync + batch)."""
     if msg is None or msg.stop_reason == "refusal":
@@ -509,13 +552,26 @@ def _forecast_params(market: dict, brief: str, run_idx: int, model: str = None) 
         "screenshot. No hedging-speak, no disclaimers, no emoji. Probability and confidence are "
         "both in [0,1]."
     )
+    # Ensemble diversity: each pass gets a distinct analytical lens instead of being a copy
+    # of the same analyst nodding at itself. Outside view first (base rates beat headlines).
+    lenses = (
+        "Analytical lens for THIS pass: the OUTSIDE VIEW. Anchor on base rates and reference "
+        "classes — how often do situations like this resolve this way, historically? Resist "
+        "the pull of today's headlines; they are already in the price.",
+        "Analytical lens for THIS pass: the INSIDE VIEW. Weigh the specific, current evidence "
+        "in the brief — what do the particulars of THIS situation imply, and is anything "
+        "genuinely different from the base-rate case?",
+    )
+    memo = _calibration_memo()
+    memo_bit = f"{memo}\n" if memo else ""
     user = (
         f"Today's date: {datetime.utcnow():%A, %B %d, %Y} (UTC).\n"
+        f"{memo_bit}"
         f"Market: {market['question']}\n"
         f"The probability you output is P('{market['target_label']}' occurs).\n"
         f"Current market price for this outcome: {market['market_price']:.2f}\n\n"
         f"Research brief:\n{brief}\n\n"
-        f"Analytical pass #{run_idx + 1}: weigh the evidence from your own angle and give your probability."
+        f"{lenses[run_idx % len(lenses)]}"
     )
     return {
         "model": model,
@@ -878,10 +934,11 @@ async def _finalize_forecast(market: dict, brief: str, forecasts: list, source: 
             log.warning("[Brain] ops post failed: %s", exc)
 
     # BRAIN PICK: if this scanner forecast is a high-conviction tradeable edge on a thin/obscure
-    # market, emit it as a token-safe synthetic alert the trader can take at discovery stakes.
+    # market, emit it as a token-safe synthetic alert the trader can take at discovery stakes
+    # (after surviving the red-team gate).
     if source == "scanner" and config.BRAIN_PICK_ENABLED:
         try:
-            _emit_brain_pick(market, calibrated, confidence, take)
+            await _emit_brain_pick(market, calibrated, confidence, take, brief)
         except Exception as exc:
             log.warning("[Brain] pick emit error: %s", exc)
     return row
@@ -1213,7 +1270,67 @@ def _brain_pick_side(market: dict, brain_prob: float):
     }
 
 
-def _emit_brain_pick(market: dict, calibrated: float, confidence: float, take: str) -> bool:
+_RED_TEAM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "uphold": {"type": "boolean"},
+        "strongest_objection": {"type": "string"},
+        "revised_probability": {"type": "number"},
+    },
+    "required": ["uphold", "strongest_objection", "revised_probability"],
+    "additionalProperties": False,
+}
+
+
+async def _red_team_pick(market: dict, pick: dict, brief: str, confidence: float):
+    """The risk desk: one adversarial pass that attacks a pick BEFORE money moves — the
+    strongest concrete case that the MARKET is right and we are wrong (stale facts, misread
+    resolution rules, ignored base rates). Returns {uphold, objection, revised} or None when
+    it can't run (budget/error) — an additive filter whose absence never blocks the pipeline."""
+    if not config.BRAIN_RED_TEAM_ENABLED or _billing_paused() or not _spend.can_afford(0.0):
+        return None
+    client = _get_client()
+    sys = (
+        "You are the risk desk of a trading operation. A trade is about to be placed. Your ONLY "
+        "job is to attack it: find the strongest CONCRETE reason the market is right and our "
+        "thesis is wrong — a stale fact (check every date and current value carefully), a misread "
+        "resolution rule, a base rate the thesis ignores, information the brief missed. Then rule: "
+        "uphold the trade only if it survives your best attack, and give your honest revised "
+        "probability for the outcome we would buy."
+    )
+    user = (
+        f"Today's date: {datetime.utcnow():%A, %B %d, %Y} (UTC).\n"
+        f"Market: {market['question']}\n"
+        f"Proposed trade: buy '{pick['buy_side']}' at {pick['buy_price']:.2f} "
+        f"(our probability {pick['brain_prob_side']:.2f}, edge {pick['edge']:+.2f}, "
+        f"confidence {confidence:.2f}).\n\n"
+        f"Our research brief:\n{(brief or '(none)')[:1500]}\n\n"
+        "Attack the trade, then rule."
+    )
+    try:
+        resp = await client.messages.create(
+            model=config.BRAIN_FORECAST_MODEL, max_tokens=600, system=sys,
+            messages=[{"role": "user", "content": user}],
+            output_config=_output_config(_RED_TEAM_SCHEMA, config.BRAIN_FORECAST_MODEL),
+        )
+    except Exception as exc:
+        if not _note_billing_error(exc):
+            log.warning("[Brain] red-team call failed: %s", exc)
+        return None
+    _spend.record_usage(config.BRAIN_FORECAST_MODEL, resp.usage)
+    if resp.stop_reason == "refusal":
+        return None
+    try:
+        d = json.loads(_first_text(resp))
+        return {"uphold": bool(d.get("uphold")),
+                "objection": (d.get("strongest_objection") or "").strip()[:220],
+                "revised": _clamp(d.get("revised_probability"))}
+    except Exception:
+        return None
+
+
+async def _emit_brain_pick(market: dict, calibrated: float, confidence: float, take: str,
+                           brief: str = "") -> bool:
     """If the scanner forecast is a high-conviction tradeable edge, write it as a synthetic
     alert_outcomes row (a Brain Pick) so the trader takes it via the PROVEN token-safe path
     (resolve_token_id_for_side + the normal order/resolution machinery). Returns True if emitted."""
@@ -1223,6 +1340,17 @@ def _emit_brain_pick(market: dict, calibrated: float, confidence: float, take: s
         return False
     if pick["edge"] < config.BRAIN_PICK_MIN_EDGE or confidence < config.BRAIN_PICK_MIN_CONFIDENCE:
         return False
+
+    # Red-team gate: the pick must survive one honest attempt to kill it.
+    rt = await _red_team_pick(market, pick, brief, confidence)
+    if rt is not None:
+        revised_edge = rt["revised"] - pick["buy_price"]
+        if not rt["uphold"] or revised_edge < config.BRAIN_PICK_MIN_EDGE * 0.5:
+            log.info("[Brain] RED TEAM killed pick %.42s — %s (revised P=%.2f, edge %+.2f)",
+                     market["question"], rt["objection"][:90], rt["revised"], revised_edge)
+            return False
+        log.info("[Brain] red team upheld pick %.42s (revised P=%.2f)",
+                 market["question"], rt["revised"])
     ts = int(time.time())
     alert_id = f"brain_{market['market_id']}_{ts}"
     # Ensure the market is in `markets` so resolve_token_id_for_side has clob_token_ids + outcomes.
