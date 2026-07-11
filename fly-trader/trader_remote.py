@@ -153,6 +153,16 @@ BRAIN_PICK_EDGE_SLOPE: float = float(os.getenv("BRAIN_PICK_EDGE_SLOPE", "15.0"))
 # 8→10 (2026-07-04): event-grouped research raises pick flow to ~5-8/day; the $8/event cap,
 # depth sizing, reserve gate and daily-loss stop bound the added exposure.
 BRAIN_PICK_MAX_PER_DAY: int = int(os.getenv("BRAIN_PICK_MAX_PER_DAY", "10"))
+# AUTO-GRADUATION LADDER (2026-07-11): the trader polls /api/brain/gates; when ALL Stage-1
+# evidence gates are green (n≥40 graded picks, ROI CI floor > 0, Brier beats market) pick
+# stakes AUTOMATICALLY step up from discovery ($2-5) to Kelly × bankroll — and AUTOMATICALLY
+# demote back if the edge decays. Promotion is data-triggered; capital can be deposited any
+# time and deploys itself only when earned. LADDER_KELLY_MULT=0.5 → half of the (quarter-Kelly
+# capped) stored fraction = conservative eighth-Kelly. Depth cap + event cap still apply.
+LADDER_ENABLED: bool = os.getenv("LADDER_ENABLED", "true").lower() in ("true", "1", "yes")
+LADDER_KELLY_MULT: float = float(os.getenv("LADDER_KELLY_MULT", "0.5"))
+LADDER_MAX_STAKE_USDC: float = float(os.getenv("LADDER_MAX_STAKE_USDC", "25.0"))
+LADDER_POLL_SECONDS: int = int(os.getenv("LADDER_POLL_SECONDS", "1800"))
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -369,6 +379,10 @@ _brain_sizeups_today: int = 0
 _brain_sizeup_day: str = ""
 _brain_picks_today: int = 0
 _brain_pick_day: str = ""
+
+# Auto-graduation ladder state: polled from /api/brain/gates. Fail-safe: unknown/error → Stage 0.
+_stage1_active: bool = False
+_last_ladder_poll: float = 0.0
 
 # Live dashboard state: the pinned message we edit in place. In-process only — on restart
 # we post a fresh dashboard and re-pin (the old one just stops updating; Telegram replaces
@@ -1911,7 +1925,8 @@ def _next_resolving(positions, now_ts: float) -> Optional[tuple]:
 def _build_dashboard_text(*, bank: float, vault: float, open_n: int, cap: int, tier: str,
                           today_w: int, today_l: int, today_pnl: float,
                           picks_today: int, sizeups_today: int, ts_utc: str,
-                          next_q: Optional[str] = None, next_h: Optional[float] = None) -> str:
+                          next_q: Optional[str] = None, next_h: Optional[float] = None,
+                          stage1: bool = False) -> str:
     """Pure dashboard card. One glance = the whole state of the operation. Edited in place,
     so it always carries a fresh timestamp (also defeats Telegram's 'not modified' rejection)."""
     total = today_w + today_l
@@ -1935,13 +1950,16 @@ def _build_dashboard_text(*, bank: float, vault: float, open_n: int, cap: int, t
         import html as _html
         when = f"~{next_h:.0f}h" if next_h >= 1.5 else f"~{max(1, int(next_h * 60))}min"
         next_line = f"\n⏳ next result: {_html.escape(str(next_q)[:52])} in <b>{when}</b>"
+    ladder_line = ("\n🪜 <b>STAGE 1</b> — stakes scale with conviction × bankroll" if stage1
+                   else "\n🪜 stage 0 (discovery) — earning the evidence for bigger stakes")
     return (
         f"📟 <b>V1 POLY — LIVE BOOK</b>\n"
         f"💰 bank <b>${bank:.2f}</b>{vault_bit}\n"
         f"🎫 <b>{open_n}</b> open positions ({tier} {open_n}/{cap})\n"
         f"📅 today: {record_bit} {dots}"
         f"{brain_line}"
-        f"{next_line}\n"
+        f"{next_line}"
+        f"{ladder_line}\n"
         f"<i>auto-updates · last {ts_utc} UTC</i>"
     )
 
@@ -1978,6 +1996,7 @@ async def _update_dashboard(http_client: httpx.AsyncClient, stats: dict) -> None
             picks_today=_brain_picks_today, sizeups_today=_brain_sizeups_today,
             ts_utc=time.strftime("%H:%M", time.gmtime()),
             next_q=_nxt[0] if _nxt else None, next_h=_nxt[1] if _nxt else None,
+            stage1=_stage1_active,
         )
         if _dash_msg_id is None:
             result = await _tg_call(http_client, "sendMessage", {
@@ -2964,14 +2983,23 @@ async def _execute_trade(
             log.info("[Brain] pick %s — daily pick cap reached (%d)", alert_id[:20], BRAIN_PICK_MAX_PER_DAY)
             await _record_brain_pick_skip(http_client, alert, "daily brain-pick cap reached")
             return
-        # Conviction-scaled stake from the pick's researched edge (stored in the breakdown).
+        # Stake: discovery = conviction-scaled from the researched edge; Stage 1 (evidence
+        # gates green) = Kelly × bankroll, derived from the pick's own stored probability.
         try:
-            _pick_edge = float(json.loads(alert.get("score_breakdown_json") or "{}").get("edge") or 0.0)
+            _bd = json.loads(alert.get("score_breakdown_json") or "{}")
         except Exception:
-            _pick_edge = 0.0
-        bet_size = _brain_pick_stake(_pick_edge)
-        log.info("[Brain] PICK trade: %.40s buy %s @ %.2f edge=%+.2f size $%.2f",
-                 market_q, bet_side, price_alert, _pick_edge, bet_size)
+            _bd = {}
+        _pick_edge = float(_bd.get("edge") or 0.0)
+        if _stage1_active and price_alert and 0.0 < price_alert < 1.0:
+            _q = float(_bd.get("brain_prob") or 0.0)   # brain's prob on the BUY side
+            _kelly = max(0.0, min(0.25, (_q - price_alert) / (1.0 - price_alert))) if _q > 0 else 0.0
+            bet_size = _ladder_stake(_kelly, max(_cached_usdc_balance, 0.0))
+            log.info("[Brain] PICK trade (STAGE 1): %.40s buy %s @ %.2f kelly=%.3f size $%.2f",
+                     market_q, bet_side, price_alert, _kelly, bet_size)
+        else:
+            bet_size = _brain_pick_stake(_pick_edge)
+            log.info("[Brain] PICK trade: %.40s buy %s @ %.2f edge=%+.2f size $%.2f",
+                     market_q, bet_side, price_alert, _pick_edge, bet_size)
     else:
         bet_size = await _calculate_bet_size(http_client, stats, score=score)
 
@@ -3507,6 +3535,57 @@ async def _notify_brain_veto_skip(http_client: httpx.AsyncClient, alert: dict, v
     await _send_telegram(http_client, text, silent=True)
 
 
+def _ladder_stake(kelly_fraction: float, bankroll: float, mult: float = None,
+                  cap: float = None, floor: float = None) -> float:
+    """Pure Stage-1 stake: LADDER_KELLY_MULT × the pick's stored (quarter-Kelly-capped) fraction
+    × current bankroll, clamped to [discovery base, LADDER_MAX_STAKE_USDC]. Depth + event caps
+    apply downstream. With mult=0.5 this is a conservative eighth-Kelly."""
+    if mult is None:
+        mult = LADDER_KELLY_MULT
+    if cap is None:
+        cap = LADDER_MAX_STAKE_USDC
+    if floor is None:
+        floor = BRAIN_PICK_SIZE_USDC
+    try:
+        k = max(0.0, float(kelly_fraction))
+        b = max(0.0, float(bankroll))
+    except (TypeError, ValueError):
+        return floor
+    return round(max(floor, min(cap, mult * k * b)), 2)
+
+
+async def _poll_ladder(http_client: httpx.AsyncClient) -> None:
+    """Refresh Stage-1 status from the evidence gates (rate-limited). Transitions are LOUD:
+    graduation and demotion both post to the audience — they're the biggest moments this
+    project has. Fail-safe: any error keeps/returns the ladder to Stage 0."""
+    global _stage1_active, _last_ladder_poll
+    if not LADDER_ENABLED:
+        return
+    now = time.time()
+    if now - _last_ladder_poll < LADDER_POLL_SECONDS:
+        return
+    _last_ladder_poll = now
+    data = await _api_get(http_client, "/api/brain/gates")
+    new_state = bool(isinstance(data, dict) and data.get("stage1"))
+    if new_state != _stage1_active:
+        if new_state:
+            log.warning("[Ladder] STAGE 1 UNLOCKED — pick stakes graduate to Kelly × bankroll "
+                        "(mult %.2f, cap $%.0f)", LADDER_KELLY_MULT, LADDER_MAX_STAKE_USDC)
+            await _send_telegram(http_client,
+                "🪜🎉 <b>STAGE 1 UNLOCKED</b>\n\n"
+                "The brain's picks cleared every evidence gate — sample size, ROI confidence "
+                "floor, and out-forecasting the market. Pick stakes now scale with conviction "
+                f"and bankroll (capped ${LADDER_MAX_STAKE_USDC:.0f}).\n"
+                "<i>earned, not granted. the scoreboard called it.</i>", silent=False)
+        else:
+            log.warning("[Ladder] Stage 1 revoked — pick stakes demote to discovery")
+            await _send_telegram(http_client,
+                "🪜 <b>back to discovery stakes</b> — the evidence gates dipped red, so pick "
+                "sizes step back down until the record recovers. <i>discipline is the edge.</i>",
+                silent=True)
+        _stage1_active = new_state
+
+
 def _brain_pick_stake(edge: float, base: float = None, slope: float = None,
                       cap: float = None) -> float:
     """Pure conviction-scaled stake for a Brain Pick: base + slope × (edge − 0.08), clamped to
@@ -4020,6 +4099,10 @@ async def main() -> None:
                 if now - _last_brain_confirm_poll >= BRAIN_CONFIRM_POLL_SECONDS:
                     await _poll_brain_confirmations(http_client)
                     _last_brain_confirm_poll = now
+
+                # Auto-graduation ladder — poll the evidence gates; graduate/demote pick
+                # stakes automatically (rate-limited internally).
+                await _poll_ladder(http_client)
 
                 # Vault sweep — runs every cycle. In idle state the function returns
                 # immediately unless it's the configured daily sweep hour and the

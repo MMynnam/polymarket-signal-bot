@@ -215,6 +215,35 @@ def test_next_resolving():
     print("  [ok] next-resolving: soonest FUTURE end date wins; past/missing ignored")
 
 
+def test_ladder_stake():
+    tr.LADDER_KELLY_MULT = 0.5
+    tr.LADDER_MAX_STAKE_USDC = 25.0
+    tr.BRAIN_PICK_SIZE_USDC = 2.0
+    # eighth-Kelly on a $1000 bankroll: 0.5 × 0.12 × 1000 = $60 → capped at $25
+    assert tr._ladder_stake(0.12, 1000.0) == 25.0
+    # modest kelly, modest bankroll: 0.5 × 0.08 × 300 = $12
+    assert tr._ladder_stake(0.08, 300.0) == 12.0
+    # small kelly on today's ~$60 bankroll: 0.5 × 0.10 × 60 = $3
+    assert tr._ladder_stake(0.10, 60.0) == 3.0
+    # never below the discovery floor; garbage-safe
+    assert tr._ladder_stake(0.001, 50.0) == 2.0
+    assert tr._ladder_stake(None, 1000.0) == 2.0
+    assert tr._ladder_stake(0.25, None) == 2.0
+    print("  [ok] ladder stake: kelly x bankroll, floored at discovery, hard $25 cap")
+
+
+def test_dashboard_shows_ladder_stage():
+    d0 = tr._build_dashboard_text(bank=60.0, vault=4.61, open_n=20, cap=40, tier='normal',
+                                  today_w=1, today_l=1, today_pnl=0.0, picks_today=1,
+                                  sizeups_today=0, ts_utc='12:00', stage1=False)
+    assert 'stage 0 (discovery)' in d0
+    d1 = tr._build_dashboard_text(bank=1100.0, vault=50.0, open_n=20, cap=40, tier='normal',
+                                  today_w=1, today_l=1, today_pnl=0.0, picks_today=1,
+                                  sizeups_today=0, ts_utc='12:00', stage1=True)
+    assert 'STAGE 1' in d1 and 'conviction × bankroll' in d1
+    print("  [ok] dashboard shows the ladder stage (0 vs 1)")
+
+
 def test_betslip_renders_brain_verdict_on_every_vetted_slip():
     # Un-vetted bet → no brain line at all.
     plain = tr._build_slip_text("Knicks make playoffs?", "Yes", 0.40, 2.0, bet_no=7)
@@ -257,5 +286,7 @@ if __name__ == "__main__":
     test_sweat_trigger()
     test_sweat_card_text()
     test_next_resolving()
+    test_ladder_stake()
+    test_dashboard_shows_ladder_stage()
     test_betslip_renders_brain_verdict_on_every_vetted_slip()
     print("all brain-sizeup tests passed")

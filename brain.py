@@ -724,7 +724,10 @@ async def _scan_cycle_batched(candidates: list, sender, http_client) -> int:
         log.info("[Brain] daily budget exhausted ($%.2f spent) — skipping batch cycle",
                  _spend.spent_today())
         return 0
-    events = _group_events(cands)[: max(1, config.BRAIN_BATCH_MARKETS)]
+    # WIDE-TRIAGE / NARROW-RESEARCH funnel: triage is Haiku pennies — cast it over
+    # BRAIN_TRIAGE_WIDE events, then spend the Sonnet research budget only on the most
+    # researchable survivors. Same dollars, pointed at the best of a much wider funnel.
+    events = _group_events(cands)[: max(1, config.BRAIN_TRIAGE_WIDE)]
     events = [(k, ms[: max(1, config.BRAIN_EVENT_SIBLINGS)]) for k, ms in events]
     mcost: dict = {}
     for _, ms in events:
@@ -737,22 +740,27 @@ async def _scan_cycle_batched(candidates: list, sender, http_client) -> int:
     for i, (k, ms) in enumerate(events):
         rep = ms[0]
         msg = res.get(f"t{i}")
-        ok = False
+        ok, research_score = False, 0
         if msg is not None:
             mcost[rep["market_id"]] += _spend.record_usage(config.BRAIN_TRIAGE_MODEL, msg.usage, batch=True)
             if msg.stop_reason != "refusal":
                 try:
-                    ok = bool(json.loads(_first_text(msg)).get("worth_forecasting"))
+                    t = json.loads(_first_text(msg))
+                    ok = bool(t.get("worth_forecasting"))
+                    research_score = int(t.get("researchability") or 0)
                 except Exception:
                     ok = False
         if ok:
-            keep.append((k, ms))
+            keep.append((research_score, k, ms))
         else:
             log.info("[Brain] batch triage declined event %.40s (%d markets)", rep["question"], len(ms))
     if not keep:
         return 0
 
-    # Budget guard: shrink the research fan-out to what the remaining budget covers.
+    # Rank survivors by triage researchability; research only the top BRAIN_BATCH_MARKETS,
+    # further shrunk to what the remaining budget covers.
+    keep.sort(key=lambda t: -t[0])
+    keep = [(k, ms) for _, k, ms in keep[: max(1, config.BRAIN_BATCH_MARKETS)]]
     est_each = config.BRAIN_EST_FORECAST_USD * 0.5   # batch rate, per event
     afford = max(1, int(_spend.remaining() / max(est_each, 0.01)))
     keep = keep[:afford]
@@ -1120,28 +1128,36 @@ async def _scanner_candidates(http_client) -> list:
     """Fetch active Gamma markets and filter to the thin/obscure long tail where
     the LLM forecasting edge actually lives. Returns binary markets only."""
     url = f"{config.GAMMA_API_BASE}/events"
-    params = {"active": "true", "closed": "false", "order": "volume24hr",
-              "ascending": "false", "limit": config.BRAIN_SCAN_GAMMA_LIMIT, "offset": 0}
-    try:
-        resp = await http_client.get(url, params=params, timeout=config.HTTP_TIMEOUT_SECONDS)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        log.warning("[Brain] scanner Gamma fetch failed: %s", exc)
-        return []
-    if isinstance(data, dict):
-        data = data.get("data") or data.get("events") or []
     now = datetime.utcnow()
     out = []
-    for event in data if isinstance(data, list) else []:
-        for m in event.get("markets") or []:
-            # Gamma carries the slug on the EVENT object, not the market — inject it so
-            # sibling markets of one match group into a single research bucket.
-            if not m.get("_event_slug"):
-                m["_event_slug"] = event.get("slug") or ""
-            cand = _scanner_market(m, now)
-            if cand:
-                out.append(cand)
+    # Wide funnel: pull multiple volume-ordered pages so the thin/obscure long tail (where the
+    # edge thesis lives) is actually IN the candidate set, not buried below page one.
+    for page in range(max(1, config.BRAIN_SCAN_PAGES)):
+        params = {"active": "true", "closed": "false", "order": "volume24hr",
+                  "ascending": "false", "limit": config.BRAIN_SCAN_GAMMA_LIMIT,
+                  "offset": page * config.BRAIN_SCAN_GAMMA_LIMIT}
+        try:
+            resp = await http_client.get(url, params=params, timeout=config.HTTP_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            log.warning("[Brain] scanner Gamma fetch failed (page %d): %s", page, exc)
+            break
+        if isinstance(data, dict):
+            data = data.get("data") or data.get("events") or []
+        if not isinstance(data, list) or not data:
+            break
+        for event in data:
+            for m in event.get("markets") or []:
+                # Gamma carries the slug on the EVENT object, not the market — inject it so
+                # sibling markets of one match group into a single research bucket.
+                if not m.get("_event_slug"):
+                    m["_event_slug"] = event.get("slug") or ""
+                cand = _scanner_market(m, now)
+                if cand:
+                    out.append(cand)
+        if len(data) < config.BRAIN_SCAN_GAMMA_LIMIT:
+            break
     # v2 targeting (2026-07-09): NON-SPORTS first — 56 graded forecasts showed no edge over
     # quant-priced sports-derivative books; scattered-information markets (politics,
     # entertainment, crypto, one-offs) are where LLM research can actually out-forecast the
@@ -1152,9 +1168,9 @@ async def _scanner_candidates(http_client) -> list:
         c["_volume"],
     ))
     if config.BRAIN_BATCH_ENABLED:
-        # Wide set for the batched path: event grouping needs the SIBLING markets of the
-        # chosen events to still be present (they'd be cut by a tight per-market limit).
-        return out[: max(24, config.BRAIN_BATCH_MARKETS * config.BRAIN_EVENT_SIBLINGS * 3)]
+        # Wide set for the batched path: the triage funnel needs BRAIN_TRIAGE_WIDE events'
+        # worth of markets (siblings included) to still be present after truncation.
+        return out[: max(48, config.BRAIN_TRIAGE_WIDE * config.BRAIN_EVENT_SIBLINGS * 2)]
     return out[: config.BRAIN_MAX_PER_CYCLE]
 
 
@@ -1544,6 +1560,40 @@ def _economics_section(e: dict) -> str:
         f"  whole book 7d: ${e['book_pnl_7d']:+.2f}\n"
         f"  {verdict}"
     )
+
+
+def stage1_gates() -> dict:
+    """The machine-readable Stage-1 gate check — the trader polls this to AUTO-graduate pick
+    stakes when the evidence is in (and auto-demote if the edge decays). Same three gates as
+    the weekly scoreboard: n≥40 graded picks, ROI 95% CI floor > 0, PICKS Brier beats the
+    market (n≥20). All three green ⇒ stage1=True."""
+    import database
+    db = database.get_db()
+    graded = db.execute(
+        "SELECT size_usdc, pnl FROM trade_executions "
+        "WHERE alert_id LIKE 'brain_%' AND status IN ('filled','partial') "
+        "  AND resolution_status IN ('won','lost')"
+    ).fetchall()
+    rois = [float(g["pnl"] or 0.0) / float(g["size_usdc"]) for g in graded if (g["size_usdc"] or 0) > 0]
+    n_g = len(graded)
+    roi_m, roi_lo, _ = _mean_ci(rois)
+    cal = db.execute(
+        "SELECT AVG(brier_brain) bb, AVG(brier_market) bm, COUNT(*) n FROM brain_forecasts "
+        "WHERE source='scanner' AND resolved_outcome IS NOT NULL"
+    ).fetchone()
+    gate_n = n_g >= 40
+    gate_roi = n_g >= 10 and roi_lo > 0
+    gate_brier = bool(cal["n"] and (cal["n"] or 0) >= 20 and cal["bb"] is not None
+                      and cal["bm"] is not None and cal["bb"] < cal["bm"])
+    return {
+        "stage1": bool(gate_n and gate_roi and gate_brier),
+        "gates": {"n_graded": gate_n, "roi_ci_floor": gate_roi, "brier_beats_market": gate_brier},
+        "n_graded": n_g,
+        "roi_mean": round(roi_m, 4),
+        "roi_ci_floor": round(roi_lo, 4),
+        "brier_brain": round(cal["bb"], 4) if cal["bb"] is not None else None,
+        "brier_market": round(cal["bm"], 4) if cal["bm"] is not None else None,
+    }
 
 
 def scaling_scoreboard() -> str:

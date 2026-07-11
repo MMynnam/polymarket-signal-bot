@@ -231,6 +231,19 @@ async def post_brain_vet(
         return {"ok": False, "reason": "vet error"}
 
 
+@app.get("/api/brain/gates")
+def get_brain_gates(_key: None = Depends(_verify_api_key)):
+    """Machine-readable Stage-1 gate check for the trader's AUTO-GRADUATION ladder: when all
+    evidence gates are green, pick stakes scale up (Kelly × bankroll, capped); when they go
+    red, stakes demote back to discovery. The promotion is data-triggered, not vibes."""
+    import brain
+    try:
+        return brain.stage1_gates()
+    except Exception as exc:
+        log.error("[API] brain gates failed: %s", exc, exc_info=True)
+        return {"stage1": False, "gates": {}, "error": "gates unavailable"}
+
+
 @app.get("/api/brain/confirmations")
 def get_brain_confirmations(
     since: Optional[int] = None,

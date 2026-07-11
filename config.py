@@ -508,6 +508,11 @@ BRAIN_BATCH_TIMEOUT_S: int = int(os.getenv("BRAIN_BATCH_TIMEOUT_S", "2700"))  # 
 # markets against the shared brief — ~3x pick flow per research dollar. The $8/event exposure
 # cap (trader-side) keeps the resulting correlated picks bounded by construction.
 BRAIN_EVENT_SIBLINGS: int = int(os.getenv("BRAIN_EVENT_SIBLINGS", "4"))
+# Wide-triage / narrow-research funnel (2026-07-11, scale push): triage is Haiku pennies, so
+# triage MANY events per cycle and spend the Sonnet research budget only on the most
+# researchable of the survivors. Same $1.25/day, pointed at the best of a 3-5x wider funnel.
+BRAIN_TRIAGE_WIDE: int = int(os.getenv("BRAIN_TRIAGE_WIDE", "10"))       # events triaged/cycle
+BRAIN_SCAN_PAGES: int = int(os.getenv("BRAIN_SCAN_PAGES", "2"))          # Gamma pages pulled
 # Web searches per research call. 2026-07-09 v2 re-aim: 2 shallow searches couldn't beat
 # quant-priced markets (56-forecast Brier read: brain ≈ market at best). v2 trades breadth
 # for depth — fewer researched events, 4 searches each.
