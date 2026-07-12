@@ -3093,6 +3093,29 @@ async def _execute_trade(
 
     slippage = abs(current_price - price_alert) if current_price is not None else None
 
+    # Brain picks: re-gate the RESEARCHED edge at the LIVE price (2026-07-12). The pick's
+    # edge was measured on Gamma's displayed price up to ~45min ago — on thin books that
+    # price is part fiction (midpoint/last-trade) and the market may have moved. Require the
+    # brain's probability to still clear its stored bar against what we'd ACTUALLY pay now.
+    # A price DROP is a cheaper entry (MORE edge) — it must never be rejected as "slippage".
+    if _is_brain_pick and current_price is not None and 0.0 < current_price < 1.0:
+        try:
+            _q_live = float(json.loads(alert.get("score_breakdown_json") or "{}").get("brain_prob") or 0.0)
+            _bar_live = float(json.loads(alert.get("score_breakdown_json") or "{}").get("bar") or 0.10)
+        except Exception:
+            _q_live, _bar_live = 0.0, 0.10
+        if _q_live > 0:
+            _live_edge = _q_live - current_price
+            if _live_edge < _bar_live - 0.02:   # small tolerance for tick noise
+                log.info("[Brain] pick %s re-gated OUT at live price: edge %.2f→%.2f < bar %.2f "
+                         "(alert px %.2f, live %.2f)", alert_id[:20], _q_live - price_alert,
+                         _live_edge, _bar_live, price_alert, current_price)
+                await _record_brain_pick_skip(http_client, alert, "edge gone at live price")
+                return
+        if current_price < price_alert:
+            # Favorable drift: entering cheaper than researched. Take it; skip the abs-gate.
+            slippage = 0.0
+
     # Gate-orientation regression guard (2026-06-13). The pre-fix token[0] bug fed the
     # OPPOSITE token's price into the slippage gate, so price_current ≈ 1 - price_alert and
     # the gate spuriously rejected the best flow while everything looked healthy. The fix

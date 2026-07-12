@@ -356,8 +356,10 @@ def _count_web_searches(resp) -> int:
 # Claude pipeline stages
 # ===========================================================================
 
-def _triage_params(market: dict) -> dict:
-    """Complete Messages-API kwargs for one triage call (shared by sync + batch paths)."""
+def _triage_params(market: dict, siblings: list = None) -> dict:
+    """Complete Messages-API kwargs for one triage call (shared by sync + batch paths).
+    `siblings`: the event's other markets — a lone unresearchable-looking derivative leg
+    shouldn't kill an event whose siblings are researchable."""
     sys = (
         "You are a triage filter for a prediction-market forecasting bot with a research "
         "budget. You decide whether a market is WORTH a full research forecast. Lean toward "
@@ -369,13 +371,18 @@ def _triage_params(market: dict) -> dict:
         "outcome on. Use your own judgment — you don't have to forecast everything, but don't "
         "reflexively pass on a researchable event just because it's a coin-flip-looking sport."
     )
+    sib_bit = ""
+    if siblings:
+        sib_bit = ("This EVENT also carries these markets (judge the event as a whole): "
+                   + "; ".join(m["question"][:60] for m in siblings[:4]) + "\n")
     user = (
         f"Today's date: {datetime.utcnow():%Y-%m-%d} (UTC).\n"
         f"Question: {market['question']}\n"
         f"Resolution detail: {market.get('description', '(none)')}\n"
         f"Current price (implied prob of '{market['target_label']}'): {market['market_price']:.2f}\n"
         f"Category: {market.get('category', 'unknown')}\n"
-        f"Closes in: {market.get('hours_to_close', 0):.0f}h\n\n"
+        f"Closes in: {market.get('hours_to_close', 0):.0f}h\n"
+        f"{sib_bit}\n"
         "Worth researching?"
     )
     return {
@@ -428,7 +435,8 @@ def _research_params(market: dict, siblings: list = None) -> dict:
     )
     sib_bit = ""
     if siblings:
-        lines = "\n".join(f"- {m['question']}" for m in siblings[:6])
+        lines = "\n".join(f"- {m['question']} (market: {m.get('market_price', 0):.2f})"
+                          for m in siblings[:6])
         sib_bit = f"\nRelated markets on the SAME event (the brief must inform these too):\n{lines}\n"
     user = (
         f"Today's date: {datetime.utcnow():%A, %B %d, %Y} (UTC).\n"
@@ -491,10 +499,19 @@ def _calibration_memo() -> str:
         return _memo_cache["text"]
     text = ""
     try:
+        # Source-filter: researched scanner forecasts have a different bias profile than the
+        # no-web Haiku vets (which are told to hug the market). Use scanner-only history when
+        # there's enough of it, so the feedback loop steers the researched pipeline by ITS
+        # own record; pooled fallback below n=20.
         rows = database.get_db().execute(
             "SELECT brain_prob_raw p, resolved_outcome y FROM brain_forecasts "
-            "WHERE resolved_outcome IS NOT NULL"
+            "WHERE resolved_outcome IS NOT NULL AND source = 'scanner'"
         ).fetchall()
+        if len(rows) < 20:
+            rows = database.get_db().execute(
+                "SELECT brain_prob_raw p, resolved_outcome y FROM brain_forecasts "
+                "WHERE resolved_outcome IS NOT NULL"
+            ).fetchall()
         if len(rows) >= 20:
             n = len(rows)
             bias = (sum(r["p"] for r in rows) - sum(r["y"] for r in rows)) / n * 100
@@ -537,8 +554,12 @@ def _parse_forecast_msg(msg):
     }
 
 
-def _forecast_params(market: dict, brief: str, run_idx: int, model: str = None) -> dict:
-    """Complete Messages-API kwargs for one forecast run (shared by sync + batch paths)."""
+def _forecast_params(market: dict, brief: str, run_idx: int, model: str = None,
+                     siblings: list = None) -> dict:
+    """Complete Messages-API kwargs for one forecast run (shared by sync + batch paths).
+    `siblings`: other markets on the SAME event with their prices — a hard consistency
+    constraint (the exact-score legs must cohere with the moneyline) that lets the model
+    spot WHICH leg of an event is the mispriced one."""
     model = model or config.BRAIN_FORECAST_MODEL
     sys = (
         "You are the brain of a scrappy Polymarket bot whose friends watch its calls on "
@@ -564,14 +585,22 @@ def _forecast_params(market: dict, brief: str, run_idx: int, model: str = None) 
     )
     memo = _calibration_memo()
     memo_bit = f"{memo}\n" if memo else ""
+    sib_bit = ""
+    if siblings:
+        lines = "\n".join(f"- {m['question']}: {m.get('market_price', 0):.2f}"
+                          for m in siblings[:5])
+        sib_bit = (f"Other markets on this SAME event right now (your probability must cohere "
+                   f"with these):\n{lines}\n")
     user = (
         f"Today's date: {datetime.utcnow():%A, %B %d, %Y} (UTC).\n"
         f"{memo_bit}"
         f"Market: {market['question']}\n"
         f"Resolution rules: {market.get('description', '(none)')[:900]}\n"
-        f"Closes in: {market.get('hours_to_close', 0):.0f}h\n"
+        f"Closes in: {market.get('hours_to_close', 0):.0f}h · Category: {market.get('category', '?')} "
+        f"· Volume ${market.get('_volume', 0):,.0f}\n"
         f"The probability you output is P('{market['target_label']}' occurs).\n"
-        f"Current market price for this outcome: {market['market_price']:.2f}\n\n"
+        f"Current market price for this outcome: {market['market_price']:.2f}\n"
+        f"{sib_bit}\n"
         f"Research brief:\n{brief}\n\n"
         f"{lenses[run_idx % len(lenses)]}"
     )
@@ -605,7 +634,7 @@ async def _reconcile(market: dict, brief: str, forecasts: list):
     client = _get_client()
     runs = "\n".join(
         f"  run {i+1}: p={f['probability']:.2f} conf={f['confidence']:.2f} "
-        f"factors={'; '.join(f['factors'][:2])}"
+        f"factors={'; '.join(f['factors'][:3])} take={f.get('take', '')[:100]}"
         for i, f in enumerate(forecasts)
     )
     sys = (
@@ -614,6 +643,7 @@ async def _reconcile(market: dict, brief: str, forecasts: list):
         "and output a single final probability and confidence in [0,1]."
     )
     user = (
+        f"Today's date: {datetime.utcnow():%A, %B %d, %Y} (UTC).\n"
         f"Market: {market['question']}\n"
         f"Target: P('{market['target_label']}')\n\n"
         f"Research brief:\n{brief}\n\n"
@@ -737,7 +767,7 @@ async def _scan_cycle_batched(candidates: list, sender, http_client) -> int:
             mcost[c["market_id"]] = 0.0
 
     # Stage 1 — triage one REPRESENTATIVE market per event (Haiku, one batch).
-    res = await _batch_run([(f"t{i}", _triage_params(ms[0])) for i, (k, ms) in enumerate(events)])
+    res = await _batch_run([(f"t{i}", _triage_params(ms[0], siblings=ms[1:])) for i, (k, ms) in enumerate(events)])
     keep = []
     for i, (k, ms) in enumerate(events):
         rep = ms[0]
@@ -790,8 +820,9 @@ async def _scan_cycle_batched(candidates: list, sender, http_client) -> int:
         if k not in briefs:
             continue
         for j, c in enumerate(ms):
+            sibs = [m for m in ms if m is not c]
             for r in range(max(1, config.BRAIN_ENSEMBLE_N)):
-                reqs.append((f"f{i}_{j}_{r}", _forecast_params(c, briefs[k], r)))
+                reqs.append((f"f{i}_{j}_{r}", _forecast_params(c, briefs[k], r, siblings=sibs)))
     if not reqs:
         return 0
     res = await _batch_run(reqs)
@@ -924,7 +955,7 @@ async def _finalize_forecast(market: dict, brief: str, forecasts: list, source: 
         "kelly_fraction": float(kelly),
         "ensemble_n": len(forecasts),
         "prob_stdev": float(stdev),
-        "evidence": brief[:1200],
+        "evidence": brief[:3000],
         "take": take,
         "models_json": json.dumps({"triage": config.BRAIN_TRIAGE_MODEL,
                                    "forecast": config.BRAIN_FORECAST_MODEL}),
@@ -1014,12 +1045,24 @@ async def vet_alert(alert: dict) -> dict:
         log.info("[Brain] LIVE vet skipped — daily budget reached ($%.2f spent)", _spend.spent_today())
         return {"ok": False, "reason": "daily budget reached", "verdict": "BUDGET"}
 
+    # The real resolution rules sit one query away (markets.raw_json) — the no-web vet
+    # reasons purely from priors, so the rules are the highest-value context it can get.
+    description = "(live insider alert — is this side mispriced right now?)"
+    try:
+        row = database.get_db().execute(
+            "SELECT raw_json FROM markets WHERE condition_id = ?", (market_id,)).fetchone()
+        if row and row["raw_json"]:
+            desc = (json.loads(row["raw_json"]).get("description") or "").strip()
+            if desc:
+                description = desc[:1200]
+    except Exception:
+        pass
     market = {
         "market_id": market_id,
         "question": alert.get("market_question") or market_id,
         "target_label": bet_side,
         "market_price": price,
-        "description": "(live insider alert — is this side mispriced right now?)",
+        "description": description,
         "category": alert.get("market_category") or "unknown",
         "hours_to_close": alert.get("hours_to_close_at_alert") or 0.0,
         "alert_id": alert.get("alert_id"),
@@ -1068,7 +1111,7 @@ async def vet_alert(alert: dict) -> dict:
         "brain_prob_raw": float(raw), "brain_prob": float(calibrated), "confidence": float(confidence),
         "edge": float(d["edge"]), "verdict": d["verdict"], "act": 1 if d["act"] else 0,
         "kelly_fraction": float(kelly), "ensemble_n": len(forecasts), "prob_stdev": float(stdev),
-        "evidence": brief[:1200], "take": take,
+        "evidence": brief[:3000], "take": take,
         "models_json": json.dumps({"forecast": config.BRAIN_FORECAST_MODEL, "mode": "live"}),
         "cost_usd": float(cost), "alert_id": alert.get("alert_id"),
     }
@@ -1321,10 +1364,12 @@ async def _red_team_pick(market: dict, pick: dict, brief: str, confidence: float
     user = (
         f"Today's date: {datetime.utcnow():%A, %B %d, %Y} (UTC).\n"
         f"Market: {market['question']}\n"
+        f"Resolution rules: {market.get('description', '(none)')[:1200]}\n"
+        f"Closes in: {market.get('hours_to_close', 0):.0f}h\n"
         f"Proposed trade: buy '{pick['buy_side']}' at {pick['buy_price']:.2f} "
         f"(our probability {pick['brain_prob_side']:.2f}, edge {pick['edge']:+.2f}, "
         f"confidence {confidence:.2f}).\n\n"
-        f"Our research brief:\n{(brief or '(none)')[:1500]}\n\n"
+        f"Our research brief:\n{(brief or '(none)')[:3000]}\n\n"
         "Attack the trade, then rule."
     )
     try:
@@ -1409,6 +1454,9 @@ async def _emit_brain_pick(market: dict, calibrated: float, confidence: float, t
         score_breakdown_json=json.dumps({"source": "brain_pick", "edge": round(pick["edge"], 4),
                                          "confidence": round(confidence, 3),
                                          "brain_prob": round(pick["brain_prob_side"], 4),
+                                         "bar": round(_pick_edge_bar(pick["buy_price"]), 3),
+                                         "rt_revised": round(rt["revised"], 4) if rt else None,
+                                         "rt_objection": (rt["objection"][:160] if rt else None),
                                          "take": (take or "")[:300]}),
         bet_side=pick["buy_side"], bet_price_at_alert=pick["buy_price"], bet_size_usd=0.0,
         market_category="brain", hours_to_close_at_alert=market.get("hours_to_close"),

@@ -465,12 +465,15 @@ BRAIN_VET_WEB_SEARCH: bool = os.getenv("BRAIN_VET_WEB_SEARCH", "false").lower() 
 # + gated; graded forward like any pick. Set BRAIN_PICK_ENABLED to have the scanner emit picks.
 BRAIN_PICK_ENABLED: bool = os.getenv("BRAIN_PICK_ENABLED", "false").lower() in ("true", "1", "yes")
 # Minimum CALIBRATED edge (brain's prob − price, on the side it would buy) to emit a pick.
-BRAIN_PICK_MIN_EDGE: float = float(os.getenv("BRAIN_PICK_MIN_EDGE", "0.08"))
-# Tiered edge bars by ENTRY PRICE (2026-07-12, fit to our own graded cash record + the
-# century-old favorite-longshot bias): buys ≥0.55 ran +8% ROI at the 0.08 bar; buys <0.35 went
-# 0-for-3 at −100% (all of the pick book's losses). Longshot buys must clear a much higher bar.
-BRAIN_PICK_EDGE_MID: float = float(os.getenv("BRAIN_PICK_EDGE_MID", "0.12"))       # buys 0.40-0.55
-BRAIN_PICK_EDGE_LONGSHOT: float = float(os.getenv("BRAIN_PICK_EDGE_LONGSHOT", "0.18"))  # buys <0.40
+# 2026-07-12 FEE AUDIT: Polymarket's zero-fee era ENDED this spring — dynamic taker fees
+# (≈ rate × (1−p) of stake) now cover nearly every category, and thin-market spreads run
+# 6-10¢. Total friction on a cheap-side thin-market entry: 8-12% of stake. The bars below
+# fold in that friction ON TOP of the favorite-longshot tiering fit to our own cash record
+# (longshot buys 0-for-3 at −100%; favorite buys +8% ROI). Cheap sides pay the most fee AND
+# carry the documented bias against them — both push the same direction.
+BRAIN_PICK_MIN_EDGE: float = float(os.getenv("BRAIN_PICK_MIN_EDGE", "0.10"))       # buys ≥0.55
+BRAIN_PICK_EDGE_MID: float = float(os.getenv("BRAIN_PICK_EDGE_MID", "0.15"))       # buys 0.40-0.55
+BRAIN_PICK_EDGE_LONGSHOT: float = float(os.getenv("BRAIN_PICK_EDGE_LONGSHOT", "0.22"))  # buys <0.40
 # Too-good-to-be-true guard: claimed edges >0.35 were a COIN FLIP in our graded record (n=8 at
 # |edge|>0.20 → 50%) — monster disagreements are as likely stale-data delusions as insight.
 BRAIN_PICK_MAX_EDGE: float = float(os.getenv("BRAIN_PICK_MAX_EDGE", "0.35"))
@@ -520,7 +523,7 @@ BRAIN_EVENT_SIBLINGS: int = int(os.getenv("BRAIN_EVENT_SIBLINGS", "4"))
 # triage MANY events per cycle and spend the Sonnet research budget only on the most
 # researchable of the survivors. Same $1.25/day, pointed at the best of a 3-5x wider funnel.
 BRAIN_TRIAGE_WIDE: int = int(os.getenv("BRAIN_TRIAGE_WIDE", "10"))       # events triaged/cycle
-BRAIN_SCAN_PAGES: int = int(os.getenv("BRAIN_SCAN_PAGES", "2"))          # Gamma pages pulled
+BRAIN_SCAN_PAGES: int = int(os.getenv("BRAIN_SCAN_PAGES", "4"))          # Gamma pages pulled (deep = the true long tail)
 # Web searches per research call. 2026-07-09 v2 re-aim: 2 shallow searches couldn't beat
 # quant-priced markets (56-forecast Brier read: brain ≈ market at best). v2 trades breadth
 # for depth — fewer researched events, 4 searches each.
@@ -535,7 +538,10 @@ BRAIN_REFORECAST_HOURS: float = float(os.getenv("BRAIN_REFORECAST_HOURS", "72"))
 # Scanner (long-tail mispricing hunt) market filters.
 BRAIN_SCAN_MIN_PRICE: float = float(os.getenv("BRAIN_SCAN_MIN_PRICE", "0.12"))
 BRAIN_SCAN_MAX_PRICE: float = float(os.getenv("BRAIN_SCAN_MAX_PRICE", "0.88"))
-BRAIN_SCAN_MIN_DAYS: float = float(os.getenv("BRAIN_SCAN_MIN_DAYS", "1"))
+# Min 1.5d (2026-07-12): a 292M-trade calibration study shows prices are near-perfectly
+# calibrated in the final hours (slope 0.99 <1h out) — the favorite edge lives at LONGER
+# horizons (slope 1.32 beyond a month). No picks inside the efficient zone.
+BRAIN_SCAN_MIN_DAYS: float = float(os.getenv("BRAIN_SCAN_MIN_DAYS", "1.5"))
 BRAIN_SCAN_MAX_DAYS: float = float(os.getenv("BRAIN_SCAN_MAX_DAYS", "30"))
 BRAIN_SCAN_MIN_VOL_USD: float = float(os.getenv("BRAIN_SCAN_MIN_VOL_USD", "2000"))   # enough liquidity to be real
 BRAIN_SCAN_MAX_VOL_USD: float = float(os.getenv("BRAIN_SCAN_MAX_VOL_USD", "250000")) # but thin/obscure (LLM edge lives here, not on liquid markets)
