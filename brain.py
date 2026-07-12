@@ -568,6 +568,8 @@ def _forecast_params(market: dict, brief: str, run_idx: int, model: str = None) 
         f"Today's date: {datetime.utcnow():%A, %B %d, %Y} (UTC).\n"
         f"{memo_bit}"
         f"Market: {market['question']}\n"
+        f"Resolution rules: {market.get('description', '(none)')[:900]}\n"
+        f"Closes in: {market.get('hours_to_close', 0):.0f}h\n"
         f"The probability you output is P('{market['target_label']}' occurs).\n"
         f"Current market price for this outcome: {market['market_price']:.2f}\n\n"
         f"Research brief:\n{brief}\n\n"
@@ -1239,7 +1241,9 @@ def _scanner_market(m: dict, now: datetime):
         "question": question,
         "target_label": str(outcomes[0]),
         "market_price": p0,
-        "description": m.get("description", "")[:600] or "(none)",
+        # Resolution rules are an EDGE SOURCE — retail doesn't read them; the model does.
+        # 1500 chars covers nearly all Gamma descriptions incl. the resolution criteria.
+        "description": m.get("description", "")[:1500] or "(none)",
         "category": m.get("category") or "unknown",
         "hours_to_close": hours,
         "_volume": vol,
@@ -1345,6 +1349,18 @@ async def _red_team_pick(market: dict, pick: dict, brief: str, confidence: float
         return None
 
 
+def _pick_edge_bar(buy_price: float) -> float:
+    """Tiered minimum edge by entry price — fit to OUR graded cash record. Favorites (≥0.55)
+    earned +8% ROI at the base bar; longshot buys (<0.35) went 0-for-3 at −100% (the classic
+    favorite-longshot bias, confirmed in our own money). The cheaper the side, the more edge
+    it must claim."""
+    if buy_price >= 0.55:
+        return config.BRAIN_PICK_MIN_EDGE
+    if buy_price >= 0.40:
+        return config.BRAIN_PICK_EDGE_MID
+    return config.BRAIN_PICK_EDGE_LONGSHOT
+
+
 async def _emit_brain_pick(market: dict, calibrated: float, confidence: float, take: str,
                            brief: str = "") -> bool:
     """If the scanner forecast is a high-conviction tradeable edge, write it as a synthetic
@@ -1354,7 +1370,13 @@ async def _emit_brain_pick(market: dict, calibrated: float, confidence: float, t
     pick = _brain_pick_side(market, calibrated)
     if not pick:
         return False
-    if pick["edge"] < config.BRAIN_PICK_MIN_EDGE or confidence < config.BRAIN_PICK_MIN_CONFIDENCE:
+    if pick["edge"] < _pick_edge_bar(pick["buy_price"]) or confidence < config.BRAIN_PICK_MIN_CONFIDENCE:
+        return False
+    # Too-good-to-be-true guard: monster claimed edges were a coin flip in our graded record —
+    # the signature of stale data or a misread market, not insight. Decline politely.
+    if pick["edge"] > config.BRAIN_PICK_MAX_EDGE:
+        log.info("[Brain] pick suppressed (edge %.2f too good to be true): %.45s",
+                 pick["edge"], market["question"])
         return False
 
     # Red-team gate: the pick must survive one honest attempt to kill it.

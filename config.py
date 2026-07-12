@@ -466,6 +466,14 @@ BRAIN_VET_WEB_SEARCH: bool = os.getenv("BRAIN_VET_WEB_SEARCH", "false").lower() 
 BRAIN_PICK_ENABLED: bool = os.getenv("BRAIN_PICK_ENABLED", "false").lower() in ("true", "1", "yes")
 # Minimum CALIBRATED edge (brain's prob − price, on the side it would buy) to emit a pick.
 BRAIN_PICK_MIN_EDGE: float = float(os.getenv("BRAIN_PICK_MIN_EDGE", "0.08"))
+# Tiered edge bars by ENTRY PRICE (2026-07-12, fit to our own graded cash record + the
+# century-old favorite-longshot bias): buys ≥0.55 ran +8% ROI at the 0.08 bar; buys <0.35 went
+# 0-for-3 at −100% (all of the pick book's losses). Longshot buys must clear a much higher bar.
+BRAIN_PICK_EDGE_MID: float = float(os.getenv("BRAIN_PICK_EDGE_MID", "0.12"))       # buys 0.40-0.55
+BRAIN_PICK_EDGE_LONGSHOT: float = float(os.getenv("BRAIN_PICK_EDGE_LONGSHOT", "0.18"))  # buys <0.40
+# Too-good-to-be-true guard: claimed edges >0.35 were a COIN FLIP in our graded record (n=8 at
+# |edge|>0.20 → 50%) — monster disagreements are as likely stale-data delusions as insight.
+BRAIN_PICK_MAX_EDGE: float = float(os.getenv("BRAIN_PICK_MAX_EDGE", "0.35"))
 # Minimum confidence (web-researched, so it can clear a real bar — unlike the humble no-web vet).
 BRAIN_PICK_MIN_CONFIDENCE: float = float(os.getenv("BRAIN_PICK_MIN_CONFIDENCE", "0.60"))
 # Score stamped on the synthetic alert so it clears the trader's min-score + premium-tier gates.
