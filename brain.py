@@ -49,6 +49,7 @@ import html
 import json
 import logging
 import math
+import re
 import statistics
 import time
 from datetime import datetime, timedelta
@@ -934,6 +935,18 @@ async def _finalize_forecast(market: dict, brief: str, forecasts: list, source: 
 
     # Dispersion haircut: disagreement lowers confidence.
     confidence = _clamp(mean_conf * (1.0 - min(0.5, 2.0 * stdev)))
+    # ABSTAIN on hard disagreement (2026-07-12): stdev is the RAW ensemble's dispersion
+    # (reconciliation returns a point estimate, so post-reconcile dispersion can't be
+    # measured) — when the lenses disagreed this hard, the honest read is "we don't know".
+    # Pin confidence strictly below BOTH act bars, whatever the env sets them to, so no
+    # money moves. Agreement-filtering is one of the few techniques with published evidence
+    # of improving REALIZED returns, not just Brier.
+    if stdev > config.BRAIN_ABSTAIN_STD:
+        confidence = min(confidence, 0.50,
+                         config.BRAIN_PICK_MIN_CONFIDENCE - 0.01,
+                         config.BRAIN_MIN_CONFIDENCE - 0.01)
+        log.info("[Brain] abstaining (ensemble stdev %.2f > %.2f): %.45s",
+                 stdev, config.BRAIN_ABSTAIN_STD, market["question"])
     calibrated = platt_calibrate(raw)
     price = market["market_price"]
     d = decide(calibrated, price, source, confidence=confidence)
@@ -1208,7 +1221,7 @@ async def _scanner_candidates(http_client) -> list:
     # entertainment, crypto, one-offs) are where LLM research can actually out-forecast the
     # price. Within each tier: soonest-to-resolve, volume tiebreak (fast grading, fast proof).
     out.sort(key=lambda c: (
-        _looks_sports(c) if config.BRAIN_SCAN_DEPRIORITIZE_SPORTS else 0,
+        _domain_rank(c) if config.BRAIN_SCAN_DEPRIORITIZE_SPORTS else 0,
         c["hours_to_close"] or 1e9,
         c["_volume"],
     ))
@@ -1232,6 +1245,36 @@ def _looks_sports(cand: dict) -> int:
         return 1
     q = (cand.get("question") or "").lower()
     return 1 if any(p in q for p in _SPORTS_PATTERNS) else 0
+
+
+# Word-boundary regexes, not bare substrings: 'minister' must not fire inside 'administered',
+# and short tickers ('btc', 'eth') must match at question start/end too. Generic phrases like
+# 'price of' / 'market cap' are NOT crypto markers (they tagged oil/equity markets as crypto
+# and truncated them out of the research window — 2026-07-13 review finding). 'doge' and
+# 'sol' are NOT crypto markers either: DOGE-the-agency is a flagship POLITICS family and
+# 'Sol Campbell' is a person (keep the unambiguous 'dogecoin'/'solana').
+_CRYPTO_RE = re.compile(r"\b(bitcoin|ethereum|btc|eth|solana|xrp|ripple|dogecoin)\b")
+_POLITICS_RE = re.compile(
+    r"\b(election|nominee|president|senate|congress|minister|parliament|ceasefire"
+    r"|treaty|sanctions?|airspace|tariffs?|impeach(?:ed|ment)?|resigns?|resignation)\b")
+
+
+def _domain_rank(cand: dict) -> int:
+    """Research-priority tier (2026-07-12, verified findings): 0 = politics/geopolitics
+    (fee-FREE on Polymarket + the documented LLM-alpha domain), 1 = general long tail,
+    2 = crypto (highest fee tier + live benchmarks show LLMs lose there) and sports
+    (model-priced even when thin). Lower = researched first. Order matters twice: sports
+    first ('president of FIFA' must not promote to tier 0), then politics ABOVE crypto
+    ('Will DOGE-the-agency…' with the word bitcoin in it is still a politics market)."""
+    cat = (cand.get("category") or "").lower()
+    q = (cand.get("question") or "").lower()
+    if _looks_sports(cand):
+        return 2
+    if any(w in cat for w in ("politic", "geopolit", "election")) or _POLITICS_RE.search(q):
+        return 0
+    if "crypto" in cat or _CRYPTO_RE.search(q):
+        return 2
+    return 1
 
 
 def _scanner_market(m: dict, now: datetime):
@@ -1514,6 +1557,92 @@ def grade_resolved_forecasts() -> int:
     # NOTE: scanner forecasts await a Gamma-resolution grader (follow-up) — until
     # then only veto rows contribute to the Brier comparison.
     return n
+
+
+async def grade_scanner_forecasts_via_gamma(http_client) -> int:
+    """Grade scanner forecasts that never became picks, via Gamma resolution. Without this,
+    only pick-linked rows grade — the Brier gate and self-calibration memo run on a
+    survivorship-biased sample (only hard-disagreement markets). Every researched forecast
+    is evidence; this collects it. Returns the number newly graded."""
+    import database
+    db = database.get_db()
+    # Window: >2h old (give Gamma time to settle) but <45 days (BRAIN_SCAN_MAX_DAYS + grace —
+    # older rows are permanently ungradeable dead weight: voided markets, Gamma-bug cids,
+    # renamed labels — and would dilute the random draw forever). RANDOM keeps any single
+    # stuck market from starving the rest.
+    rows = db.execute(
+        "SELECT DISTINCT market_id FROM brain_forecasts "
+        "WHERE source='scanner' AND resolved_outcome IS NULL AND alert_id IS NULL "
+        "  AND created_at < ? AND created_at > ? ORDER BY RANDOM() LIMIT 10",
+        (int(time.time()) - 2 * 3600, int(time.time()) - 45 * 86400),
+    ).fetchall()
+    graded = 0
+    for r in rows:
+        cid = r["market_id"]
+        try:
+            resp = await http_client.get(
+                f"{config.GAMMA_API_BASE}/markets",
+                params={"condition_ids": cid, "closed": "true"},   # Gamma defaults closed=false now
+                timeout=config.HTTP_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            continue
+        # Gamma's conditionIds filter is documented-broken for some ids (returns an unrelated
+        # market — see resolution_checker.py). NEVER trust list position: select by the
+        # RETURNED conditionId or skip. A wrong-market grade here would silently corrupt the
+        # graduation-gate Brier record (the 2026-06-11 inversion class, in the grading path).
+        m = None
+        if isinstance(data, list):
+            m = next((x for x in data if isinstance(x, dict) and
+                      (x.get("conditionId") or x.get("condition_id") or "").lower()
+                      == str(cid).lower()), None)
+        if not m or not m.get("closed"):
+            continue
+
+        def _jl(v):
+            if isinstance(v, str):
+                try:
+                    return json.loads(v)
+                except Exception:
+                    return None
+            return v
+
+        outcomes = _jl(m.get("outcomes"))
+        prices = _jl(m.get("outcomePrices"))
+        if not (isinstance(outcomes, list) and isinstance(prices, list)) or len(outcomes) != len(prices):
+            continue
+        try:
+            fp = [float(p) for p in prices]
+        except (TypeError, ValueError):
+            continue
+        # Decisive resolution only (indecisive = disputed/pending — skip, retry next cycle).
+        if not any(p >= 0.99 for p in fp) or not any(p <= 0.01 for p in fp):
+            continue
+        winner = outcomes[fp.index(max(fp))]
+        winner_l = str(winner).strip().lower()
+        labels = [str(o).strip().lower() for o in outcomes]
+        for f in db.execute(
+                "SELECT id, brain_prob, market_price, target_label FROM brain_forecasts "
+                "WHERE source='scanner' AND resolved_outcome IS NULL AND alert_id IS NULL "
+                "  AND market_id = ?", (cid,)).fetchall():
+            tl = (f["target_label"] or "").strip().lower()
+            # The stored label must still BE one of the market's outcomes — a renamed/drifted
+            # label means "cannot grade" (skip, retry, log), never "graded as a loss".
+            if tl not in labels:
+                log.warning("[Brain] grade skip %.20s: target_label %r not in outcomes %s",
+                            cid, f["target_label"], outcomes)
+                continue
+            y = 1 if tl == winner_l else 0
+            db.execute(
+                "UPDATE brain_forecasts SET resolved_outcome=?, resolved_at=?, "
+                "brier_brain=?, brier_market=? WHERE id=?",
+                (y, int(time.time()), brier(f["brain_prob"], y), brier(f["market_price"], y), f["id"]))
+            graded += 1
+    if graded:
+        db.commit()
+        log.info("[Brain] Gamma-graded %d scanner forecasts (no pick link)", graded)
+    return graded
 
 
 def calibration_report() -> str:
@@ -1811,6 +1940,12 @@ async def brain_loop(dry_run: bool = False) -> None:
                 graded = grade_resolved_forecasts()
                 if graded:
                     log.info("[Brain] graded %d newly-resolved forecasts", graded)
+                # Grade the non-pick scanner forecasts too — every researched market is
+                # evidence for the gates, not just the ones we traded.
+                try:
+                    await grade_scanner_forecasts_via_gamma(http_client)
+                except Exception as exc:
+                    log.debug("[Brain] gamma grading error (non-fatal): %s", exc)
 
                 # SCANNER only — the trader's own alerts are now vetted in REAL TIME at trade
                 # time (vet_alert via /api/brain/vet), so the slow hourly veto source is retired.

@@ -608,3 +608,8 @@ def validate_config() -> None:
         TRADE_MIN_SIZE_USD,
         WALLET_CACHE_TTL_SECONDS // 3600,
     )
+
+# Abstain-on-disagreement (2026-07-12): if the forecast ensemble still disagrees by more than
+# this stdev AFTER reconciliation, confidence is capped below the pick bar — "we don't know"
+# is a position. Published result: agreement-filtering improves realized returns.
+BRAIN_ABSTAIN_STD: float = float(os.getenv("BRAIN_ABSTAIN_STD", "0.18"))

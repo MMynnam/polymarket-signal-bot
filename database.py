@@ -252,6 +252,24 @@ CREATE INDEX IF NOT EXISTS idx_brain_forecasts_alert
     ON brain_forecasts(alert_id);
 
 -- ------------------------------------------------------------------
+-- pick_orders_pending: resting maker orders the fly trader has live on
+-- the CLOB. Persisted here (fly disks are ephemeral across deploys) so
+-- boot reconciliation can finalize fills that landed while the trader
+-- was down instead of orphaning them. Rows are deleted when the order
+-- reaches a terminal state.
+-- ------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pick_orders_pending (
+    order_id   TEXT PRIMARY KEY,
+    alert_id   TEXT NOT NULL,
+    alert_json TEXT NOT NULL,      -- the full alert dict, verbatim (rehydrates trader ctx)
+    shares     REAL NOT NULL,
+    limit_px   REAL NOT NULL,
+    cost       REAL NOT NULL,
+    placed_at  INTEGER NOT NULL,
+    ev_key     TEXT NOT NULL DEFAULT ''
+);
+
+-- ------------------------------------------------------------------
 -- schema_version: simple migration tracking
 -- ------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -1691,6 +1709,36 @@ def update_trade_resolution_by_alert_id(
             """,
             (resolution_status, pnl, resolved_at, resolution_source, alert_id),
         )
+
+
+def upsert_pick_order(order_id: str, alert_id: str, alert_json: str, shares: float,
+                      limit_px: float, cost: float, placed_at: int, ev_key: str) -> None:
+    """Persist a resting maker order (crash-safety mirror of the trader's in-process ctx)."""
+    with transaction() as db:
+        db.execute(
+            """
+            INSERT OR REPLACE INTO pick_orders_pending
+                (order_id, alert_id, alert_json, shares, limit_px, cost, placed_at, ev_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (order_id, alert_id, alert_json, shares, limit_px, cost, placed_at, ev_key),
+        )
+
+
+def get_pending_pick_orders() -> list[dict]:
+    """All resting maker orders (for the trader's boot reconciliation)."""
+    db = get_db()
+    rows = db.execute(
+        "SELECT order_id, alert_id, alert_json, shares, limit_px, cost, placed_at, ev_key "
+        "FROM pick_orders_pending ORDER BY placed_at"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_pick_order(order_id: str) -> None:
+    """The order reached a terminal state (filled / canceled / skipped) — drop the mirror."""
+    with transaction() as db:
+        db.execute("DELETE FROM pick_orders_pending WHERE order_id = ?", (order_id,))
 
 
 # ---------------------------------------------------------------------------

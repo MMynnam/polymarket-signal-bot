@@ -261,6 +261,56 @@ def get_brain_confirmations(
         raise HTTPException(status_code=500, detail="Database error")
 
 
+class PickOrderReport(BaseModel):
+    order_id: str
+    alert: dict                 # the served alert, verbatim — rehydrates the trader's ctx
+    shares: float
+    limit_px: float
+    cost: float
+    placed_at: int
+    ev_key: str = ""
+
+
+@app.post("/api/pick_orders")
+def post_pick_order(body: PickOrderReport, _key: None = Depends(_verify_api_key)):
+    """Persist a resting maker order (crash-safety: fly disks are ephemeral, so the trader
+    mirrors its in-process order tracking here and reconciles it at boot)."""
+    import json as _json
+    try:
+        database.upsert_pick_order(
+            order_id=body.order_id,
+            alert_id=str(body.alert.get("alert_id") or ""),
+            alert_json=_json.dumps(body.alert),
+            shares=body.shares, limit_px=body.limit_px, cost=body.cost,
+            placed_at=body.placed_at, ev_key=body.ev_key,
+        )
+        return {"ok": True}
+    except Exception as exc:
+        log.error("[API] post_pick_order failed: %s", exc, exc_info=True)
+        return {"ok": False, "error": str(exc)}
+
+
+@app.get("/api/pick_orders")
+def get_pick_orders(_key: None = Depends(_verify_api_key)):
+    """All resting maker orders (the trader's boot reconciliation reads this)."""
+    try:
+        return database.get_pending_pick_orders()
+    except Exception as exc:
+        log.error("[API] get_pick_orders failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+@app.delete("/api/pick_orders/{order_id}")
+def delete_pick_order(order_id: str, _key: None = Depends(_verify_api_key)):
+    """The order reached a terminal state — drop the crash-safety mirror row."""
+    try:
+        database.delete_pick_order(order_id)
+        return {"ok": True}
+    except Exception as exc:
+        log.error("[API] delete_pick_order failed: %s", exc, exc_info=True)
+        return {"ok": False, "error": str(exc)}
+
+
 @app.get("/api/stats/vault")
 def get_vault_stats(_key: None = Depends(_verify_api_key)):
     """Return vault sweep history: count, total USDC swept, last sweep timestamp."""

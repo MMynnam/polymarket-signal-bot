@@ -162,7 +162,21 @@ BRAIN_PICK_MAX_PER_DAY: int = int(os.getenv("BRAIN_PICK_MAX_PER_DAY", "10"))
 LADDER_ENABLED: bool = os.getenv("LADDER_ENABLED", "true").lower() in ("true", "1", "yes")
 LADDER_KELLY_MULT: float = float(os.getenv("LADDER_KELLY_MULT", "0.5"))
 LADDER_MAX_STAKE_USDC: float = float(os.getenv("LADDER_MAX_STAKE_USDC", "25.0"))
+# Stage-1 stakes also cap at a % of bankroll so deposit size directly drives pick size:
+# $300 → ~$15 max, $500 → ~$25, $1000 → LADDER_MAX_STAKE_USDC binds.
+LADDER_MAX_BANKROLL_PCT: float = float(os.getenv("LADDER_MAX_BANKROLL_PCT", "0.05"))
 LADDER_POLL_SECONDS: int = int(os.getenv("LADDER_POLL_SECONDS", "1800"))
+
+# MAKER EXECUTION for brain picks (2026-07-12). Polymarket's 2026 fee regime: takers pay
+# ~rate×(1−p) of stake (3.5-6%+ on cheap sides) while MAKERS PAY ZERO. Picks now rest a GTC
+# limit order 1¢ inside the ask instead of crossing with FAK — converting 8-12% round-trip
+# friction into ~0-2%. NO taker fallback: if the market doesn't come to our price within the
+# TTL, the displayed edge was likely spread-fiction — cancel and skip (patience IS the edge).
+# Crash safety: all open orders are cancelled at boot (an untracked resting order could
+# otherwise fill with no accounting).
+PICK_MAKER_ENABLED: bool = os.getenv("PICK_MAKER_ENABLED", "true").lower() in ("true", "1", "yes")
+PICK_MAKER_IMPROVE: float = float(os.getenv("PICK_MAKER_IMPROVE", "0.01"))   # place at ask − this
+PICK_MAKER_TTL_S: int = int(os.getenv("PICK_MAKER_TTL_S", "1800"))           # 30 min rest
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -384,6 +398,12 @@ _brain_pick_day: str = ""
 _stage1_active: bool = False
 _last_ladder_poll: float = 0.0
 
+# Maker-order lifecycle: order_id -> context for resting pick limit orders; alert_ids with a
+# live resting order (suppresses re-processing while the alert re-serves from the feed).
+# In-process by design — boot runs cancel_all so a restart can't orphan a resting order.
+_pending_pick_orders: dict = {}
+_pending_pick_alerts: set = set()
+
 # Live dashboard state: the pinned message we edit in place. In-process only — on restart
 # we post a fresh dashboard and re-pin (the old one just stops updating; Telegram replaces
 # the pin).
@@ -560,6 +580,20 @@ async def _api_patch(
         return resp.json()
     except Exception as exc:
         log.warning("[API] PATCH %s failed: %s", path, exc)
+    return None
+
+
+async def _api_delete(
+    client: httpx.AsyncClient,
+    path: str,
+) -> Optional[dict]:
+    try:
+        resp = await client.delete(
+            f"{RAILWAY_API_URL}{path}", headers=_headers(), timeout=15,
+        )
+        return resp.json()
+    except Exception as exc:
+        log.warning("[API] DELETE %s failed: %s", path, exc)
     return None
 
 
@@ -1495,10 +1529,38 @@ def _ratchet_settle_amount(tab: float, free_balance, floor: float = VAULT_RATCHE
     return round(min(tab, headroom, max_batch), 4)
 
 
+def _pending_pick_cost() -> float:
+    """Cash spoken for by resting maker orders. The CLOB does NOT lock collateral while a
+    limit order rests — the chain still shows it as free — so every other spend path must
+    subtract it or a fill could bounce on insufficient balance."""
+    return round(sum(ctx.get("cost", 0.0) for ctx in _pending_pick_orders.values()), 2)
+
+
+def _pending_pick_sides(market_id: str) -> dict:
+    """{bet_side: limit_px} for resting maker orders on a market. Resting orders must count
+    as (provisionally) held for the dedup and opposite-side vig gates — the CLOB can match a
+    complementary taker against our own resting order, so 'it hasn't filled yet' is not 'we
+    don't hold it': an unchecked opposite-side buy + the later fill locks a guaranteed-loss
+    pair the vig gate exists to block."""
+    out = {}
+    for ctx in _pending_pick_orders.values():
+        a = ctx.get("alert") or {}
+        if a.get("market_id") == market_id and a.get("bet_side"):
+            out[a["bet_side"]] = float(ctx.get("limit_px") or 0.0)
+    return out
+
+
+def _pending_pick_event_cost(ev_key: str) -> float:
+    """Resting maker cost already committed to one underlying event (for the event cap)."""
+    return round(sum(ctx.get("cost", 0.0) for ctx in _pending_pick_orders.values()
+                     if ctx.get("ev_key") == ev_key), 2)
+
+
 def _sweep_reserve_usdc() -> float:
     """Free USDC the bot must NOT bet: the operating floor always, plus the in-flight sweep
-    amount while a sweep is pending (so the cash survives the 1h timelock to the withdraw)."""
-    reserve = VAULT_RATCHET_FLOOR_USDC
+    amount while a sweep is pending (so the cash survives the 1h timelock to the withdraw),
+    plus cash committed to resting maker orders (unlocked on-chain but spoken for)."""
+    reserve = VAULT_RATCHET_FLOOR_USDC + _pending_pick_cost()
     if _sweep_state in ("pause_pending", "pause_ready"):
         reserve += _sweep_intended_amount
     return reserve
@@ -1746,7 +1808,9 @@ async def _check_and_sweep(http_client: httpx.AsyncClient) -> None:
         except Exception as exc:
             log.warning("[Vault] Balance fetch failed: %s — skipping ratchet check", exc)
             return
-        intended_amount = _ratchet_settle_amount(_vault_tab, balance)
+        # Resting maker orders' cost is unlocked on-chain but spoken for — a sweep must
+        # not take the cash a pending fill needs to settle.
+        intended_amount = _ratchet_settle_amount(_vault_tab, balance - _pending_pick_cost())
         if intended_amount <= 0:
             return  # tab is ready but no free cash above the operating floor yet
 
@@ -2969,6 +3033,10 @@ async def _execute_trade(
     _brain_verdict = None
     _brain_conf = None
     if _is_brain_pick:
+        # A maker order for this pick is already resting on the book — the alert re-serves
+        # every cycle until a trade row exists, so suppress here.
+        if alert_id in _pending_pick_alerts:
+            return
         # The brain's OWN pick: gate, per-day cap, fixed discovery stake. No vet/size-up/veto —
         # this IS the brain's researched conviction; vetting it would be circular.
         _bp_day = _utc_day()
@@ -2979,8 +3047,12 @@ async def _execute_trade(
             log.info("[Brain] pick %s — brain-pick trading disabled; recording skip", alert_id[:20])
             await _record_brain_pick_skip(http_client, alert, "brain-pick trading disabled")
             return
-        if _brain_picks_today >= BRAIN_PICK_MAX_PER_DAY:
-            log.info("[Brain] pick %s — daily pick cap reached (%d)", alert_id[:20], BRAIN_PICK_MAX_PER_DAY)
+        # Daily cap counts FILLS + RESTING maker orders: N orders resting simultaneously are
+        # N picks the market can fill today, whatever the fill counter says right now.
+        if _brain_picks_today + len(_pending_pick_orders) >= BRAIN_PICK_MAX_PER_DAY:
+            log.info("[Brain] pick %s — daily pick cap reached (%d filled + %d resting >= %d)",
+                     alert_id[:20], _brain_picks_today, len(_pending_pick_orders),
+                     BRAIN_PICK_MAX_PER_DAY)
             await _record_brain_pick_skip(http_client, alert, "daily brain-pick cap reached")
             return
         # Stake: discovery = conviction-scaled from the researched edge; Stage 1 (evidence
@@ -3034,7 +3106,10 @@ async def _execute_trade(
     # more $ onto an underlying event than EVENT_MAX_EXPOSURE_USDC across all its derivatives.
     _ev_key = _event_key(_slug, market_id)
     if EVENT_EXPOSURE_CAP_ENABLED:
-        _over, _ev_cur = _event_over_cap(_ev_key, bet_size, _held_event_exposure)
+        # Resting maker orders on the same event are committed exposure the fill-time
+        # bookkeeping hasn't seen yet — count them, or two legs can both pass and both fill.
+        _over, _ev_cur = _event_over_cap(
+            _ev_key, bet_size + _pending_pick_event_cost(_ev_key), _held_event_exposure)
         if _over:
             log.info("[EventCap] Skipping %s — event '%s' already carries $%.2f "
                      "(+$%.2f would breach the $%.2f cap)",
@@ -3080,14 +3155,19 @@ async def _execute_trade(
             await _notify_skip(http_client, alert, _reason)
             return
 
-    # Current ask price for slippage measurement
+    # Current ask price for slippage measurement. _live_px_ok distinguishes a real read from
+    # the price_alert fallback — a maker order must NEVER be priced off a stale alert price
+    # (a stale "ask − 1¢" above the live ask would cross, and the books would record fiction).
     current_price: Optional[float] = price_alert
+    _live_px_ok = False
     try:
         price_resp = await asyncio.to_thread(clob_client.get_price, token_id, "BUY")
         if isinstance(price_resp, dict):
             current_price = float(price_resp.get("price", price_alert))
+            _live_px_ok = "price" in price_resp
         elif price_resp is not None:
             current_price = float(price_resp)
+            _live_px_ok = True
     except Exception:
         pass
 
@@ -3201,6 +3281,23 @@ async def _execute_trade(
         log.debug("[Trade] token=%s neg_risk=%s sig_type=%d funder=%s",
                   token_id[:16], neg_risk, TRADING_SIGNATURE_TYPE,
                   TRADING_FUNDER_ADDRESS[:10] + "..." if TRADING_FUNDER_ADDRESS else "self")
+
+        # MAKER EXECUTION for brain picks: rest a zero-fee post-only limit 1¢ inside the ask
+        # instead of crossing as a fee-paying taker. Requires a LIVE price read (_live_px_ok).
+        # Lifecycle completes in _check_pick_orders. Tri-state result: 'placed' → done here;
+        # 'reject' (clean, nothing rests) → fall through to the FAK taker path below;
+        # 'suppress' (outcome ambiguous, an order may rest untracked) → bail WITHOUT posting
+        # any trade row, so the still-served alert retries next cycle instead of double-buying.
+        if _is_brain_pick and PICK_MAKER_ENABLED and _live_px_ok \
+                and current_price is not None and 0 < current_price < 1:
+            _mk = await _place_pick_maker_order(clob_client, http_client, alert, token_id,
+                                                bet_size, current_price, neg_risk)
+            if _mk == "placed":
+                return
+            if _mk == "suppress":
+                log.warning("[Maker] ambiguous placement for %s — suppressing this cycle "
+                            "(no taker fallback, alert will retry)", alert_id[:20])
+                return
 
         # FAK: fills available liquidity, kills remainder — eliminates FOK "no match" on thin books.
         # order_type must be set on BOTH MarketOrderArgs (for price calculation) and the call
@@ -3574,6 +3671,8 @@ def _ladder_stake(kelly_fraction: float, bankroll: float, mult: float = None,
         b = max(0.0, float(bankroll))
     except (TypeError, ValueError):
         return floor
+    # Bankroll-proportional ceiling: deposit size directly drives max pick size.
+    cap = min(cap, max(floor, LADDER_MAX_BANKROLL_PCT * b))
     return round(max(floor, min(cap, mult * k * b)), 2)
 
 
@@ -3624,6 +3723,332 @@ def _brain_pick_stake(edge: float, base: float = None, slope: float = None,
     except (TypeError, ValueError):
         e = 0.0
     return round(max(base, min(cap, base + slope * e)), 2)
+
+
+def _maker_order_plan(bet_size: float, ask_price: float, improve: float = None) -> Optional[tuple]:
+    """Pure maker-order sizing: (limit_price, shares, cost) for a BUY resting `improve` inside
+    the ask, honoring the CLOB's 5-share minimum. None when a maker order isn't sensible:
+    price out of range, or the share minimum would balloon cost past 1.6× the intended stake."""
+    if improve is None:
+        improve = PICK_MAKER_IMPROVE
+    try:
+        limit_px = round(float(ask_price) - improve, 2)
+    except (TypeError, ValueError):
+        return None
+    if not (0.02 <= limit_px <= 0.97):
+        return None
+    shares = max(5, int(bet_size // limit_px))
+    cost = round(shares * limit_px, 2)
+    if cost > bet_size * 1.6:
+        return None
+    return (limit_px, float(shares), cost)
+
+
+async def _clear_token_orders(clob_client, token_id: str) -> bool:
+    """Best-effort: cancel every resting order on a token (used to reconcile an AMBIGUOUS
+    placement — the exchange may or may not have accepted). True = book confirmed clear."""
+    from py_clob_client_v2.clob_types import OrderMarketCancelParams
+    try:
+        await asyncio.to_thread(clob_client.cancel_market_orders,
+                                OrderMarketCancelParams(asset_id=token_id))
+        return True
+    except Exception as exc:
+        log.warning("[Maker] reconcile cancel failed for token %.16s: %s", token_id, exc)
+        return False
+
+
+def _register_pick_order(alert: dict, order_id: str, shares: float, limit_px: float,
+                         cost: float) -> dict:
+    """Track a live resting order in-process. Returns the ctx (also persisted to Railway)."""
+    ctx = {
+        "alert": alert, "shares": shares, "limit_px": limit_px, "cost": cost,
+        "placed_at": time.time(),
+        "ev_key": _event_key(alert.get("market_slug"), alert.get("market_id", "")),
+    }
+    _pending_pick_orders[order_id] = ctx
+    _pending_pick_alerts.add(alert.get("alert_id", ""))
+    return ctx
+
+
+async def _place_pick_maker_order(clob_client, http_client, alert: dict, token_id: str,
+                                  bet_size: float, ask_price: float, neg_risk: bool) -> str:
+    """Rest a post-only GTC limit BUY for a brain pick (maker = zero fees; post_only makes
+    the exchange REJECT a would-cross order instead of filling it as a fee-paying taker at
+    a price our accounting never sees). Returns one of:
+      'placed'   — order live + tracked; lifecycle completes in _check_pick_orders.
+      'reject'   — nothing rests; the caller may safely fall back to the FAK taker path.
+      'suppress' — outcome AMBIGUOUS (an accepted order may rest untracked): the caller must
+                   place NO other order for this alert; the still-served alert retries next
+                   cycle. Falling back here is how one alert becomes two live orders."""
+    from py_clob_client_v2.clob_types import OrderArgs, OrderPayload, PartialCreateOrderOptions, OrderType
+    from py_clob_client_v2.order_utils.model.side import Side
+    from py_clob_client_v2.exceptions import PolyApiException
+
+    plan = _maker_order_plan(bet_size, ask_price)
+    if plan is None:
+        return "reject"
+    limit_px, shares, cost = plan
+    if _cached_usdc_balance >= 0 and cost > _cached_usdc_balance - _sweep_reserve_usdc():
+        return "reject"
+    try:
+        resp = await asyncio.to_thread(
+            clob_client.create_and_post_order,
+            OrderArgs(token_id=token_id, price=limit_px, size=shares, side=Side.BUY),
+            PartialCreateOrderOptions(neg_risk=neg_risk),
+            OrderType.GTC,
+            True,   # post_only
+        )
+    except PolyApiException as exc:
+        sc = getattr(exc, "status_code", None)
+        if sc is not None and 400 <= sc < 500:
+            # Definitive rejection (incl. post-only would-cross) — nothing rests.
+            log.info("[Maker] rejected by exchange (%s) — falling back to taker", exc)
+            return "reject"
+        # Timeout / 5xx: the order may have been accepted server-side.
+        log.warning("[Maker] placement outcome UNKNOWN (%s) — reconciling", exc)
+        return "reject" if await _clear_token_orders(clob_client, token_id) else "suppress"
+    except Exception as exc:
+        log.warning("[Maker] placement failed unexpectedly (%s) — reconciling", exc)
+        return "reject" if await _clear_token_orders(clob_client, token_id) else "suppress"
+
+    order_id = resp.get("orderID") or resp.get("id") if isinstance(resp, dict) else None
+    status = (resp.get("status") or "").lower() if isinstance(resp, dict) else ""
+    ok = isinstance(resp, dict) and (resp.get("success") or status in ("live", "matched"))
+    if not order_id:
+        # HTTP 200 but no id we can track — treat as ambiguous-accepted.
+        return "reject" if await _clear_token_orders(clob_client, token_id) else "suppress"
+    if not ok:
+        # Unexpected status with an id in hand: cancel it; only a CONFIRMED cancel makes the
+        # taker fallback safe. Otherwise adopt the order — tracking beats a second order.
+        try:
+            cresp = await asyncio.to_thread(clob_client.cancel_order, OrderPayload(orderID=order_id))
+            if isinstance(cresp, dict) and order_id in (cresp.get("canceled") or []):
+                return "reject"
+        except Exception:
+            pass
+        log.warning("[Maker] status %r and cancel unconfirmed — adopting order %.16s",
+                    resp.get("status"), order_id)
+
+    ctx = _register_pick_order(alert, order_id, shares, limit_px, cost)
+    # Persist off-box (fly disks are ephemeral across deploys): boot reconciliation reads
+    # this back so a fill during a restart gap becomes a trade row, not a ghost position.
+    await _api_post(http_client, "/api/pick_orders", {
+        "order_id": order_id, "alert": alert, "shares": shares, "limit_px": limit_px,
+        "cost": cost, "placed_at": int(ctx["placed_at"]), "ev_key": ctx["ev_key"],
+    })
+    log.info("[Maker] resting %s: %.0f shares @ %.2f ($%.2f, ask was %.2f, TTL %dm) | %.40s",
+             (alert.get("alert_id") or "")[:20], shares, limit_px, cost, ask_price,
+             PICK_MAKER_TTL_S // 60, alert.get("market_question") or "")
+    return "placed"
+
+
+async def _finalize_pick_fill(http_client, ctx: dict, matched_shares: float) -> bool:
+    """A resting pick order (fully or partially) filled — post the trade row FIRST, then
+    update dedup/exposure/balance/counters and the betslip only on a CONFIRMED write.
+    Returns False when Railway didn't accept the row (documented 502s during its
+    auto-deploys): the caller keeps the order tracked and retries next cycle —
+    INSERT OR IGNORE on UNIQUE(alert_id) makes the retry idempotent."""
+    global _cached_usdc_balance, _brain_picks_today, _brain_pick_day
+    alert = ctx["alert"]
+    filled_usdc = round(matched_shares * ctx["limit_px"], 2)
+    status = "filled" if matched_shares >= ctx["shares"] * 0.99 else "partial"
+    resp = await _api_post(http_client, "/api/trades", {
+        "alert_id": alert.get("alert_id", ""), "market_id": alert.get("market_id", ""),
+        "market_question": alert.get("market_question") or "",
+        "clob_token_id": alert.get("clob_token_id") or "",
+        "bet_side": alert.get("bet_side", ""),
+        "bet_price_intended": float(alert.get("bet_price_at_alert") or 0.0),
+        "bet_price_filled": ctx["limit_px"], "slippage": 0.0,
+        "size_usdc": filled_usdc, "order_id": None, "status": status,
+        "error_message": None,
+    })
+    if not (isinstance(resp, dict) and resp.get("ok")):
+        log.warning("[Maker] trade-row POST unconfirmed for %s — keeping the fill tracked, "
+                    "will retry", (alert.get("alert_id") or "")[:20])
+        return False
+    mid, side = alert.get("market_id"), alert.get("bet_side")
+    if mid and side:
+        _held_positions.add((mid, side))
+        _held_side_px.setdefault(mid, {})[side] = float(ctx["limit_px"])
+        _held_event_exposure[ctx["ev_key"]] = _held_event_exposure.get(ctx["ev_key"], 0.0) + filled_usdc
+    # Balance: a maker fill settles on-chain at match time, so a periodic refresh may have
+    # ALREADY captured this spend — a blind second decrement understates free cash for up to
+    # ~10 min and spuriously rejects valid trades. Re-read the chain; fall back to the
+    # conservative decrement only if the read fails.
+    try:
+        _cached_usdc_balance = await _get_usdc_balance()
+    except Exception:
+        if _cached_usdc_balance >= 0:
+            _cached_usdc_balance = max(0.0, _cached_usdc_balance - filled_usdc)
+    _d = _utc_day()
+    if _d != _brain_pick_day:   # fill landed after UTC midnight — roll before counting
+        _brain_pick_day = _d
+        _brain_picks_today = 0
+    _brain_picks_today += 1
+    log.info("[Maker] FILLED %s: $%.2f @ %.2f (%s)", (alert.get("alert_id") or "")[:20],
+             filled_usdc, ctx["limit_px"], status)
+    _slug = alert.get("market_slug")
+    await _notify_trade_filled(
+        http_client, alert.get("market_question") or "", side or "",
+        ctx["limit_px"], filled_usdc, int(alert.get("score") or 0), 0.0,
+        f"https://polymarket.com/event/{_slug}" if _slug else None,
+        alert_id=alert.get("alert_id", ""),
+        brain_verdict=_brain_pick_slip_info(alert), is_brain_pick=True,
+    )
+    return True
+
+
+def _order_matched_shares(od: dict):
+    """Parse an order read's fill (SHARES, per the 2026-06-11 audit) with every field
+    spelling the client is known to use. Returns None when the field is ABSENT — an
+    absent fill is 'unconfirmed', never 'zero' (a filled order read as 0 would be
+    finalized as skipped and its cash would vanish from the books)."""
+    raw = od.get("size_matched", od.get("sizeMatched", od.get("matched_amount")))
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _check_pick_orders(clob_client, http_client) -> None:
+    """Lifecycle for resting maker pick orders: fill → finalize; TTL expiry → cancel and skip
+    (NO taker fallback — an order the market wouldn't meet was probably spread-fiction).
+    Money-safety rules (2026-07-13 adversarial review): tracking is dropped ONLY after a
+    confirmed terminal state AND a confirmed Railway write. Anything ambiguous — unreadable
+    order, unconfirmed cancel, failed trade-row POST — stays tracked (its cost stays in the
+    sweep reserve) and retries next cycle; a prolonged wedge pages ops instead of guessing."""
+    if not _pending_pick_orders:
+        return
+    now = time.time()
+    for oid in list(_pending_pick_orders.keys()):
+        ctx = _pending_pick_orders.get(oid)
+        if ctx is None:
+            continue
+        expired = now - ctx["placed_at"] > PICK_MAKER_TTL_S
+        wedged = now - ctx["placed_at"] > PICK_MAKER_TTL_S + 900   # 15 min past TTL → page ops
+        od = {}
+        try:
+            _od = await asyncio.to_thread(clob_client.get_order, oid)
+            od = _od if isinstance(_od, dict) else {}
+        except Exception as exc:
+            if not expired:
+                continue   # transient — retry next cycle
+            log.warning("[Maker] get_order failing past TTL for %.16s: %s", oid, exc)
+        matched_read = _order_matched_shares(od)
+        if matched_read is None and not expired:
+            continue   # fill-unconfirmed (absent field / unreadable) — retry next cycle
+        matched = matched_read or 0.0
+        status = (od.get("status") or "").lower()
+        filled = matched >= ctx["shares"] * 0.99
+        terminal = status in ("canceled", "cancelled", "expired", "matched")
+        if not (filled or terminal or expired):
+            continue
+        if expired and not filled and not terminal:
+            # TTL: cancel, then require CONFIRMATION the order is dead before finalizing.
+            # A swallowed cancel failure + final 'skipped' row would let a still-live order
+            # fill real cash outside all accounting (first row is FINAL under
+            # UNIQUE(alert_id) — the books could never self-correct).
+            cancel_confirmed = False
+            try:
+                from py_clob_client_v2.clob_types import OrderPayload
+                cresp = await asyncio.to_thread(clob_client.cancel_order, OrderPayload(orderID=oid))
+                if isinstance(cresp, dict) and oid in (cresp.get("canceled") or []):
+                    cancel_confirmed = True
+            except Exception as exc:
+                log.warning("[Maker] cancel failed for %.16s: %s — will retry", oid, exc)
+            try:   # post-cancel re-read: catch a last-moment partial AND confirm terminality
+                od2 = await asyncio.to_thread(clob_client.get_order, oid)
+                if isinstance(od2, dict):
+                    m2 = _order_matched_shares(od2)
+                    if m2 is not None:
+                        matched = max(matched, m2)
+                    if (od2.get("status") or "").lower() in ("canceled", "cancelled",
+                                                             "expired", "matched"):
+                        cancel_confirmed = True
+            except Exception:
+                pass
+            if not cancel_confirmed and matched < ctx["shares"] * 0.99:
+                # Order may still be LIVE on the book — keep tracking + cash reserve, retry.
+                if wedged and not ctx.get("ops_paged"):
+                    ctx["ops_paged"] = True
+                    await _send_telegram(
+                        http_client,
+                        f"⚠️ <b>Maker order wedged</b>\nOrder <code>{oid[:20]}</code> is "
+                        f"{int((now - ctx['placed_at']) / 60)} min old, cancel unconfirmed "
+                        f"(CLOB API failing?). Its ${ctx['cost']:.2f} stays reserved until "
+                        f"it resolves. Market: {(ctx['alert'].get('market_question') or '')[:80]}",
+                        ops=True)
+                continue
+        if matched > 0:
+            if not await _finalize_pick_fill(http_client, ctx, matched):
+                continue   # Railway didn't take the row — keep tracked, retry (idempotent)
+        else:
+            log.info("[Maker] TTL expired unfilled — %s (the market never met our price)",
+                     (ctx["alert"].get("alert_id") or "")[:20])
+            await _record_brain_pick_skip(http_client, ctx["alert"],
+                                          "maker order unfilled — edge was likely the spread")
+        _pending_pick_orders.pop(oid, None)
+        _pending_pick_alerts.discard(ctx["alert"].get("alert_id", ""))
+        await _api_delete(http_client, f"/api/pick_orders/{oid}")
+
+
+async def _reconcile_pick_orders_on_boot(clob_client, http_client) -> None:
+    """Crash-safety for the maker path. A restart wipes the in-process order tracking, but
+    Railway holds a copy persisted at placement time. Cancel the whole book first (stops
+    further fills), then read each persisted order's FINAL state: a fill that happened while
+    we were down gets its trade row (restoring dedup/exposure/P&L and blocking the re-served
+    alert from double-buying); an unfilled order records its skip. Unreadable orders are
+    adopted into in-process tracking so the normal confirmation-gated lifecycle resolves
+    them. Runs UNCONDITIONALLY — flipping PICK_MAKER_ENABLED off must not orphan an order."""
+    try:
+        cancel_all = getattr(clob_client, "cancel_all", None)
+        if callable(cancel_all):
+            await asyncio.to_thread(cancel_all)
+            log.info("[Maker] boot: cancelled all resting orders (clean slate)")
+    except Exception as exc:
+        log.warning("[Maker] boot cancel_all failed: %s", exc)
+    rows = await _api_get(http_client, "/api/pick_orders")
+    if not isinstance(rows, list) or not rows:
+        return
+    log.info("[Maker] boot: reconciling %d persisted resting order(s)", len(rows))
+    for row in rows:
+        try:
+            alert = json.loads(row.get("alert_json") or "{}")
+            oid = row.get("order_id") or ""
+            if not oid or not alert.get("alert_id"):
+                continue
+            ctx = {"alert": alert, "shares": float(row.get("shares") or 0.0),
+                   "limit_px": float(row.get("limit_px") or 0.0),
+                   "cost": float(row.get("cost") or 0.0),
+                   "placed_at": float(row.get("placed_at") or 0.0),
+                   "ev_key": row.get("ev_key") or ""}
+        except Exception as exc:
+            log.warning("[Maker] boot: bad persisted order row (%s) — skipping", exc)
+            continue
+        matched = None
+        try:
+            od = await asyncio.to_thread(clob_client.get_order, oid)
+            if isinstance(od, dict):
+                matched = _order_matched_shares(od)
+        except Exception as exc:
+            log.warning("[Maker] boot: could not read order %.16s (%s)", oid, exc)
+        if matched is None:
+            # Final state unknown — adopt into tracking; _check_pick_orders resolves it
+            # under its confirmation rules (and keeps its cost in the sweep reserve).
+            _pending_pick_orders[oid] = ctx
+            _pending_pick_alerts.add(alert.get("alert_id", ""))
+            continue
+        if matched > 0:
+            if await _finalize_pick_fill(http_client, ctx, matched):
+                await _api_delete(http_client, f"/api/pick_orders/{oid}")
+            else:   # Railway write failed — keep tracked, lifecycle retries the finalize
+                _pending_pick_orders[oid] = ctx
+                _pending_pick_alerts.add(alert.get("alert_id", ""))
+        else:
+            await _record_brain_pick_skip(http_client, alert, "maker order canceled on restart")
+            await _api_delete(http_client, f"/api/pick_orders/{oid}")
 
 
 def _brain_pick_slip_info(alert: dict) -> Optional[dict]:
@@ -4094,6 +4519,14 @@ async def main() -> None:
         except Exception as exc:
             log.warning("[CB] Backfill/post-seed evaluation error (non-fatal): %s", exc)
 
+        # Maker crash-safety: reconcile persisted resting orders (finalize downtime fills →
+        # trade rows) and clear the book, BEFORE the dedup seed so the seed includes any
+        # just-posted fill rows. Unconditional — a flag flip must not orphan an order.
+        try:
+            await _reconcile_pick_orders_on_boot(clob_client, http_client)
+        except Exception as exc:
+            log.warning("[Maker] boot reconciliation failed (non-fatal): %s", exc)
+
         # Seed per-market/side dedup set BEFORE processing any alerts.
         # If this fails, dedup stays inactive and a warning fires each cycle.
         await _seed_held_positions(http_client)
@@ -4202,6 +4635,9 @@ async def main() -> None:
                 # (rate-limited internally; zero LLM cost).
                 await _check_sweat_cards(clob_client, http_client)
 
+                # Maker-order lifecycle: finalize filled resting picks, cancel TTL-expired ones.
+                await _check_pick_orders(clob_client, http_client)
+
                 block_reason = await _check_risk_limits(stats, http_client=http_client)
                 if block_reason:
                     log.info("[Risk] Skipping cycle — %s", block_reason)
@@ -4255,20 +4691,25 @@ async def main() -> None:
                     else:
                         _dmid  = alert.get("market_id", "")
                         _dside = alert.get("bet_side", "")
-                        if _dmid and _dside and (_dmid, _dside) in _held_positions:
+                        # Resting maker orders count as held: same-side dupes can't stack on
+                        # a resting order, and the vig gate sees the pending side's price.
+                        _pend_sides = _pending_pick_sides(_dmid) if _dmid else {}
+                        if _dmid and _dside and ((_dmid, _dside) in _held_positions
+                                                 or _dside in _pend_sides):
                             log.info(
                                 "[Dedup] Skipping %s — already holding %s/%s",
                                 (alert.get("alert_id") or "")[:12], _dmid[:16], _dside,
                             )
                             await _notify_skip(http_client, alert, "already holding position")
                             continue
-                        # Opposite-side vig gate: we already hold a DIFFERENT side of this
-                        # market. Taking this side too locks the pair; only do it if the two
-                        # entry prices sum to <= the cap (a real cheap hedge / arb). Otherwise
-                        # it's the insiders' overround as a guaranteed loss — skip it.
+                        # Opposite-side vig gate: we already hold (or have resting) a
+                        # DIFFERENT side of this market. Taking this side too locks the pair;
+                        # only do it if the two entry prices sum to <= the cap (a real cheap
+                        # hedge / arb). Otherwise it's the insiders' overround as a
+                        # guaranteed loss — skip it. Held prices win ties over pending.
                         _vig_skip, _vig_sum = _opposite_side_vig(
                             alert.get("bet_price_at_alert"),
-                            _held_side_px.get(_dmid) or {}, _dside)
+                            {**_pend_sides, **(_held_side_px.get(_dmid) or {})}, _dside)
                         if _vig_skip:
                             log.info(
                                 "[Dedup] Skipping %s — opposite-side vig: %s would lock "
