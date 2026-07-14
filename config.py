@@ -613,3 +613,21 @@ def validate_config() -> None:
 # this stdev AFTER reconciliation, confidence is capped below the pick bar — "we don't know"
 # is a position. Published result: agreement-filtering improves realized returns.
 BRAIN_ABSTAIN_STD: float = float(os.getenv("BRAIN_ABSTAIN_STD", "0.18"))
+
+# REGIME BOUNDARY for the Stage-1 gates (2026-07-13). Pre-registered, tied to a code change,
+# NOT data-mined: 2026-07-12T15:00Z is just after the fee-aware tiered edge bars shipped
+# (commit ad8aaed, 14:53Z — the Platt refit landed 07-09, the maker era 07-13). Gate
+# evidence from before this boundary measures a brain that no longer exists (fee-blind flat
+# bars) and would dilute the CI floor forever. Midnight would have been cleaner but wrong:
+# picks emitted that morning ran the OLD bars (one such pick verifiably filled at 04:55Z).
+# Picks/forecasts BEFORE this ts still exist and still grade — they just don't count toward
+# graduation.
+BRAIN_REGIME_START_TS: int = int(os.getenv("BRAIN_REGIME_START_TS", "1783868400"))
+
+# GRADUATION SPRINT (2026-07-13): while the new-regime graded-pick count is below the n gate,
+# the scanner runs at double cadence, researches one extra event per cycle, and front-loads
+# markets closing within BRAIN_SPRINT_FAST_CLOSE_H hours (fast resolution = fast evidence).
+# Self-limiting: the moment n_graded reaches the target, everything reverts to defaults.
+BRAIN_SPRINT_ENABLED: bool = os.getenv("BRAIN_SPRINT_ENABLED", "true").lower() == "true"
+BRAIN_SPRINT_TARGET: int = int(os.getenv("BRAIN_SPRINT_TARGET", "40"))
+BRAIN_SPRINT_FAST_CLOSE_H: float = float(os.getenv("BRAIN_SPRINT_FAST_CLOSE_H", "120"))

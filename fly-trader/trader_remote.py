@@ -177,6 +177,9 @@ LADDER_POLL_SECONDS: int = int(os.getenv("LADDER_POLL_SECONDS", "1800"))
 PICK_MAKER_ENABLED: bool = os.getenv("PICK_MAKER_ENABLED", "true").lower() in ("true", "1", "yes")
 PICK_MAKER_IMPROVE: float = float(os.getenv("PICK_MAKER_IMPROVE", "0.01"))   # place at ask − this
 PICK_MAKER_TTL_S: int = int(os.getenv("PICK_MAKER_TTL_S", "1800"))           # 30 min rest
+# At TTL, if the pick's edge STILL clears its bar at the live price, reset the clock this
+# many times before cancelling (patience is still +EV; no re-pricing, no new order).
+PICK_MAKER_MAX_EXTENDS: int = int(os.getenv("PICK_MAKER_MAX_EXTENDS", "1"))
 TRADING_DYNAMIC_MIN_RESOLVED: int = int(os.getenv("TRADING_DYNAMIC_MIN_RESOLVED", "20"))
 POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "30"))
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -3898,6 +3901,27 @@ async def _finalize_pick_fill(http_client, ctx: dict, matched_shares: float) -> 
     return True
 
 
+async def _pick_edge_still_live(clob_client, ctx: dict) -> bool:
+    """True when a resting pick's researched probability still clears its stored bar (minus
+    tick tolerance) against the LIVE ask — the test for extending its TTL. Any read or parse
+    failure returns False: never extend blind."""
+    alert = ctx.get("alert") or {}
+    token_id = alert.get("clob_token_id")
+    if not token_id:
+        return False
+    try:
+        b = json.loads(alert.get("score_breakdown_json") or "{}")
+        q = float(b.get("brain_prob") or 0.0)
+        bar = float(b.get("bar") or 0.10)
+        pr = await asyncio.to_thread(clob_client.get_price, token_id, "BUY")
+        ask = float(pr.get("price")) if isinstance(pr, dict) else float(pr)
+    except Exception:
+        return False
+    if not (q > 0 and 0.0 < ask < 1.0):
+        return False
+    return (q - ask) >= (bar - 0.02)
+
+
 def _order_matched_shares(od: dict):
     """Parse an order read's fill (SHARES, per the 2026-06-11 audit) with every field
     spelling the client is known to use. Returns None when the field is ABSENT — an
@@ -3946,6 +3970,24 @@ async def _check_pick_orders(clob_client, http_client) -> None:
         if not (filled or terminal or expired):
             continue
         if expired and not filled and not terminal:
+            # EXTEND-ONCE before cancelling: if the pick's edge still clears its bar at the
+            # LIVE price, the resting order is still +EV — reset the clock instead of giving
+            # up. No re-pricing, no new order, no new failure modes; just more patience
+            # exactly when patience is still justified. (Evidence velocity: every unfilled
+            # pick is a graduation-gate sample that never happens.)
+            # Precondition: THIS cycle's order read succeeded (matched_read is not None) —
+            # an order in unknown state (order API failing, fill field absent) must fall
+            # through to the confirmation-gated cancel path, never rest blind for another
+            # TTL. The price API working is NOT evidence the order API works.
+            if matched_read is not None \
+                    and ctx.get("extends", 0) < PICK_MAKER_MAX_EXTENDS \
+                    and await _pick_edge_still_live(clob_client, ctx):
+                ctx["extends"] = ctx.get("extends", 0) + 1
+                ctx["placed_at"] = now
+                log.info("[Maker] TTL extended (%d/%d) for %s — edge still clears the bar live",
+                         ctx["extends"], PICK_MAKER_MAX_EXTENDS,
+                         (ctx["alert"].get("alert_id") or "")[:20])
+                continue
             # TTL: cancel, then require CONFIRMATION the order is dead before finalizing.
             # A swallowed cancel failure + final 'skipped' row would let a still-live order
             # fill real cash outside all accounting (first row is FINAL under
@@ -4023,7 +4065,11 @@ async def _reconcile_pick_orders_on_boot(clob_client, http_client) -> None:
                    "limit_px": float(row.get("limit_px") or 0.0),
                    "cost": float(row.get("cost") or 0.0),
                    "placed_at": float(row.get("placed_at") or 0.0),
-                   "ev_key": row.get("ev_key") or ""}
+                   "ev_key": row.get("ev_key") or "",
+                   # Boot-adopted orders are extension-INELIGIBLE: cancel_all already tried
+                   # to kill them, and the in-memory extend count didn't survive the restart
+                   # — without this, every restart would grant a fresh extend budget.
+                   "extends": PICK_MAKER_MAX_EXTENDS}
         except Exception as exc:
             log.warning("[Maker] boot: bad persisted order row (%s) — skipping", exc)
             continue

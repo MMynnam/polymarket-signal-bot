@@ -793,7 +793,9 @@ async def _scan_cycle_batched(candidates: list, sender, http_client) -> int:
     # Rank survivors by triage researchability; research only the top BRAIN_BATCH_MARKETS,
     # further shrunk to what the remaining budget covers.
     keep.sort(key=lambda t: -t[0])
-    keep = [(k, ms) for _, k, ms in keep[: max(1, config.BRAIN_BATCH_MARKETS)]]
+    # Sprint: one extra researched event per cycle while the graduation gate is evidence-poor.
+    _n_research = max(1, config.BRAIN_BATCH_MARKETS + (1 if _sprint_now else 0))
+    keep = [(k, ms) for _, k, ms in keep[:_n_research]]
     est_each = config.BRAIN_EST_FORECAST_USD * 0.5   # batch rate, per event
     afford = max(1, int(_spend.remaining() / max(est_each, 0.01)))
     keep = keep[:afford]
@@ -1220,7 +1222,14 @@ async def _scanner_candidates(http_client) -> list:
     # quant-priced sports-derivative books; scattered-information markets (politics,
     # entertainment, crypto, one-offs) are where LLM research can actually out-forecast the
     # price. Within each tier: soonest-to-resolve, volume tiebreak (fast grading, fast proof).
+    # FAST-CLOSE FIRST (2026-07-13, PERMANENT — deliberately NOT sprint-conditional): markets
+    # closing within BRAIN_SPRINT_FAST_CLOSE_H hours outrank everything. Fast resolution =
+    # fast evidence AND fast capital recycling on a small bankroll. Crucially, because this
+    # holds both during and after graduation, the population that certifies the Stage-1 gate
+    # is the SAME population Stage-1 stakes deploy on — a sprint-only sort would certify on
+    # fast movers and then bet big on slow ones the evidence never covered (review finding).
     out.sort(key=lambda c: (
+        0 if (c["hours_to_close"] or 1e9) <= config.BRAIN_SPRINT_FAST_CLOSE_H else 1,
         _domain_rank(c) if config.BRAIN_SCAN_DEPRIORITIZE_SPORTS else 0,
         c["hours_to_close"] or 1e9,
         c["_volume"],
@@ -1229,7 +1238,29 @@ async def _scanner_candidates(http_client) -> list:
         # Wide set for the batched path: the triage funnel needs BRAIN_TRIAGE_WIDE events'
         # worth of markets (siblings included) to still be present after truncation.
         return out[: max(48, config.BRAIN_TRIAGE_WIDE * config.BRAIN_EVENT_SIBLINGS * 2)]
-    return out[: config.BRAIN_MAX_PER_CYCLE]
+    # Sequential path honors the sprint's +1 too (it was a silent no-op otherwise: the loop
+    # cap can't bind on a list already truncated to the un-bumped size).
+    return out[: config.BRAIN_MAX_PER_CYCLE + (1 if _sprint_now else 0)]
+
+
+# GRADUATION SPRINT state: recomputed once per brain_loop cycle from stage1_gates(). While
+# True (new-regime graded picks < target): double scan cadence, +1 research event/cycle,
+# and fast-closing markets jump the queue. Defaults True so the very first cycle after a
+# boot sprints rather than idles (corrected within one cycle).
+_sprint_now: bool = True
+
+
+def _refresh_sprint_state() -> bool:
+    """Recompute the sprint flag from the live gate card; never raises. A failure keeps the
+    prior flag — WARN loudly, because a latched-True flag silently doubles spend cadence."""
+    global _sprint_now
+    try:
+        g = stage1_gates()
+        _sprint_now = bool(g.get("sprint"))
+    except Exception as exc:
+        log.warning("[Brain] sprint-state refresh failed (%s) — keeping sprint=%s",
+                    exc, _sprint_now)
+    return _sprint_now
 
 
 _SPORTS_PATTERNS = (" vs. ", " vs ", "o/u ", "spread:", "exact score", "1st half", "2nd half",
@@ -1765,20 +1796,27 @@ def stage1_gates() -> dict:
     """The machine-readable Stage-1 gate check — the trader polls this to AUTO-graduate pick
     stakes when the evidence is in (and auto-demote if the edge decays). Same three gates as
     the weekly scoreboard: n≥40 graded picks, ROI 95% CI floor > 0, PICKS Brier beats the
-    market (n≥20). All three green ⇒ stage1=True."""
+    market (n≥20). All three green ⇒ stage1=True.
+
+    REGIME-AWARE (2026-07-13): only evidence created after BRAIN_REGIME_START_TS counts —
+    the pre-registered boundary where the fee-aware bars + calibration refit + maker
+    execution shipped. The old-regime book (backwards Platt, taker fees) measures a brain
+    that no longer exists; lifetime-pooling it would keep the CI floor underwater no matter
+    how good the current brain is, making the gate unpassable instead of honest."""
     import database
     db = database.get_db()
+    t0 = config.BRAIN_REGIME_START_TS
     graded = db.execute(
         "SELECT size_usdc, pnl FROM trade_executions "
         "WHERE alert_id LIKE 'brain_%' AND status IN ('filled','partial') "
-        "  AND resolution_status IN ('won','lost')"
+        "  AND resolution_status IN ('won','lost') AND created_at >= ?", (t0,)
     ).fetchall()
     rois = [float(g["pnl"] or 0.0) / float(g["size_usdc"]) for g in graded if (g["size_usdc"] or 0) > 0]
     n_g = len(graded)
     roi_m, roi_lo, _ = _mean_ci(rois)
     cal = db.execute(
         "SELECT AVG(brier_brain) bb, AVG(brier_market) bm, COUNT(*) n FROM brain_forecasts "
-        "WHERE source='scanner' AND resolved_outcome IS NOT NULL"
+        "WHERE source='scanner' AND resolved_outcome IS NOT NULL AND created_at >= ?", (t0,)
     ).fetchone()
     gate_n = n_g >= 40
     gate_roi = n_g >= 10 and roi_lo > 0
@@ -1792,6 +1830,14 @@ def stage1_gates() -> dict:
         "roi_ci_floor": round(roi_lo, 4),
         "brier_brain": round(cal["bb"], 4) if cal["bb"] is not None else None,
         "brier_market": round(cal["bm"], 4) if cal["bm"] is not None else None,
+        "brier_n": cal["n"] or 0,
+        "regime_start": t0,
+        # Sprint while evidence-poor AND not yet graduated: stage1 flipping true ends the
+        # sprint even if an env-tuned target sits above the hardcoded n>=40 gate (and a
+        # target below 40 just ends the throughput boost early — the gate itself never moves).
+        "sprint": bool(config.BRAIN_SPRINT_ENABLED
+                       and n_g < config.BRAIN_SPRINT_TARGET
+                       and not (gate_n and gate_roi and gate_brier)),
     }
 
 
@@ -1801,16 +1847,18 @@ def scaling_scoreboard() -> str:
     Stage-1 gate checklist. This makes 'wire in the next $X?' a look at a card, not a vibe."""
     import database
     db = database.get_db()
+    t0 = config.BRAIN_REGIME_START_TS   # same regime boundary as stage1_gates — one truth
 
     placed = db.execute(
         "SELECT COUNT(*) n, SUM(CASE WHEN status='partial' THEN 1 ELSE 0 END) partial, "
         "MIN(created_at) first_ts FROM trade_executions "
-        "WHERE alert_id LIKE 'brain_%' AND status IN ('filled','partial')"
+        "WHERE alert_id LIKE 'brain_%' AND status IN ('filled','partial') AND created_at >= ?",
+        (t0,)
     ).fetchone()
     graded = db.execute(
         "SELECT size_usdc, pnl, resolution_status FROM trade_executions "
         "WHERE alert_id LIKE 'brain_%' AND status IN ('filled','partial') "
-        "  AND resolution_status IN ('won','lost')"
+        "  AND resolution_status IN ('won','lost') AND created_at >= ?", (t0,)
     ).fetchall()
     rois = [float(g["pnl"] or 0.0) / float(g["size_usdc"]) for g in graded if (g["size_usdc"] or 0) > 0]
     wins = sum(1 for g in graded if g["resolution_status"] == "won")
@@ -1819,7 +1867,7 @@ def scaling_scoreboard() -> str:
 
     cal = db.execute(
         "SELECT AVG(brier_brain) bb, AVG(brier_market) bm, COUNT(*) n FROM brain_forecasts "
-        "WHERE source='scanner' AND resolved_outcome IS NOT NULL"
+        "WHERE source='scanner' AND resolved_outcome IS NOT NULL AND created_at >= ?", (t0,)
     ).fetchone()
     brier_ok = cal["n"] and cal["bb"] is not None and cal["bm"] is not None and cal["bb"] < cal["bm"]
 
@@ -1842,8 +1890,10 @@ def scaling_scoreboard() -> str:
     verdict = ("<b>STAGE 1 UNLOCKED</b> — evidence supports the first capital raise."
                if gates_met == 3 else
                f"keep running Stage 0 — {gates_met}/3 gates met, evidence accumulating.")
+    _regime_d = datetime.utcfromtimestamp(t0).strftime("%Y-%m-%d")
     return (
-        "📈 <b>SCALING SCOREBOARD</b> — <i>Stage 0 (discovery)</i>\n\n"
+        "📈 <b>SCALING SCOREBOARD</b> — <i>Stage 0 (discovery)</i>\n"
+        f"<i>current-regime evidence only (since {_regime_d}: fee-aware bars + maker era)</i>\n\n"
         f"🎯 picks: <b>{n_placed}</b> placed · <b>{n_g}</b> graded ({wins}W-{losses}L) · {per_day:.1f}/day\n"
         f"💵 ROI <b>{roi_m*100:+.1f}%</b> (95% CI {roi_lo*100:+.1f}%..{roi_hi*100:+.1f}%)\n"
         f"🧮 PICKS Brier: {cal_bit}\n"
@@ -1937,6 +1987,7 @@ async def brain_loop(dry_run: bool = False) -> None:
         while True:
             cycle_start = time.monotonic()
             try:
+                _refresh_sprint_state()
                 graded = grade_resolved_forecasts()
                 if graded:
                     log.info("[Brain] graded %d newly-resolved forecasts", graded)
@@ -1964,8 +2015,9 @@ async def brain_loop(dry_run: bool = False) -> None:
                         if not _note_billing_error(exc):
                             log.warning("[Brain] batch scan failed (%s) — sequential fallback", exc)
                 if not batched_ok and not _billing_paused():
+                    _cycle_cap = config.BRAIN_MAX_PER_CYCLE + (1 if _sprint_now else 0)
                     for cand in candidates:
-                        if done >= config.BRAIN_MAX_PER_CYCLE or not _spend.can_afford(config.BRAIN_EST_FORECAST_USD):
+                        if done >= _cycle_cap or not _spend.can_afford(config.BRAIN_EST_FORECAST_USD):
                             break
                         if await forecast_market(cand, None if dry_run else sender, http_client, "scanner"):
                             done += 1
@@ -2004,10 +2056,14 @@ async def brain_loop(dry_run: bool = False) -> None:
                     else:
                         await sender.send_message(text, http_client)
 
-                log.info("[Brain] cycle done — %d scanner forecast(s), $%.3f/$%.2f spent today",
-                         done, _spend.spent_today(), config.BRAIN_DAILY_USD_CAP)
+                log.info("[Brain] cycle done — %d scanner forecast(s), $%.3f/$%.2f spent today%s",
+                         done, _spend.spent_today(), config.BRAIN_DAILY_USD_CAP,
+                         " [SPRINT: graduating]" if _sprint_now else "")
             except Exception as exc:
                 log.exception("[Brain] cycle error: %s", exc)
 
             elapsed = time.monotonic() - cycle_start
-            await asyncio.sleep(max(60.0, config.BRAIN_SCAN_INTERVAL_SECONDS - elapsed))
+            # Sprint: double cadence while the graduation gate is evidence-poor; auto-reverts
+            # the cycle after n_graded reaches the target (spend cap still binds regardless).
+            _interval = config.BRAIN_SCAN_INTERVAL_SECONDS // (2 if _sprint_now else 1)
+            await asyncio.sleep(max(60.0, _interval - elapsed))

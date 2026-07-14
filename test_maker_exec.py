@@ -110,6 +110,63 @@ def test_pending_orders_visible_to_dedup_vig_and_event_cap():
     print("  [ok] resting orders visible to dedup/vig/event-cap/reserve views")
 
 
+def test_edge_still_live_gates_ttl_extension():
+    import asyncio, json as _json
+
+    class _Clob:
+        def __init__(self, ask):
+            self._ask = ask
+        def get_price(self, token_id, side):
+            if self._ask is None:
+                raise RuntimeError("api down")
+            return {"price": str(self._ask)}
+
+    def ctx(prob, bar):
+        return {"alert": {"clob_token_id": "t1",
+                          "score_breakdown_json": _json.dumps({"brain_prob": prob, "bar": bar})}}
+
+    run = asyncio.run
+    # brain 0.60, bar 0.10: ask 0.48 -> edge 0.12 >= 0.08 -> extend
+    assert run(tr._pick_edge_still_live(_Clob(0.48), ctx(0.60, 0.10))) is True
+    # ask 0.55 -> edge 0.05 < 0.08 -> no extension (edge gone, cancel honestly)
+    assert run(tr._pick_edge_still_live(_Clob(0.55), ctx(0.60, 0.10))) is False
+    # API down -> never extend blind
+    assert run(tr._pick_edge_still_live(_Clob(None), ctx(0.60, 0.10))) is False
+    # no token / no prob -> False
+    assert run(tr._pick_edge_still_live(_Clob(0.40), {"alert": {}})) is False
+    assert run(tr._pick_edge_still_live(_Clob(0.40), ctx(0.0, 0.10))) is False
+    print("  [ok] TTL extension only when the live edge still clears the bar")
+
+
+def test_no_extension_when_order_state_unreadable():
+    # The order API failing (or the fill field absent) past TTL must NOT extend — the price
+    # API working is not evidence the order API works; a hidden partial could rest blind.
+    import asyncio, json as _json, time as _time
+
+    class _Clob:
+        def get_order(self, oid):
+            raise RuntimeError("order API down")
+        def get_price(self, token_id, side):
+            return {"price": "0.40"}   # edge WOULD clear the bar if it were consulted
+        def cancel_order(self, payload):
+            raise RuntimeError("cancel also down")
+
+    ctx = {"alert": {"alert_id": "brain_x", "clob_token_id": "t1",
+                     "score_breakdown_json": _json.dumps({"brain_prob": 0.60, "bar": 0.10})},
+           "shares": 10.0, "limit_px": 0.41, "cost": 4.10,
+           "placed_at": _time.time() - tr.PICK_MAKER_TTL_S - 60, "ev_key": "ev"}
+    tr._pending_pick_orders.clear()
+    tr._pending_pick_orders["oid-x"] = ctx
+    tr._pending_pick_alerts.add("brain_x")
+    asyncio.run(tr._check_pick_orders(_Clob(), None))
+    kept = tr._pending_pick_orders.get("oid-x")
+    assert kept is not None, "order must stay tracked (cancel unconfirmed)"
+    assert kept.get("extends", 0) == 0, "must NOT extend while order state is unreadable"
+    tr._pending_pick_orders.clear()
+    tr._pending_pick_alerts.clear()
+    print("  [ok] unreadable order state -> no blind extension, order stays tracked")
+
+
 # ---------------------------------------------------------------- bankroll-aware ladder stake
 
 def test_ladder_stake_capped_by_bankroll_pct():
