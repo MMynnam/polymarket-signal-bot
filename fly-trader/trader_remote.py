@@ -123,6 +123,12 @@ DASHBOARD_UPDATE_SECONDS: int = int(os.getenv("DASHBOARD_UPDATE_SECONDS", "600")
 # exposure per UNDERLYING EVENT (derivative markets grouped by normalized event slug).
 EVENT_EXPOSURE_CAP_ENABLED: bool = os.getenv("EVENT_EXPOSURE_CAP_ENABLED", "true").lower() in ("true", "1", "yes")
 EVENT_MAX_EXPOSURE_USDC: float = float(os.getenv("EVENT_MAX_EXPOSURE_USDC", "8.0"))
+# Bankroll-aware rail scaling (2026-07-14, post-$500 deposit): flat dollar rails tuned for a
+# $40 book either strangle a $580 one (event cap $8 < a single Stage-1 pick) or trip on
+# routine variance (daily-loss $15 ≈ one bad resolution cluster). Effective value =
+# max(flat floor above, pct below × bankroll). Floors keep small-bankroll protection intact.
+EVENT_MAX_EXPOSURE_PCT: float = float(os.getenv("EVENT_MAX_EXPOSURE_PCT", "0.06"))
+MAX_DAILY_LOSS_PCT: float = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.06"))
 # Depth-aware sizing: before placing a sized bet (brain pick / conviction size-up), read the
 # CLOB order book and cap the stake at DEPTH_MAX_FRACTION of the visible ask depth within
 # DEPTH_PRICE_TOL of our price — never be a whale on a thin book (you'd pay away the edge
@@ -1256,8 +1262,9 @@ async def _check_risk_limits(
         return f"CB: drawdown ${rolling_loss:.2f} >= ${threshold_usdc:.2f} over {TRADING_CB_WINDOW_HOURS:.0f}h"
 
     daily_loss = stats.get("daily_loss", 0.0)
-    if daily_loss >= TRADING_MAX_DAILY_LOSS_USDC:
-        return f"daily loss limit reached (${daily_loss:.2f} >= ${TRADING_MAX_DAILY_LOSS_USDC:.2f})"
+    _dl_limit = _effective_daily_loss_limit()
+    if daily_loss >= _dl_limit:
+        return f"daily loss limit reached (${daily_loss:.2f} >= ${_dl_limit:.2f})"
 
     # Hard ceiling — absolute block regardless of tier or score.
     # The 50–60 premium tier is handled per-alert in the main loop.
@@ -3116,7 +3123,7 @@ async def _execute_trade(
         if _over:
             log.info("[EventCap] Skipping %s — event '%s' already carries $%.2f "
                      "(+$%.2f would breach the $%.2f cap)",
-                     alert_id[:12], _ev_key[:40], _ev_cur, bet_size, EVENT_MAX_EXPOSURE_USDC)
+                     alert_id[:12], _ev_key[:40], _ev_cur, bet_size, _effective_event_cap())
             if _is_brain_pick:
                 await _record_brain_pick_skip(http_client, alert, "event exposure cap")
             else:
@@ -3532,12 +3539,38 @@ def _event_key(market_slug, market_id: str) -> str:
     return slug
 
 
+def _bankroll_estimate() -> float:
+    """Total working bankroll: free cash + capital deployed in open positions (at cost).
+    The risk rails below scale on this rather than on flat dollar values tuned for a $40
+    book — a $15 daily-loss stop is catastrophic-day protection at $40 but trips on routine
+    resolution-clustering variance at $580, silently pausing the graduation sprint."""
+    free = _cached_usdc_balance if _cached_usdc_balance >= 0 else 0.0
+    return round(free + sum(_held_event_exposure.values()), 2)
+
+
+def _effective_event_cap(bankroll: float = None) -> float:
+    """Event-exposure cap, bankroll-aware: max(flat env floor, pct of bankroll). The pct
+    (6%) deliberately exceeds the Stage-1 per-pick cap (5% of bankroll) so a single
+    graduated pick FITS inside its own event — a flat $8 cap would silently veto every
+    Stage-1 stake the moment the gates open."""
+    if bankroll is None:
+        bankroll = _bankroll_estimate()
+    return round(max(EVENT_MAX_EXPOSURE_USDC, EVENT_MAX_EXPOSURE_PCT * bankroll), 2)
+
+
+def _effective_daily_loss_limit(bankroll: float = None) -> float:
+    """Daily-loss circuit breaker, bankroll-aware: max(flat env floor, pct of bankroll)."""
+    if bankroll is None:
+        bankroll = _bankroll_estimate()
+    return round(max(TRADING_MAX_DAILY_LOSS_USDC, MAX_DAILY_LOSS_PCT * bankroll), 2)
+
+
 def _event_over_cap(event_key: str, add_usdc: float, exposure: dict,
                     cap: float = None) -> tuple[bool, float]:
     """Pure decision: would adding add_usdc to this event's open exposure breach the cap?
     Returns (over, current_exposure)."""
     if cap is None:
-        cap = EVENT_MAX_EXPOSURE_USDC
+        cap = _effective_event_cap()
     cur = float(exposure.get(event_key, 0.0))
     return (cur + add_usdc) > cap, cur
 

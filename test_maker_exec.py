@@ -167,6 +167,30 @@ def test_no_extension_when_order_state_unreadable():
     print("  [ok] unreadable order state -> no blind extension, order stays tracked")
 
 
+def test_bankroll_aware_rails():
+    tr.EVENT_MAX_EXPOSURE_USDC = 8.0
+    tr.EVENT_MAX_EXPOSURE_PCT = 0.06
+    tr.TRADING_MAX_DAILY_LOSS_USDC = 15.0
+    tr.MAX_DAILY_LOSS_PCT = 0.06
+    # Small book: flat floors bind (identical to pre-change behavior).
+    assert tr._effective_event_cap(bankroll=40.0) == 8.0
+    assert tr._effective_daily_loss_limit(bankroll=40.0) == 15.0
+    # $580 book: rails scale — event cap fits a full Stage-1 pick (5% = $29 < 6% = $34.8),
+    # daily-loss stop no longer trips on one bad resolution cluster.
+    assert tr._effective_event_cap(bankroll=580.0) == 34.8
+    assert tr._effective_daily_loss_limit(bankroll=580.0) == 34.8
+    assert tr._effective_event_cap(bankroll=580.0) > 0.05 * 580.0   # Stage-1 pick fits
+    # _event_over_cap picks up the scaled cap via the default path.
+    tr._pending_pick_orders.clear()
+    tr._cached_usdc_balance = 580.0
+    tr._held_event_exposure.clear()
+    over, cur = tr._event_over_cap("ev-x", 25.0, {"ev-x": 5.0})
+    assert not over, "a $25 Stage-1 pick + $5 held must fit a $34.8 scaled event cap"
+    over, _ = tr._event_over_cap("ev-x", 25.0, {"ev-x": 15.0})
+    assert over, "$40 on one event must still breach the 6% cap"
+    print("  [ok] event cap + daily-loss stop scale with bankroll (floors intact)")
+
+
 # ---------------------------------------------------------------- bankroll-aware ladder stake
 
 def test_ladder_stake_capped_by_bankroll_pct():
