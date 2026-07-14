@@ -18,14 +18,15 @@ Outputs a JSON patch list and calls /api/trades/bulk-correction on Railway.
 """
 
 import json
+import os
 import time
 import urllib.request
 import urllib.parse
 
 from onchain_match import is_side_ambiguous
 
-RAILWAY_URL = "https://polymarket-signal-bot-production-d248.up.railway.app"
-RAILWAY_KEY = "API_SECRET_KEY_REMOVED"
+RAILWAY_URL = os.getenv("RAILWAY_API_URL", "https://polymarket-signal-bot-production-d248.up.railway.app")
+RAILWAY_KEY = os.environ["API_SECRET_KEY"]   # set in .env / environment; never hardcode
 DATA_API    = "https://data-api.polymarket.com"
 WALLET      = "0x00BD1F45caAFd08a1FFfEABa7e17c712a8791e9E"
 

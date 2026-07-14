@@ -13,11 +13,11 @@ Tag: resolution_source='reconcile-chain' (excluded from CB seeding via prospecti
 Run: python heal_history.py          (dry-run, prints summary)
      python heal_history.py APPLY    (posts to /api/trades/bulk-correction in batches)
 """
-import json, sys, time, urllib.request
+import json, os, sys, time, urllib.request
 from collections import defaultdict
 
-RAILWAY_URL = "https://polymarket-signal-bot-production-d248.up.railway.app"
-RAILWAY_KEY = "API_SECRET_KEY_REMOVED"
+RAILWAY_URL = os.getenv("RAILWAY_API_URL", "https://polymarket-signal-bot-production-d248.up.railway.app")
+RAILWAY_KEY = os.environ["API_SECRET_KEY"]   # set in .env / environment; never hardcode
 
 L = json.load(open("ledger.json"))
 D = json.load(open("fresh_dump.json"))
