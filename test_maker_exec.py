@@ -191,6 +191,143 @@ def test_bankroll_aware_rails():
     print("  [ok] event cap + daily-loss stop scale with bankroll (floors intact)")
 
 
+def test_taker_convert_full_bar_gate():
+    # Conversion requires the FULL bar at the live ask (the maker path's -0.02 tolerance
+    # does not apply: the bar budgets the taker fee we are about to actually pay).
+    import asyncio, json as _json
+
+    class _Clob:
+        def __init__(self, ask, fill_shares=10.0):
+            self._ask, self._fill = ask, fill_shares
+            self.posted = 0
+        def get_price(self, token_id, side):
+            if self._ask is None:
+                raise RuntimeError("down")
+            return {"price": str(self._ask)}
+        def get_neg_risk(self, token_id):
+            return False
+        def create_and_post_market_order(self, order, options, order_type):
+            self.posted += 1
+            return {"success": True, "orderID": "fak1", "price": str(self._ask)}
+        def get_order(self, oid):
+            return {"size_matched": self._fill, "status": "matched"}
+
+    def ctx(prob, bar, cost=5.0):
+        return {"alert": {"clob_token_id": "t1", "alert_id": "brain_z", "neg_risk": False,
+                          "score_breakdown_json": _json.dumps({"brain_prob": prob, "bar": bar})},
+                "shares": 12.0, "limit_px": 0.40, "cost": cost, "placed_at": 0.0, "ev_key": "e"}
+
+    run = asyncio.run
+    tr.PICK_TAKER_FALLBACK_ENABLED = True
+    tr._cached_usdc_balance = -1.0   # unknown balance -> affordability check skipped
+    # edge 0.60-0.48=0.12 >= bar 0.10 -> converts
+    c = _Clob(0.48)
+    got = run(tr._taker_convert_pick(c, None, ctx(0.60, 0.10)))
+    assert got == (10.0, 0.48) and c.posted == 1
+    # edge 0.09 < bar 0.10 -> no conversion, nothing posted (maker tolerance would've passed)
+    c = _Clob(0.51)
+    assert run(tr._taker_convert_pick(c, None, ctx(0.60, 0.10))) is None and c.posted == 0
+    # price API down -> None, nothing posted
+    c = _Clob(None)
+    assert run(tr._taker_convert_pick(c, None, ctx(0.60, 0.10))) is None and c.posted == 0
+    print("  [ok] taker-convert requires the FULL bar at the live ask")
+
+
+def test_taker_convert_unconfirmed_fill_books_stake():
+    # FAK success but unreadable fill -> book the intended stake (never a skip row after
+    # cash may have left the wallet).
+    import asyncio, json as _json
+
+    class _Clob:
+        def get_price(self, token_id, side): return {"price": "0.50"}
+        def get_neg_risk(self, token_id): return False
+        def create_and_post_market_order(self, order, options, order_type):
+            return {"success": True, "orderID": "fak2", "price": "0.50"}
+        def get_order(self, oid): raise RuntimeError("read failed")
+
+    ctx = {"alert": {"clob_token_id": "t1", "alert_id": "brain_w", "neg_risk": False,
+                     "score_breakdown_json": _json.dumps({"brain_prob": 0.70, "bar": 0.10})},
+           "shares": 12.0, "limit_px": 0.48, "cost": 6.0, "placed_at": 0.0, "ev_key": "e"}
+    tr.PICK_TAKER_FALLBACK_ENABLED = True
+    tr._cached_usdc_balance = -1.0
+    shares, px = __import__("asyncio").run(tr._taker_convert_pick(_Clob(), None, ctx))
+    assert px == 0.50 and abs(shares - 12.0) < 1e-6   # 6.0 / 0.50
+    print("  [ok] unconfirmed taker fill books the intended stake, never skips")
+
+
+def test_taker_convert_confirmed_zero_is_clean_skip():
+    # FAK success but get_order CONFIRMS size_matched=0 (killed unmatched): no cash left,
+    # so a skip row is honest — never a phantom booked fill (review finding).
+    import asyncio, json as _json
+
+    class _Clob:
+        def get_price(self, token_id, side): return {"price": "0.50"}
+        def get_neg_risk(self, token_id): return False
+        def create_and_post_market_order(self, order, options, order_type):
+            return {"success": True, "orderID": "fak3"}
+        def get_order(self, oid): return {"size_matched": 0, "status": "canceled"}
+
+    ctx = {"alert": {"clob_token_id": "t1", "alert_id": "brain_v", "neg_risk": False,
+                     "score_breakdown_json": _json.dumps({"brain_prob": 0.70, "bar": 0.10})},
+           "shares": 12.0, "limit_px": 0.48, "cost": 6.0, "placed_at": 0.0, "ev_key": "e"}
+    tr._cached_usdc_balance = -1.0
+    assert __import__("asyncio").run(tr._taker_convert_pick(_Clob(), None, ctx)) is None
+    print("  [ok] CONFIRMED zero fill -> clean skip, no phantom position")
+
+
+def test_taker_convert_post_exception_is_ambiguous():
+    # A non-4xx error on the FAK post (timeout/5xx after possible acceptance) must return
+    # 'ambiguous' — the caller holds, never writes a final skip over possibly-spent cash.
+    import asyncio, json as _json
+    from py_clob_client_v2.exceptions import PolyApiException
+
+    class _Resp:
+        status_code = None
+        text = "timeout"
+        def json(self): return {}
+
+    class _Clob:
+        def __init__(self, exc): self._exc = exc
+        def get_price(self, token_id, side): return {"price": "0.50"}
+        def get_neg_risk(self, token_id): return False
+        def create_and_post_market_order(self, order, options, order_type):
+            raise self._exc
+
+    def ctx():
+        return {"alert": {"clob_token_id": "t1", "alert_id": "brain_u", "neg_risk": False,
+                          "score_breakdown_json": _json.dumps({"brain_prob": 0.70, "bar": 0.10})},
+                "shares": 12.0, "limit_px": 0.48, "cost": 6.0, "placed_at": 0.0, "ev_key": "e"}
+    run = __import__("asyncio").run
+    tr._cached_usdc_balance = -1.0
+    assert run(tr._taker_convert_pick(_Clob(RuntimeError("conn reset")), None, ctx())) == "ambiguous"
+    print("  [ok] unknown FAK outcome -> 'ambiguous' (hold), never a skip row")
+
+
+def test_fak_fill_px_prefers_making_taking_ratio():
+    # makingAmount/takingAmount (USDC given / shares got) is the true average; the response
+    # 'price' field may be absent or a marketable-limit, and the pre-post ask is stale.
+    assert abs(tr._fak_fill_px({"makingAmount": "6.0", "takingAmount": "11.3"}, 11.3, 0.48)
+               - 6.0 / 11.3) < 1e-9
+    assert tr._fak_fill_px({"price": "0.52"}, 10, 0.48) == 0.52     # ratio absent -> price
+    assert tr._fak_fill_px({}, 10, 0.48) == 0.48                    # nothing -> ask
+    assert tr._fak_fill_px({"makingAmount": "0", "takingAmount": "0", "price": "garbage"},
+                           10, 0.48) == 0.48                        # junk never poisons
+    print("  [ok] fill price prefers making/taking ratio, falls back sanely")
+
+
+def test_finalize_price_override_math():
+    # Pure math check on the cash-basis status label + px propagation (no network parts).
+    ctx = {"cost": 6.0, "limit_px": 0.48}
+    px = 0.50
+    filled_usdc = round(11.0 * px, 2)                 # taker filled 11 shares @ 0.50 = $5.50
+    status = "filled" if filled_usdc >= 0.95 * ctx["cost"] else "partial"
+    assert status == "partial"                        # $5.50 < 95% of $6.00
+    filled_usdc = round(12.0 * px, 2)                 # $6.00 = full stake
+    status = "filled" if filled_usdc >= 0.95 * ctx["cost"] else "partial"
+    assert status == "filled"
+    print("  [ok] cash-basis fill/partial label correct for taker fills")
+
+
 # ---------------------------------------------------------------- bankroll-aware ladder stake
 
 def test_ladder_stake_capped_by_bankroll_pct():

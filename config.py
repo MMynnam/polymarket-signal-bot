@@ -625,9 +625,9 @@ BRAIN_ABSTAIN_STD: float = float(os.getenv("BRAIN_ABSTAIN_STD", "0.18"))
 BRAIN_REGIME_START_TS: int = int(os.getenv("BRAIN_REGIME_START_TS", "1783868400"))
 
 # GRADUATION SPRINT (2026-07-13): while the new-regime graded-pick count is below the n gate,
-# the scanner runs at double cadence, researches one extra event per cycle, and front-loads
-# markets closing within BRAIN_SPRINT_FAST_CLOSE_H hours (fast resolution = fast evidence).
-# Self-limiting: the moment n_graded reaches the target, everything reverts to defaults.
+# the scanner runs at double cadence and researches one extra event per cycle. Self-limiting:
+# the moment n_graded reaches the target (or stage1 flips), everything reverts to defaults.
+# (The 07-13 fast-close-front-loading experiment was REVERTED 07-16 — fast markets are
+# efficiently priced and produced zero picks; see the sort comment in brain.py.)
 BRAIN_SPRINT_ENABLED: bool = os.getenv("BRAIN_SPRINT_ENABLED", "true").lower() == "true"
 BRAIN_SPRINT_TARGET: int = int(os.getenv("BRAIN_SPRINT_TARGET", "40"))
-BRAIN_SPRINT_FAST_CLOSE_H: float = float(os.getenv("BRAIN_SPRINT_FAST_CLOSE_H", "120"))

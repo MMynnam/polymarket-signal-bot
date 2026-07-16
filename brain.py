@@ -1222,14 +1222,13 @@ async def _scanner_candidates(http_client) -> list:
     # quant-priced sports-derivative books; scattered-information markets (politics,
     # entertainment, crypto, one-offs) are where LLM research can actually out-forecast the
     # price. Within each tier: soonest-to-resolve, volume tiebreak (fast grading, fast proof).
-    # FAST-CLOSE FIRST (2026-07-13, PERMANENT — deliberately NOT sprint-conditional): markets
-    # closing within BRAIN_SPRINT_FAST_CLOSE_H hours outrank everything. Fast resolution =
-    # fast evidence AND fast capital recycling on a small bankroll. Crucially, because this
-    # holds both during and after graduation, the population that certifies the Stage-1 gate
-    # is the SAME population Stage-1 stakes deploy on — a sprint-only sort would certify on
-    # fast movers and then bet big on slow ones the evidence never covered (review finding).
+    # REVERTED 2026-07-16: the 07-13 cross-tier fast-close-first experiment pointed research
+    # at ≤120h markets and produced ZERO picks from that bucket in 2.5 days (all 5 picks came
+    # 151-712h out) while the Brier record on those efficiently-priced fast markets ran
+    # BEHIND the market — near-resolution prices are near-perfect (slope 0.99), so gradable-
+    # fast and edge-bearing are anti-correlated. Domain-first is where the edge lives;
+    # within-tier soonest-first still prefers the gradable end of each tier.
     out.sort(key=lambda c: (
-        0 if (c["hours_to_close"] or 1e9) <= config.BRAIN_SPRINT_FAST_CLOSE_H else 1,
         _domain_rank(c) if config.BRAIN_SCAN_DEPRIORITIZE_SPORTS else 0,
         c["hours_to_close"] or 1e9,
         c["_volume"],
