@@ -3143,7 +3143,11 @@ async def _execute_trade(
     if DEPTH_SIZING_ENABLED and (_is_brain_pick or _brain_conf) and bet_size > TRADING_BET_SIZE_USDC:
         _capped = await _fetch_depth_cap(clob_client, token_id, price_alert, bet_size)
         if _capped is not None:
-            if _capped < 0.5:  # book too thin to take ANY meaningful position
+            # Floor at the exchange's $1 minimum for marketable orders: a $0.56 depth-capped
+            # stake sails past a $0.50 floor, fails the 5-share maker minimum, falls through
+            # to FAK, and the exchange 400s it — an error row instead of an honest thin-book
+            # skip (observed live 2026-07-17).
+            if _capped < 1.0:  # book too thin to take ANY meaningful position
                 log.info("[Depth] Skipping %s — book too thin ($%.2f available at %d%% fraction)",
                          alert_id[:12], _capped, int(DEPTH_MAX_FRACTION * 100))
                 if _is_brain_pick:
