@@ -1967,7 +1967,7 @@ async def brain_loop(dry_run: bool = False) -> None:
     the hard daily spend cap), and post a daily calibration report to ops. No-ops
     cleanly when the brain is disabled (no key / BRAIN_ENABLED=false)."""
     import httpx
-    from alerter import make_research_sender, make_audience_sender
+    from alerter import make_research_sender
 
     if not _enabled():
         log.info("[Brain] disabled (BRAIN_ENABLED=%s, api_key=%s) — loop idle.",
@@ -1983,11 +1983,8 @@ async def brain_loop(dry_run: bool = False) -> None:
              config.BRAIN_ENSEMBLE_N,
              f"on({config.BRAIN_BATCH_MARKETS}/cycle, 50%% off)" if config.BRAIN_BATCH_ENABLED else "off")
     sender = make_research_sender()
-    audience = make_audience_sender()
     last_report_day = None
     last_scoreboard_day = None
-    last_digest_ts = time.time()  # don't dump history on first boot
-    digest_interval = max(1800.0, config.BRAIN_DIGEST_HOURS * 3600)
 
     async with httpx.AsyncClient() as http_client:
         while True:
@@ -2028,18 +2025,11 @@ async def brain_loop(dry_run: bool = False) -> None:
                         if await forecast_market(cand, None if dry_run else sender, http_client, "scanner"):
                             done += 1
 
-                # Audience decision digest — readable summary of recent brain calls to V1 Poly.
-                now_ts = time.time()
-                if now_ts - last_digest_ts >= digest_interval:
-                    decisions = _recent_brain_decisions(int(last_digest_ts))
-                    last_digest_ts = now_ts
-                    text = format_brain_digest(decisions)
-                    if text:
-                        if dry_run or audience is None:
-                            log.info("[Brain] audience digest:\n%s", text)
-                        else:
-                            await audience.send_message(text, http_client)
-                            log.info("[Brain] posted audience digest (%d decisions)", len(decisions))
+                # (Removed 2026-07-18: the periodic "brain chewing on / stayed flat" audience
+                # digest. It fired every few hours and was ~always a wall of "looked at 14,
+                # passed" musings — no value to the channel. The brain's voice now lives ONLY
+                # where there's a real event behind it: betslip verdicts, its own Brain Picks,
+                # and overrules. _recent_brain_decisions/format_brain_digest are now unused.)
 
                 # Daily calibration report to ops.
                 now = datetime.utcnow()

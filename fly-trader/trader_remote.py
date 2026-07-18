@@ -144,8 +144,16 @@ DEPTH_PRICE_TOL: float = float(os.getenv("DEPTH_PRICE_TOL", "0.02"))
 # the last alerted price; globally capped per cycle so a book-wide swing can't storm the feed.
 SWEAT_CARDS_ENABLED: bool = os.getenv("SWEAT_CARDS_ENABLED", "true").lower() in ("true", "1", "yes")
 SWEAT_CHECK_SECONDS: int = int(os.getenv("SWEAT_CHECK_SECONDS", "900"))       # 15 min
-SWEAT_MOVE_THRESHOLD: float = float(os.getenv("SWEAT_MOVE_THRESHOLD", "0.15"))  # 15¢
+# 2026-07-18 feed cleanup: a volatile 24¢ binary earned ~15 LIVE cards in one day. Only
+# MEANINGFUL positions ($2+) earn coverage, only BIG moves (25¢) trigger, and each position
+# is capped per UTC day so the feed stays pointed instead of narrating every wiggle.
+SWEAT_MOVE_THRESHOLD: float = float(os.getenv("SWEAT_MOVE_THRESHOLD", "0.25"))  # 25¢
+SWEAT_MIN_SIZE_USDC: float = float(os.getenv("SWEAT_MIN_SIZE_USDC", "2.0"))
+SWEAT_MAX_PER_POSITION_DAY: int = int(os.getenv("SWEAT_MAX_PER_POSITION_DAY", "3"))
 SWEAT_MAX_PER_CYCLE: int = int(os.getenv("SWEAT_MAX_PER_CYCLE", "3"))
+# One BRAIN OVERRULE card per market per this window: the insider detector can fire a market
+# many times in minutes (5 identical Messi overrules in 2 min, observed 2026-07-18).
+OVERRULE_DEDUP_HOURS: float = float(os.getenv("OVERRULE_DEDUP_HOURS", "12"))
 
 BRAIN_PICK_TRADING_ENABLED: bool = os.getenv("BRAIN_PICK_TRADING_ENABLED", "false").lower() in ("true", "1", "yes")
 # Conviction-scaled pick stakes (2026-07-04): the picks went 7-0 (+34% ROI) at $1 flat — the
@@ -435,9 +443,14 @@ _held_event_exposure: dict = {}
 # In-process; a restart just resets the baselines to entry (worst case: one repeat card).
 _sweat_last_px: dict = {}
 _last_sweat_check: float = 0.0
+# Per-position daily budget: alert_id -> [utc_day, count_today]. Bounds how many LIVE cards
+# one position can post in a day so a single volatile market can't dominate the feed.
+_sweat_count: dict = {}
 # Tokens whose orderbook is GONE (market ended, awaiting redemption) — 404 forever; stop
 # re-polling them every sweat cycle. Cleared on restart.
 _sweat_dead_tokens: set = set()
+# BRAIN OVERRULE dedup: market_id -> ts of last posted overrule card.
+_overrule_posted: dict = {}
 
 # ---------------------------------------------------------------------------
 # Collateral token constants (Polygon — Polymarket USD / pUSD)
@@ -2111,6 +2124,10 @@ _SWEAT_RISING = [
     "called it early, watching the price catch up.",
     "this is the part where the bot pretends it never doubted.",
     "the line is moving our way. act natural.",
+    "green. we don't want to talk about it in case it hears us.",
+    "the thesis is thesis-ing. rare.",
+    "up and to the right, the only two directions the bot respects.",
+    "printing quietly. do not jinx it.",
 ]
 _SWEAT_FALLING = [
     "hostile territory. holding.",
@@ -2118,6 +2135,10 @@ _SWEAT_FALLING = [
     "sweating. this is the sweat. this is what we came for.",
     "conviction is easy when you're winning. this is the other kind.",
     "down but not out. the bot has seen worse. the bot has BEEN worse.",
+    "red, but a principled red. we stand by the mistake.",
+    "the bot is unbothered. the bot is lying.",
+    "paper losses are just opinions. loud opinions.",
+    "holding the line. the line is holding back.",
 ]
 
 
@@ -2157,6 +2178,25 @@ def _build_sweat_text(market_q: str, bet_side: str, entry_px: float, current_px:
     )
 
 
+def _sweat_candidates(positions: list) -> list:
+    """One position per MARKET — the largest by stake. Sweating both sides of the same market
+    (mirror images that always move together) is pure redundancy; pick the side with more
+    skin in it and drop the rest."""
+    best: dict = {}
+    for p in positions if isinstance(positions, list) else []:
+        mid = p.get("market_id")
+        if not mid:
+            continue
+        try:
+            sz = float(p.get("size_usdc") or 0.0)
+        except (TypeError, ValueError):
+            sz = 0.0
+        cur = best.get(mid)
+        if cur is None or sz > float(cur.get("size_usdc") or 0.0):
+            best[mid] = p
+    return list(best.values())
+
+
 async def _check_sweat_cards(clob_client, http_client: httpx.AsyncClient) -> None:
     """Watch open positions for big price swings and thread updates under their betslips.
     Best-effort by design; capped per cycle; zero LLM cost (CLOB price reads only)."""
@@ -2171,14 +2211,24 @@ async def _check_sweat_cards(clob_client, http_client: httpx.AsyncClient) -> Non
         positions = await _api_get(http_client, "/api/positions/open")
         if not isinstance(positions, list):
             return
+        _day = _utc_day()
         posted = 0
-        for p in positions:
+        for p in _sweat_candidates(positions):   # one side per market
             if posted >= SWEAT_MAX_PER_CYCLE:
                 break
             token = p.get("clob_token_id")
             entry = p.get("bet_price_filled") or p.get("bet_price_intended")
             aid = p.get("alert_id") or ""
+            size = float(p.get("size_usdc") or 0.0)
             if not token or not entry or not aid or token in _sweat_dead_tokens:
+                continue
+            if size < SWEAT_MIN_SIZE_USDC:   # dust doesn't earn live coverage
+                continue
+            # Per-position daily cap (reset at UTC rollover).
+            day, cnt = _sweat_count.get(aid, (_day, 0))
+            if day != _day:
+                day, cnt = _day, 0
+            if cnt >= SWEAT_MAX_PER_POSITION_DAY:
                 continue
             try:
                 resp = await asyncio.to_thread(clob_client.get_price, token, "BUY")
@@ -2192,19 +2242,22 @@ async def _check_sweat_cards(clob_client, http_client: httpx.AsyncClient) -> Non
             if not direction:
                 continue
             _sweat_last_px[aid] = cur
+            _sweat_count[aid] = (day, cnt + 1)
             text = _build_sweat_text(
                 p.get("market_question") or "", p.get("bet_side") or "",
-                float(entry), cur, float(p.get("size_usdc") or 0.0),
-                direction, seed=int(cur * 100) + len(aid),
+                float(entry), cur, size, direction,
+                seed=int(cur * 100) + len(aid) + cnt * 7,   # vary line across a position's cards
             )
             await _send_telegram(http_client, text, silent=True,
                                  reply_to=_slip_msgs.get(aid))
             posted += 1
-            log.info("[Sweat] %s %s: %.2f → %.2f (%s)", aid[:12],
-                     (p.get("market_question") or "")[:30], float(entry), cur, direction)
-        if len(_sweat_last_px) > 400:   # bound the baseline map
+            log.info("[Sweat] %s %s: %.2f → %.2f (%s) [%d/%d today]", aid[:12],
+                     (p.get("market_question") or "")[:30], float(entry), cur, direction,
+                     cnt + 1, SWEAT_MAX_PER_POSITION_DAY)
+        if len(_sweat_last_px) > 400:   # bound the baseline maps
             for k in list(_sweat_last_px)[:200]:
                 _sweat_last_px.pop(k, None)
+                _sweat_count.pop(k, None)
     except Exception as exc:
         log.debug("[Sweat] check error (non-fatal): %s", exc)
 
@@ -3682,7 +3735,20 @@ def _brain_skip_veto(info: Optional[dict]) -> bool:
 
 async def _notify_brain_veto_skip(http_client: httpx.AsyncClient, alert: dict, verdict: dict) -> None:
     """AUDIENCE card (V1 Poly): the brain overruled the signal and sat a bet out. Rare by design
-    (only strong vetoes), so it reads as a moment, not noise."""
+    (only strong vetoes), so it reads as a moment, not noise. Deduped per market: the insider
+    detector can flag the same market many times in minutes, and one overrule says it all."""
+    mid = str(alert.get("market_id") or "")
+    now = time.time()
+    if mid:
+        last = _overrule_posted.get(mid, 0.0)
+        if now - last < OVERRULE_DEDUP_HOURS * 3600:
+            log.debug("[Brain] overrule for %s already posted %.0fm ago — skipping card",
+                      mid[:16], (now - last) / 60)
+            return
+        _overrule_posted[mid] = now
+        if len(_overrule_posted) > 500:   # bound the map
+            for k in sorted(_overrule_posted, key=_overrule_posted.get)[:250]:
+                _overrule_posted.pop(k, None)
     import html as _html
     q = _html.escape(str(alert.get("market_question") or "")[:90])
     side = _html.escape(str(alert.get("bet_side") or ""))

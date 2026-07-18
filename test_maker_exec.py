@@ -167,6 +167,31 @@ def test_no_extension_when_order_state_unreadable():
     print("  [ok] unreadable order state -> no blind extension, order stays tracked")
 
 
+def test_sweat_candidates_one_side_per_market():
+    # Both sides of a market are mirror images — sweat only the bigger stake, and never dust.
+    positions = [
+        {"market_id": "m1", "bet_side": "Yes", "size_usdc": 0.93},
+        {"market_id": "m1", "bet_side": "No", "size_usdc": 0.66},   # same market, smaller
+        {"market_id": "m2", "bet_side": "Yes", "size_usdc": 5.0},
+        {"market_id": None, "bet_side": "Yes", "size_usdc": 9.0},   # no market id -> dropped
+    ]
+    cands = tr._sweat_candidates(positions)
+    by_mid = {c["market_id"]: c for c in cands}
+    assert set(by_mid) == {"m1", "m2"}
+    assert by_mid["m1"]["bet_side"] == "Yes" and by_mid["m1"]["size_usdc"] == 0.93  # larger side
+    print("  [ok] sweat picks one (largest) side per market, drops id-less")
+
+
+def test_sweat_trigger_threshold():
+    # 25c default: a 20c wiggle is silent, a 26c move sweats.
+    tr.SWEAT_MOVE_THRESHOLD = 0.25
+    assert tr._sweat_trigger(0.50, 0.70, None) is None            # +20c < 25c
+    assert tr._sweat_trigger(0.50, 0.76, None) == "rising"        # +26c
+    assert tr._sweat_trigger(0.50, 0.24, None) == "falling"       # -26c
+    assert tr._sweat_trigger(0.50, 0.70, 0.70) is None            # baseline = last alert px
+    print("  [ok] sweat trigger honors the 25c threshold off the last-alert baseline")
+
+
 def test_bankroll_aware_rails():
     tr.EVENT_MAX_EXPOSURE_USDC = 8.0
     tr.EVENT_MAX_EXPOSURE_PCT = 0.06
