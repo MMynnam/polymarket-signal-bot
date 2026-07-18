@@ -472,7 +472,13 @@ BRAIN_PICK_ENABLED: bool = os.getenv("BRAIN_PICK_ENABLED", "false").lower() in (
 # (longshot buys 0-for-3 at −100%; favorite buys +8% ROI). Cheap sides pay the most fee AND
 # carry the documented bias against them — both push the same direction.
 BRAIN_PICK_MIN_EDGE: float = float(os.getenv("BRAIN_PICK_MIN_EDGE", "0.10"))       # buys ≥0.55
-BRAIN_PICK_EDGE_MID: float = float(os.getenv("BRAIN_PICK_EDGE_MID", "0.15"))       # buys 0.40-0.55
+# MID bar 0.15→0.12 (2026-07-18, new-regime graded data): the 0.40-0.55 tier is the ONE
+# segment where the brain's Brier beats the market (0.2022 vs 0.2311, n=13) and the
+# 0.05-0.12 edge band is the one band where it wins overall — yet the 0.15 bar blocked 5
+# near-miss candidates vs 2 cleared. Small sample; revisit at n≈40 graded in-tier. The
+# LONGSHOT bar stays at 0.22: brain trails the market there (0.1725 vs 0.1606, n=44) and
+# fees+bias are worst — volume from a losing segment is not evidence, it's bleed.
+BRAIN_PICK_EDGE_MID: float = float(os.getenv("BRAIN_PICK_EDGE_MID", "0.12"))       # buys 0.40-0.55
 BRAIN_PICK_EDGE_LONGSHOT: float = float(os.getenv("BRAIN_PICK_EDGE_LONGSHOT", "0.22"))  # buys <0.40
 # Too-good-to-be-true guard: claimed edges >0.35 were a COIN FLIP in our graded record (n=8 at
 # |edge|>0.20 → 50%) — monster disagreements are as likely stale-data delusions as insight.

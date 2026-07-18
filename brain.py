@@ -1228,8 +1228,15 @@ async def _scanner_candidates(http_client) -> list:
     # BEHIND the market — near-resolution prices are near-perfect (slope 0.99), so gradable-
     # fast and edge-bearing are anti-correlated. Domain-first is where the edge lives;
     # within-tier soonest-first still prefers the gradable end of each tier.
+    # MID-BAND FIRST within each domain tier (2026-07-18, graded-data finding): 68% of
+    # research was landing on longshot-priced markets (<0.40) where the brain TRAILS the
+    # market's Brier, while the 0.30-0.70 band is where it wins (mid-tier bb 0.2022 vs
+    # bm 0.2311) — and where our own cash record made money (favorites ≥0.55: +8% ROI).
+    # Research budget goes where the brain has demonstrated skill; longshots still get
+    # researched, last.
     out.sort(key=lambda c: (
         _domain_rank(c) if config.BRAIN_SCAN_DEPRIORITIZE_SPORTS else 0,
+        0 if 0.30 <= (c["market_price"] or 0.0) <= 0.70 else 1,
         c["hours_to_close"] or 1e9,
         c["_volume"],
     ))
